@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.4-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.5.5-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -59,7 +59,8 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 - 凭据比较统一走常量时间；HTTP 转发做逐跳头剥离、`Host` 规范化、CL+TE 走私拒绝
 - 面板与客户端本地界面**绑非回环地址却没有凭据时拒绝启动**（逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）
 
-完整修复清单见 [SECURITY-FIXES.md](SECURITY-FIXES.md)。
+完整修复清单见 [SECURITY-FIXES.md](SECURITY-FIXES.md)；
+最近的第四轮（11 项）见 [SECURITY-FIXES-ROUND4.md](SECURITY-FIXES-ROUND4.md)。
 
 ### 运维与调度
 
@@ -81,7 +82,7 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 ### 工程质量
 
-- 612 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- 646 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
 - CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
 - 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
 - 发布产物附 `SHA256SUMS` + Ed25519 分离签名
@@ -178,10 +179,22 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 | 空 token 且**显式**绑对外地址 | 拒绝启动 | 配 token / 绑回环 / 显式写 `allow_insecure_no_auth = true` |
 | `[acl]` 段拼错的键名 | 现在会报错（原先静默失效） | 检查拼写 |
 
+**0.5.5 起追加三处**（都是安全修复的必然结果）：
+
+| 变更 | 影响 | 处理 |
+|---|---|---|
+| 远程下发**不再允许携带插件**（`plugin` / `pluginUser` / `pluginPasswd` / `pluginHostHeaderRewrite` / `pluginStripPrefix`） | 面板下发的代理若带插件会被拒 | 插件只能写在**本机配置文件**里（它决定客户端"变成什么"，不该由服务端远程指定）。要连内网服务请用普通 tcp/http 代理 |
+| 远程下发**不能删/覆盖配置文件里定义的代理** | 面板对这些代理的增删会返回明确错误 | 改本机配置文件；面板只管理它自己加的（以及 store 恢复的）动态代理 |
+| 工作连接需要凭证 | **对官方 frpc 无影响**（官方默认不带凭证，服务端退回"源 IP 一致"校验） | 无需处理。NFrp ≥ 0.5.5 客户端会自动声明并携带 |
+
 其余需注意：
 
 - **OIDC 部署必须配 TLS**。OIDC 的 `privilege_key` 是原样的 access token，会明文出现在登录报文里；不加密链路上任何被动抓包的人都能拿走它。
 - **客户端 `transport.tls` 只加密、不校验对端证书**（与官方 frp 行为一致）。它防被动偷看，不防中间人；跨公网直连且需要防 MITM 时请在**外层**再套一层 TLS。
+- **v1 的登录凭据强度完全取决于 token**，而且凭据**可无限期重放**（`md5(token+ts)`，服务端不校验时间戳新鲜性；官方 frp 同样如此）。跨公网部署请用足够随机的 token，并优先 v2 / OIDC。
+- **未配 `[[roles]]` 时，客户端的 `user` 只是自报标签、不是身份**。需要真正的多租户隔离必须配 RBAC。
+- **xtcp 的"数据不经服务端"不包含"防服务端"**：服务端持有 `secret_key` 且自行生成 `sid`，理论上能算出 P2P 口令。它防的是**路径上的第三方**，不是服务端本身。
+- 对手不想暴露内部细节时，可设 `detailed_errors_to_client = false`（默认与官方一致为 `true`）：它会把发给客户端的错误换成统一短句，顺带收掉 stcp/xtcp 隧道名的枚举面。
 - 示例配置里默认**不包含**任何代理，需要什么自己打开对应的注释段。示例不再默认暴露 SSH。
 
 ## 质量保障
@@ -189,17 +202,17 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                # 格式
 cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
-cargo test --workspace                    # 612 个测试
+cargo test --workspace                    # 646 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 |
 |---|---|
-| `common` 单元测试 | 300 |
-| `server` 单元测试（lib） | 181 |
+| `common` 单元测试 | 317 |
+| `server` 单元测试（lib） | 191 |
 | `server` 单元测试（bin） | 16 |
-| `client` 单元测试 | 97 |
+| `client` 单元测试 | 104 |
 | `server` 端到端集成测试 | 18 |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
