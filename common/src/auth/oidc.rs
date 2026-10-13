@@ -464,6 +464,33 @@ impl OidcVerifier {
     }
 
     /// 校验 `iss` / `aud` / `exp` / `nbf`。
+    ///
+    /// ★★ v0.5.5 修（第四轮 G-8）：原先时间字段的写法是
+    ///
+    /// ```ignore
+    /// if let Some(exp) = payload.get("exp").and_then(|x| x.as_i64()) {
+    ///     if exp < now { bail!(...) }
+    /// }
+    /// ```
+    ///
+    /// 这个写法把**"字段不存在"**和**"字段存在但类型不对"**都变成了 `None`，
+    /// 于是整个判断被**静默跳过**。实测（`tmp/audit4g/`）以下形态全部**接受**：
+    ///
+    /// | 用例 | 修复前 | 期望 |
+    /// |---|---|---|
+    /// | 完全没有 `exp` | 接受（**永不过期**） | 拒绝 |
+    /// | `exp` 是字符串 `"1"`（早该过期） | 接受 | 拒绝 |
+    /// | `exp` 是 `null` | 接受 | 拒绝 |
+    /// | `exp` 是数组 | 接受 | 拒绝 |
+    /// | `nbf` 是字符串（未来时间） | 接受 | 拒绝 |
+    ///
+    /// 这条在 G-2 修好之前**不可达**（验签恒失败），所以它一直是"潜伏"状态 ——
+    /// 修 G-2 会**立刻**把它变成可利用的认证绕过（伪造一个不带 exp 的 token
+    /// 就能永久有效）。两者必须同时修，这也是把它们放在同一个提交里的原因。
+    ///
+    /// 修法：**区分"缺失"与"类型不对"** —— OIDC 规定 `exp` 是必填，
+    /// 所以缺失即拒；出现但类型不是数值也拒。`nbf` 可选，
+    /// 但一旦出现就必须是数值（否则拒绝，而不是静默跳过）。
     fn check_claims(&self, payload: &serde_json::Value) -> Result<()> {
         if !self.cfg.skip_issuer_check {
             let iss = payload
@@ -491,12 +518,31 @@ impl OidcVerifier {
         }
         if !self.cfg.skip_expiry_check {
             let now = now_unix() as i64;
-            if let Some(exp) = payload.get("exp").and_then(|x| x.as_i64()) {
-                if exp < now {
-                    bail!("token 已过期（exp={exp}，现在 {now}）");
-                }
+
+            // ---- exp：**必须存在且必须是数值** ----
+            let exp = match payload.get("exp") {
+                // 存在但不是数值（字符串 / null / 数组 / 对象）⇒ 拒绝。
+                // ★ 这里绝不能"当作没有" —— 那正是原来的漏洞。
+                Some(v) => v.as_i64().ok_or_else(|| {
+                    anyhow!(
+                        "token 的 exp 不是数值（实际是 {}）—— 无法判断有效期，拒绝",
+                        json_type_name(v)
+                    )
+                })?,
+                None => bail!("token 里没有 exp —— 无法判断有效期，拒绝（会永不过期）"),
+            };
+            if exp < now {
+                bail!("token 已过期（exp={exp}，现在 {now}）");
             }
-            if let Some(nbf) = payload.get("nbf").and_then(|x| x.as_i64()) {
+
+            // ---- nbf：可选，但出现就必须是数值 ----
+            if let Some(v) = payload.get("nbf") {
+                let nbf = v.as_i64().ok_or_else(|| {
+                    anyhow!(
+                        "token 的 nbf 不是数值（实际是 {}）—— 拒绝",
+                        json_type_name(v)
+                    )
+                })?;
                 // 允许 60 秒时钟漂移
                 if nbf > now + 60 {
                     bail!("token 还没生效（nbf={nbf}，现在 {now}）");
@@ -638,14 +684,22 @@ fn b64url(s: &str) -> Result<Vec<u8>> {
 fn verify_signature(jwk: &Jwk, alg: &str, message: &[u8], sig: &[u8]) -> Result<bool> {
     use ring::signature::UnparsedPublicKey;
 
-    let spki = jwk_to_spki(jwk)?;
-    let key = UnparsedPublicKey::new(pick_algorithm(jwk, alg)?, spki);
+    let key_bytes = jwk_to_ring_key(jwk)?;
+    let key = UnparsedPublicKey::new(pick_algorithm(jwk, alg)?, key_bytes);
     // 签名不匹配是**预期内**的结果：JWKS 里可能有多把 key，要逐把试，
     // 试错不能当错误往上抛（否则第一把没试中就把整次校验判死了）。
     Ok(key.verify(message, sig).is_ok())
 }
 
 /// 按 JWK 类型与 alg 选 ring 的验签算法。
+///
+/// ★★ v0.5.5（第四轮 G-2）：**这些算法要的密钥编码各有不同**，
+/// 必须与 [`jwk_to_ring_key`] 产出的格式严格配对，否则验签**恒失败**：
+///
+/// | 算法 | ring 期望的密钥编码 |
+/// |---|---|
+/// | `RSA_PKCS1_*` / `RSA_PSS_*` | **PKCS#1** `RSAPublicKey`（`SEQUENCE{n,e}`），**不是** SPKI |
+/// | `ECDSA_P256_*` / `ECDSA_P384_*` | **裸的未压缩点** `0x04‖X‖Y`，**不是** SPKI |
 fn pick_algorithm(
     jwk: &Jwk,
     alg: &str,
@@ -666,37 +720,65 @@ fn pick_algorithm(
     Ok(a)
 }
 
-/// 把 JWK 转成 SubjectPublicKeyInfo（DER），ring 需要这个格式。
-fn jwk_to_spki(jwk: &Jwk) -> Result<Vec<u8>> {
+/// 把 JWK 转成 **ring 期望的**公钥编码（DER / 点）。
+///
+/// ★★ v0.5.5 修（第四轮 G-2，高危可用性）：本函数原名叫 `jwk_to_spki`，
+/// **注释还写着"ring 需要这个格式"，但对 RSA 恰恰相反** ——
+/// ring 的 `RSA_PKCS1_2048_8192_SHA256`（以及 `RSA_PSS_*`）要的是
+/// **裸的 PKCS#1 `RSAPublicKey`**，而不是外面又包了一层 `AlgorithmIdentifier`
+/// 的 `SubjectPublicKeyInfo`。EC 同理：`ECDSA_P256_SHA256_ASN1` 要的是
+/// **裸的未压缩点**，不是 SPKI。
+///
+/// 后果是 **OIDC 验签对任何合法 IdP 都恒失败** —— 整个 OIDC 认证功能不可用。
+///
+/// 实测（真 RSA-2048 密钥 + 真签名，`tmp/audit4-verify-G2.py`）：
+///
+/// ```text
+/// --- RSA_PKCS1_2048_8192_SHA256 ---
+/// SPKI   (仓库原先给的格式): ring 拒绝 -> Unspecified
+/// PKCS#1 (ring 期望的格式)  : 被 ring 接受（且签名有效）
+/// ```
+///
+/// ★ 之所以一直没被发现，是因为测试只覆盖了"验不过要拒绝"这个方向，
+///   **没有一条测试断言"合法的签名要验得过"** —— 典型的"绿得不真实"。
+///   本函数修完后，下面 `oidc_verify_roundtrip` 补上了正向用例。
+fn jwk_to_ring_key(jwk: &Jwk) -> Result<Vec<u8>> {
     match jwk.kty.to_ascii_uppercase().as_str() {
         "RSA" => {
             let n = b64url(&jwk.n).context("JWK 的 n 不是合法 base64url")?;
             let e = b64url(&jwk.e).context("JWK 的 e 不是合法 base64url")?;
-            let rsa_pub = der::seq(&[&der::int(&n), &der::int(&e)]);
-            let alg_id = der::seq(&[&der::oid("1.2.840.113549.1.1.1"), &der::null()]);
-            Ok(der::seq(&[&alg_id, &der::bit_string(&rsa_pub)]))
+            // ★ 只返回 PKCS#1 的 `SEQUENCE { n INTEGER, e INTEGER }`，
+            //   **不再**套 `AlgorithmIdentifier` + `BIT STRING` 那层 SPKI。
+            Ok(der::seq(&[&der::int(&n), &der::int(&e)]))
         }
         "EC" => {
             let x = b64url(&jwk.x).context("JWK 的 x 不是合法 base64url")?;
             let y = b64url(&jwk.y).context("JWK 的 y 不是合法 base64url")?;
-            let curve = match jwk.crv.as_str() {
-                "P-256" => "1.2.840.10045.3.1.7",
-                "P-384" => "1.3.132.0.34",
+            // 曲线白名单：只实现了 P-256 / P-384（对应 ring 的
+            // `ECDSA_P256_SHA256_ASN1` / `ECDSA_P384_SHA384_ASN1`）。
+            match jwk.crv.as_str() {
+                "P-256" | "P-384" => {}
                 other => bail!("不支持的 EC 曲线 {other}（实现了 P-256 / P-384）"),
-            };
-            // 未压缩点：0x04 || X || Y
+            }
+            if x.len() != y.len() {
+                bail!(
+                    "JWK 的 x/y 长度不一致（x={} y={}）—— 不是合法的 EC 点",
+                    x.len(),
+                    y.len()
+                );
+            }
+            // ★ 只返回**未压缩点** `0x04 ‖ X ‖ Y`，不套 SPKI。
             let mut point = Vec::with_capacity(1 + x.len() + y.len());
             point.push(0x04);
             point.extend_from_slice(&x);
             point.extend_from_slice(&y);
-            let alg_id = der::seq(&[&der::oid("1.2.840.10045.2.1"), &der::oid(curve)]);
-            Ok(der::seq(&[&alg_id, &der::bit_string(&point)]))
+            Ok(point)
         }
         other => bail!("不支持的 JWK kty={other}（实现了 RSA / EC）"),
     }
 }
 
-/// 一点点 DER 编码 —— 只够构造 SubjectPublicKeyInfo。
+/// 一点点 DER 编码 —— 只够构造 PKCS#1 `RSAPublicKey`。
 mod der {
     /// TLV：tag + 长度 + 内容。
     fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
@@ -743,19 +825,13 @@ mod der {
         tlv(0x02, body)
     }
 
-    pub fn null() -> Vec<u8> {
-        tlv(0x05, &[])
-    }
-
-    /// BIT STRING：首字节是"未用位数"，公钥里恒为 0。
-    pub fn bit_string(content: &[u8]) -> Vec<u8> {
-        let mut body = Vec::with_capacity(content.len() + 1);
-        body.push(0);
-        body.extend_from_slice(content);
-        tlv(0x03, &body)
-    }
-
     /// OBJECT IDENTIFIER：点分十进制 → DER。
+    ///
+    /// ★ v0.5.5（G-2）：修完 SPKI/PKCS#1 的格式错配后，生产路径**不再构造
+    /// SPKI**，于是本函数只被它自己的编码测试用到。留着是为了那个"DER 编码
+    /// 是否正确"的回归价值（将来若有人真要拼 SPKI，别再踩一遍）；
+    /// 用 `#[cfg(test)]` 明确标注它不在生产路径上，避免又变成"看起来在用"的死代码。
+    #[cfg(test)]
     pub fn oid(dotted: &str) -> Vec<u8> {
         let arcs: Vec<u64> = dotted.split('.').filter_map(|s| s.parse().ok()).collect();
         assert!(arcs.len() >= 2, "OID 至少要有两段：{dotted}");
@@ -768,6 +844,7 @@ mod der {
     }
 
     /// 128 进制变长编码（DER 的 OID 用这个）。
+    #[cfg(test)]
     fn push_base128(out: &mut Vec<u8>, mut v: u64) {
         let mut buf = vec![(v & 0x7f) as u8];
         v >>= 7;
@@ -784,6 +861,19 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// JSON 值的类型名（只为把错误信息写清楚 —— "exp 不是数值（实际是 string）"
+/// 比"exp 不合法"有用得多）。
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +994,125 @@ mod tests {
                 "iss": "https://idp", "aud": "frps", "exp": now + 100, "nbf": now + 3600
             }))
             .is_err());
+    }
+
+    // ==================================================================
+    // G-8 回归（v0.5.5）：时间字段的**缺失**与**类型不对**都必须拒绝
+    //
+    // 原先的写法 `payload.get("exp").and_then(|x| x.as_i64())` 把
+    // "字段不存在" 和 "类型不对" 都变成 `None` ⇒ 整个时间校验被**静默跳过**，
+    // 于是"不带 exp 的 token 永不过期"。
+    //
+    // 这些用例在 G-2 修好之前**不可达**（验签恒失败），所以一直是潜伏状态 ——
+    // 修 G-2 会立刻把它变成可利用的认证绕过，故两者必须同修。
+    // ==================================================================
+
+    fn verifier_for_claims() -> std::sync::Arc<OidcVerifier> {
+        OidcVerifier::new(ServerOidcConfig {
+            issuer: "https://idp".into(),
+            audience: "frps".into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// ★★ 核心：**完全没有 `exp`** 的 token 必须被拒（否则永不过期）。
+    #[test]
+    fn 缺_exp_必须被拒() {
+        let v = verifier_for_claims();
+        let e = v
+            .check_claims(&serde_json::json!({"iss": "https://idp", "aud": "frps"}))
+            .expect_err("没有 exp 必须被拒 —— 否则 token 永不过期");
+        assert!(
+            e.to_string().contains("exp"),
+            "错误要指明是 exp 的问题：{e}"
+        );
+    }
+
+    /// ★★ 核心：`exp` 类型不对（字符串 / null / 数组 / 布尔）都必须被拒。
+    ///
+    /// 这几种在修复前全部被**静默放行**（`as_i64()` 返回 None ⇒ 跳过检查）。
+    #[test]
+    fn exp_类型不对必须被拒() {
+        let v = verifier_for_claims();
+        let now = now_unix() as i64;
+        // 字符串形式：内容其实是"已过期"，如果按数值解析会拒，按原逻辑会跳过
+        for bad in [
+            serde_json::json!("1"),
+            serde_json::json!("not-a-number"),
+            serde_json::json!(null),
+            serde_json::json!([now + 100]),
+            serde_json::json!(true),
+            serde_json::json!({"v": 1}),
+        ] {
+            let payload = serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": bad.clone()
+            });
+            assert!(
+                v.check_claims(&payload).is_err(),
+                "exp={bad} 必须被拒（类型不对时不能跳过检查）"
+            );
+        }
+    }
+
+    /// `nbf` 出现但类型不对也必须被拒（修复前是静默跳过）。
+    #[test]
+    fn nbf_类型不对必须被拒() {
+        let v = verifier_for_claims();
+        let now = now_unix() as i64;
+        for bad in [
+            serde_json::json!("9999999999"), // 字符串形式，其实是个未来时间
+            serde_json::json!(null),
+            serde_json::json!([now]),
+        ] {
+            let payload = serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": now + 100, "nbf": bad.clone()
+            });
+            assert!(
+                v.check_claims(&payload).is_err(),
+                "nbf={bad} 必须被拒（类型不对时不能跳过检查）"
+            );
+        }
+    }
+
+    /// 负数 `exp`（远古时间）也应当被拒 —— 它是合法数值，走的是"已过期"分支。
+    #[test]
+    fn 负数_exp_必须被拒() {
+        let v = verifier_for_claims();
+        assert!(v
+            .check_claims(&serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": -1
+            }))
+            .is_err());
+    }
+
+    /// 正向：合法数值 `exp` / `nbf` 必须照常通过（别修得过头）。
+    #[test]
+    fn 合法时间数值必须通过() {
+        let v = verifier_for_claims();
+        let now = now_unix() as i64;
+        assert!(v
+            .check_claims(&serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": now + 3600
+            }))
+            .is_ok());
+        assert!(v
+            .check_claims(&serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": now + 3600, "nbf": now - 10
+            }))
+            .is_ok());
+        // nbf 允许 60 秒漂移
+        assert!(v
+            .check_claims(&serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": now + 3600, "nbf": now + 60
+            }))
+            .is_ok());
+        // exp 恰好等于 now：按"< now 才算过期"的口径应当通过
+        assert!(v
+            .check_claims(&serde_json::json!({
+                "iss": "https://idp", "aud": "frps", "exp": now
+            }))
+            .is_ok());
     }
 
     /// `skipIssuerCheck` / `skipExpiryCheck` 打开后要真的跳过。
@@ -1034,5 +1243,188 @@ mod tests {
         assert_eq!(v.subject_count(), 1, "同一 run_id 只应有一条绑定");
         let g = v.subjects.read().unwrap();
         assert_eq!(g.get("run-1").map(|s| s.as_str()), Some("bob"));
+    }
+
+    // ==================================================================
+    // G-2 回归（v0.5.5）：**合法的签名必须验得过**
+    //
+    // 这是本轮补上的**正向**用例。原先只有"验不过要拒绝"的测试，
+    // 于是 `jwk_to_spki` 把 RSA 公钥拼成 SPKI（而 ring 要 PKCS#1）
+    // 导致**验签恒失败**这个 bug 一直没被发现 —— 典型的"绿得不真实"。
+    //
+    // 向量是用 `cryptography` 真实生成并签名的（见 `tmp/gen_oidc_vectors.py`）：
+    // 私钥签 `VEC_MSG`，这里只放公钥的 JWK 参数与签名。
+    // ==================================================================
+
+    /// 固定的验签测试向量（由 openssl/`cryptography` 生成，一次性）。
+    /// 签名消息统一是 `b"nfrp-oidc-vector-v1"`。
+    const VEC_MSG: &[u8] = b"nfrp-oidc-vector-v1";
+
+    /// RSA-2048 的 JWK（n / e 均为 base64url 无填充）。
+    const VEC_RSA_N: &str = "rgeJoBlo848ca8HxC23HqjuT4KSmOduLmBWYoVSy8MIGOm6Qxwsk-vGJaWjFN7aKqpCvn6KD7TT3hq12_wDH9uRrTOTUqI1pjpoyPiJ1R79HaJjGYFW6FYEhXKHiNN_DqwlqDCK_Ds1DueufslubtdcKAbp38kMfKaiP_rJiznj6d0Jup0G5YjGTnqPihsuggk4oHyXMT4gKfYnNYekVCPpVUPptNidXOOi7-vIOQlIX8Xr2sr8iBF4gVSliLcIAOmItLqmenBnRh-Y5KXBEl9Q5MwW5SvNDjt7lTxDcFcgjqo6BOqGTC1PVCJXaqd626M52X1Mog1tYVLzch0sRbQ";
+    const VEC_RSA_E: &str = "AQAB";
+    const VEC_RSA_SIG: &[u8] = &[
+        0x99, 0x22, 0x0a, 0xdb, 0x91, 0x7f, 0xaf, 0xd6, 0x47, 0xc1, 0xd5, 0xc5, 0x54, 0x97, 0x4d,
+        0xfe, 0xf8, 0x39, 0xd5, 0xa7, 0x18, 0xf0, 0xf7, 0xa3, 0x87, 0xff, 0x00, 0xfc, 0xc5, 0x49,
+        0x8a, 0xc6, 0xb3, 0x88, 0x93, 0xdb, 0x92, 0x16, 0x53, 0x20, 0x8b, 0x36, 0xa0, 0x5d, 0xe7,
+        0x81, 0x6d, 0x4b, 0x02, 0xbc, 0x7a, 0x16, 0x25, 0xd4, 0x0d, 0xa0, 0x3f, 0x74, 0x08, 0x33,
+        0xdd, 0x69, 0x64, 0x59, 0x20, 0x05, 0x68, 0x1a, 0x4a, 0x06, 0x66, 0xbc, 0x82, 0xe4, 0xf5,
+        0x00, 0x2b, 0x7a, 0x93, 0xbb, 0xe7, 0xb7, 0xd2, 0xeb, 0xf5, 0x58, 0x4b, 0x34, 0xec, 0xb5,
+        0x4e, 0x01, 0x0e, 0x50, 0x8b, 0x81, 0x3a, 0x61, 0xfd, 0x9f, 0x23, 0xeb, 0x86, 0x02, 0xf5,
+        0xd6, 0x1c, 0x86, 0x1c, 0x23, 0x11, 0x08, 0xe6, 0x4a, 0x98, 0x6a, 0xd1, 0xbc, 0x92, 0x18,
+        0xaa, 0x77, 0x15, 0x93, 0x5c, 0xf9, 0x24, 0x02, 0x2a, 0x2d, 0x0d, 0x98, 0x93, 0x90, 0xb8,
+        0xb8, 0x1b, 0x18, 0x8c, 0x29, 0xd6, 0x54, 0xb1, 0x85, 0x54, 0xee, 0xe8, 0xf3, 0x1e, 0x29,
+        0x44, 0x7a, 0x5b, 0xe4, 0x30, 0x83, 0x06, 0xdc, 0xfe, 0x9c, 0xdf, 0x5c, 0x9b, 0x53, 0xc6,
+        0x89, 0xea, 0x97, 0x4d, 0x54, 0xdf, 0xeb, 0xc6, 0xd3, 0x23, 0x4d, 0x67, 0x86, 0x4f, 0x3c,
+        0xc1, 0x28, 0x69, 0xc7, 0xb1, 0x6a, 0x54, 0x6f, 0x31, 0xc1, 0xa8, 0xde, 0xeb, 0xf9, 0x93,
+        0x0e, 0x1f, 0x04, 0x77, 0xc5, 0x49, 0x8f, 0x21, 0x6a, 0xf3, 0x9f, 0x1c, 0xc0, 0x3a, 0x7a,
+        0x80, 0xad, 0xee, 0x83, 0xea, 0xcf, 0x6d, 0x85, 0x88, 0xa9, 0x84, 0x55, 0x95, 0x37, 0xeb,
+        0x3b, 0xdf, 0xf9, 0xc2, 0x6e, 0x95, 0x24, 0x7b, 0xdb, 0x1c, 0x73, 0xc0, 0x67, 0x17, 0x16,
+        0x0a, 0x2e, 0x1f, 0x47, 0x14, 0x7d, 0xbe, 0x92, 0x8d, 0x92, 0xa4, 0x98, 0x28, 0x64, 0x3c,
+        0x45,
+    ];
+
+    /// P-256 的 JWK 坐标。
+    const VEC_EC_X: &str = "LQ07yi77_AzxmnDTa6hYdUxVGwJAxi9GZqfrwaYCgrw";
+    const VEC_EC_Y: &str = "WHENFL6u1OIYLFdj9b0KoMQP1tNetbIwvRkpJDRUcGM";
+    const VEC_EC_SIG: &[u8] = &[
+        0x30, 0x44, 0x02, 0x20, 0x66, 0x97, 0xc3, 0xf8, 0xd8, 0x20, 0xa8, 0xd0, 0x73, 0xfe, 0x78,
+        0x8b, 0x00, 0xfe, 0x19, 0xc4, 0x60, 0x01, 0xe4, 0x84, 0x86, 0xaf, 0xdb, 0xe9, 0x75, 0xd2,
+        0x70, 0xf8, 0x53, 0xde, 0xa7, 0xce, 0x02, 0x20, 0x79, 0x0b, 0xe7, 0xfc, 0x27, 0xf8, 0xe8,
+        0x08, 0x3a, 0x63, 0xec, 0x38, 0x66, 0xd6, 0x6c, 0xf0, 0x21, 0x3e, 0x6f, 0xdf, 0xf1, 0x00,
+        0x7d, 0xd3, 0x0d, 0x72, 0x7b, 0x02, 0xc4, 0x98, 0x6a, 0x93,
+    ];
+
+    /// P-384 的 JWK 坐标。
+    const VEC_EC384_X: &str = "cBkF1dUOPGRohKdyMpCWaEIzkcG62tRP_H802F8d_1sNLeKdOwVTuW9aJ10lMm7k";
+    const VEC_EC384_Y: &str = "2uLvNj_6adqX5ReNs3Wuft6e6ZlrSfzFfxcOk6fiUoXUQamy1-N10woZ-a39CCte";
+    const VEC_EC384_SIG: &[u8] = &[
+        0x30, 0x65, 0x02, 0x31, 0x00, 0x85, 0x34, 0x2f, 0x62, 0xcb, 0x25, 0xb6, 0x76, 0x20, 0x42,
+        0x0b, 0x0d, 0x57, 0x61, 0x7a, 0x50, 0x15, 0xd3, 0x02, 0x6c, 0x45, 0x7b, 0xb3, 0xb4, 0x33,
+        0xd8, 0x3c, 0x14, 0x64, 0xf7, 0xc2, 0x3c, 0x81, 0xbb, 0x10, 0xba, 0x0d, 0x9d, 0xe0, 0xe2,
+        0x50, 0xf1, 0xa8, 0xee, 0x68, 0x6b, 0x3f, 0x15, 0x02, 0x30, 0x46, 0x36, 0x84, 0x3f, 0x45,
+        0x12, 0x2e, 0x4b, 0xeb, 0xe5, 0x55, 0xdb, 0x7f, 0x7f, 0x11, 0x1c, 0xbd, 0x0e, 0xab, 0x42,
+        0xdd, 0xb6, 0xb6, 0x15, 0xda, 0xa2, 0xd4, 0x56, 0x2d, 0x87, 0x80, 0x72, 0xf4, 0x83, 0xdc,
+        0xf5, 0x67, 0xce, 0xb7, 0x00, 0xdd, 0x0d, 0x34, 0xf4, 0xcd, 0x57, 0x01, 0xc6,
+    ];
+
+    fn rsa_jwk() -> Jwk {
+        Jwk {
+            kty: "RSA".into(),
+            kid: "vec-rsa".into(),
+            alg: "RS256".into(),
+            n: VEC_RSA_N.into(),
+            e: VEC_RSA_E.into(),
+            crv: String::new(),
+            x: String::new(),
+            y: String::new(),
+        }
+    }
+
+    fn ec_jwk(crv: &str, x: &str, y: &str) -> Jwk {
+        Jwk {
+            kty: "EC".into(),
+            kid: "vec-ec".into(),
+            alg: if crv == "P-256" {
+                "ES256".into()
+            } else {
+                "ES384".into()
+            },
+            n: String::new(),
+            e: String::new(),
+            crv: crv.into(),
+            x: x.into(),
+            y: y.into(),
+        }
+    }
+
+    /// 核心：RS256 的真签名必须验得过。
+    ///
+    /// 修复前这条会**失败** —— 因为 RSA 公钥被拼成了 SPKI，
+    /// 而 `RSA_PKCS1_2048_8192_SHA256` 要的是裸 PKCS#1。
+    #[test]
+    fn rsa_真签名必须验得过() {
+        let ok = verify_signature(&rsa_jwk(), "RS256", VEC_MSG, VEC_RSA_SIG)
+            .expect("验签不该报错（只是不匹配）");
+        assert!(
+            ok,
+            "RS256 的真签名验不过 —— 密钥编码格式不对（ring 要 PKCS#1，不是 SPKI）"
+        );
+    }
+
+    /// 核心：ES256 的真签名必须验得过。
+    ///
+    /// 修复前 EC 走的是同一个 `jwk_to_spki`，同样套了 SPKI 头，
+    /// 而 ring 的 ECDSA 要裸的未压缩点。
+    #[test]
+    fn es256_真签名必须验得过() {
+        let jwk = ec_jwk("P-256", VEC_EC_X, VEC_EC_Y);
+        let ok = verify_signature(&jwk, "ES256", VEC_MSG, VEC_EC_SIG).expect("验签不该报错");
+        assert!(ok, "ES256 的真签名验不过 —— EC 公钥不该套 SPKI");
+    }
+
+    /// ES384 同理（覆盖 P-384 那条路径）。
+    #[test]
+    fn es384_真签名必须验得过() {
+        let jwk = ec_jwk("P-384", VEC_EC384_X, VEC_EC384_Y);
+        let ok = verify_signature(&jwk, "ES384", VEC_MSG, VEC_EC384_SIG).expect("验签不该报错");
+        assert!(ok, "ES384 的真签名验不过");
+    }
+
+    /// 反向：**改一个字节**的签名必须验不过（防止"永远返回 true"这种假修复）。
+    #[test]
+    fn 篡改后的签名必须验不过() {
+        let mut bad = VEC_RSA_SIG.to_vec();
+        bad[0] ^= 0x01;
+        let ok = verify_signature(&rsa_jwk(), "RS256", VEC_MSG, &bad).expect("不该报错");
+        assert!(!ok, "改过的签名必须验不过");
+    }
+
+    /// 反向：**换了消息**也必须验不过。
+    #[test]
+    fn 换消息后签名必须验不过() {
+        let ok =
+            verify_signature(&rsa_jwk(), "RS256", b"other-message", VEC_RSA_SIG).expect("不该报错");
+        assert!(!ok, "消息不一致时签名必须验不过");
+    }
+
+    /// 反向：**换一把 key** 也必须验不过（覆盖"逐把试 key"的逻辑）。
+    #[test]
+    fn 换密钥后签名必须验不过() {
+        let mut other = rsa_jwk();
+        // 换成 EC 的坐标（仍是合法 base64url，但不是合法的 RSA 模数）
+        other.n = VEC_EC_X.to_string();
+        let ok = verify_signature(&other, "RS256", VEC_MSG, VEC_RSA_SIG);
+        // 允许 Err（长度/格式不对）或 Ok(false)，但**绝不能是 Ok(true)**
+        assert!(
+            !matches!(ok, Ok(true)),
+            "换了一把 key 却验过了 —— 验签形同虚设"
+        );
+    }
+
+    /// RSA 的密钥编码**必须是 PKCS#1**（不是 SPKI）—— 锁定格式，防回退。
+    #[test]
+    fn rsa_密钥编码必须是_pkcs1_而不是_spki() {
+        let k = jwk_to_ring_key(&rsa_jwk()).expect("构造公钥");
+        assert_eq!(k[0], 0x30, "应当是 SEQUENCE");
+        // 跳过 SEQUENCE 头，第一个内部元素必须是 INTEGER(0x02)。
+        // 若是 0x30，说明又套成了 SPKI 的 AlgorithmIdentifier。
+        let inner_start = if k[1] & 0x80 == 0 {
+            2
+        } else {
+            2 + (k[1] & 0x7f) as usize
+        };
+        assert_eq!(
+            k[inner_start], 0x02,
+            "RSA 公钥的第一个内部元素应是 INTEGER(n)；若是 0x30 说明又套成了 SPKI"
+        );
+    }
+
+    /// EC 的密钥编码**必须是裸未压缩点**（0x04 || X || Y），不是 SPKI。
+    #[test]
+    fn ec_密钥编码必须是裸点() {
+        let k = jwk_to_ring_key(&ec_jwk("P-256", VEC_EC_X, VEC_EC_Y)).expect("构造公钥");
+        assert_eq!(k.len(), 65, "P-256 未压缩点是 65 字节");
+        assert_eq!(k[0], 0x04, "首字节应是未压缩点标记 0x04");
     }
 }
