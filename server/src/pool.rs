@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -218,6 +218,18 @@ pub struct ClientState {
     /// 用 `AtomicBool` 而不是普通 `bool`：客户端建好之后要由控制连接那边
     /// 补写（角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到）。
     allow_manage: AtomicBool,
+    /// 控制连接的**源 IP**（v0.5.5，配合 A-1 的互通安全回退）。
+    ///
+    /// 用途：官方 frpc 在默认配置下**不给工作连接带 `privilege_key`**
+    /// （见官方 `pkg/auth/token.go` 的 `SetNewWorkConn`：未配
+    /// `additionalScopes = ["NewWorkConns"]` 时直接 `return nil`）。
+    /// 所以"要求凭证"这条策略不能一刀切 —— 会把官方客户端挡在门外
+    /// （实测：`工作连接凭证不符` ⇒ 官方 frpc 的 tcp 代理完全不通）。
+    ///
+    /// 折中方案：**凭证为空时，要求工作连接的源 IP 与控制连接一致**。
+    /// 官方 frpc 天然满足（同一个进程、同一个出口），零兼容代价；
+    /// 而攻击者要伪造源 IP 比"知道 run_id"难得多。
+    peer_ip: IpAddr,
 }
 
 impl ClientState {
@@ -234,6 +246,7 @@ impl ClientState {
         conn_limit: Limit,
         backlog_limit: Limit,
         proxy_limit: Limit,
+        peer_ip: IpAddr,
     ) -> Self {
         Self {
             run_id,
@@ -254,7 +267,13 @@ impl ClientState {
             // 默认**允许**：未启用 RBAC 时行为必须与老版本完全一致。
             // 启用 RBAC 后由控制连接按角色覆盖。
             allow_manage: AtomicBool::new(true),
+            peer_ip,
         }
+    }
+
+    /// 控制连接的源 IP（工作连接的空凭证回退校验要用，见字段注释）。
+    pub fn peer_ip(&self) -> IpAddr {
+        self.peer_ip
     }
 
     /// 按角色写入"面板能不能管理这个客户端"。握手期解析出角色后立刻调用。
@@ -514,6 +533,7 @@ pub(crate) fn dummy_client(run_id: &str) -> Arc<ClientState> {
         Limit::unlimited(),
         Limit::unlimited(),
         Limit::unlimited(),
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
     ))
 }
 
@@ -562,6 +582,7 @@ mod tests {
             conn,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
     }
 
@@ -633,6 +654,7 @@ mod tests {
             Limit::unlimited(),
             Limit::unlimited(),
             Limit::unlimited(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         );
         c.submit_work(work(Instant::now()));
         assert_eq!(c.idle_work_conns(), 1);
