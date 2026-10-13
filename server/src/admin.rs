@@ -62,6 +62,39 @@ pub async fn add_proxy(
             "客户端 [{run_id}] 所属角色不允许被面板管理（allowManage = false）"
         ));
     }
+
+    // ★★ v0.5.5 修（第四轮 D-AUTH-02）：**面板路径也必须过 RBAC 的逐条代理检查**。
+    //
+    // `sec.check_proxy()`（角色允许的代理类型 / 端口范围 / maxProxies）
+    // 原先全仓**唯一**的调用点是客户端发 `NewProxy` 的那条路
+    // （`serve.rs` 的 `register_proxy` 上游）。而面板这条路
+    // （`dashboard.rs` → 本函数 → `serve::register_proxy`）只查了 `allow_manage`
+    // —— 那是有用的，但它不是类型/端口/配额限制。
+    //
+    // 实弹（`tmp/audit4-verify-D2.py`）：角色 `guest` 配
+    // `allowProxyTypes=["http"]` / `portRange="30000-30010"` / `maxProxies=1`，
+    //   * 客户端自己发 `tcp:30005` ⇒ **被拒**（RBAC 有效）；
+    //   * 面板发 `tcp:12347/12348/12349` ⇒ **三条全部生效**。
+    // 即：面板可达时，任何被角色刻意收紧的客户端都能被越权开端口。
+    //
+    // 这与第四轮 H1 是**同一类**：同一个语义（"这个客户端能不能注册这条代理"）
+    // 在两条路径上用了两套规则。修法就是把闸门补到这条路径上。
+    //
+    // ★ 放在最前面（问客户端之前）：先拦下来才不会有"客户端已经认下、
+    //   服务端却拒绝"的半成品状态。
+    let sec = registry.security();
+    let role = sec
+        .role_for(&client.user)
+        .map_err(|e| format!("客户端 [{}] 的角色解析失败，拒绝面板下发：{e}", client.user))?;
+    sec.check_proxy(
+        &role,
+        &proxy.name,
+        &proxy.proxy_type,
+        proxy.remote_port,
+        client.proxy_count(),
+    )
+    .map_err(|e| format!("面板下发被权限模型拒绝：{e}"))?;
+
     let name = proxy.name.clone();
 
     // 1) 客户端先认下这条代理
@@ -124,9 +157,12 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
 
     // 服务端这侧：端口 / 域名 / visitor 全摘掉（与客户端主动 CloseProxy 同款清理）
     let wire_name = nfrp_common::util::add_user_prefix(&client.user, name);
-    registry.visitors.remove(&wire_name);
+    // ★ v0.5.5（第四轮 B-1）：同样带上归属，避免误删其它租户的同名 visitor 记录。
+    registry.visitors.remove(&client, &wire_name);
     if let Some(t) = registry.vhosts() {
-        t.remove_proxy(&wire_name);
+        // ★ v0.5.5（第四轮 H1）：带上是**哪个客户端**的代理 ——
+        //   只按名字摘会误删其它租户的同名路由。
+        t.remove_proxy(&client, &wire_name);
     }
     if let Some(port) = client.stop_proxy(&wire_name) {
         registry.release_port(port, &client, &wire_name);
@@ -234,6 +270,7 @@ mod tests {
             conn,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
     }
 
@@ -285,5 +322,78 @@ mod tests {
         assert!(c.is_stopped(), "被踢的客户端必须标记为已停止");
         // 再踢一次应当是"没有这个客户端"，而不是 panic
         assert!(kick(&r, "c1", "").await.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // 第四轮 D-AUTH-02：面板路径也要过 RBAC
+    // ------------------------------------------------------------------
+
+    /// 造一个"角色把类型收紧到只允许 http"的注册表。
+    fn registry_with_guest_role() -> Arc<Registry> {
+        let r = Arc::new(Registry::unlimited());
+        let toml = r#"
+[[roles]]
+name = "guest"
+users = ["alice"]
+allowProxyTypes = ["http"]
+portRange = "30000-30010"
+maxProxies = 1
+"#;
+        let cfg: ServerConfig = nfrp_common::config::parse_server_toml(toml).expect("解析角色");
+        r.set_security(Arc::new(
+            crate::guard::SecurityContext::from_config(&cfg).expect("构造安全上下文"),
+        ));
+        r
+    }
+
+    /// ★★ D-AUTH-02 回归：**面板下发**同样受 RBAC 的类型限制。
+    ///
+    /// 修复前 `sec.check_proxy` 只在客户端 `NewProxy` 那条路上调用，
+    /// 面板路径只查 `allow_manage` ⇒ 角色收紧的客户端可被面板越权开端口
+    /// （实弹：`guest` 角色下客户端发 tcp 被拒，面板发 tcp 三条全过）。
+    #[tokio::test]
+    async fn 面板下发必须受_rbac_类型限制() {
+        let r = registry_with_guest_role();
+        let c = client("c1"); // user = "alice"，命中 guest 角色
+        r.insert(c.clone()).expect("插入");
+        let cfg = Arc::new(ServerConfig::default());
+
+        // guest 只许 http ⇒ tcp 必须被拒
+        let p = ProxyConfig {
+            name: "sneaky".into(),
+            proxy_type: "tcp".into(),
+            local_addr: "127.0.0.1:9".into(),
+            remote_port: 12347,
+            ..Default::default()
+        };
+        let e = add_proxy(&cfg, &r, "c1", p)
+            .await
+            .expect_err("面板下发 tcp 必须被角色拒绝");
+        assert!(
+            e.contains("tcp") || e.contains("权限"),
+            "错误要说清是权限拒绝：{e}"
+        );
+    }
+
+    /// ★★ D-AUTH-02 回归：**面板下发**同样受 RBAC 的端口范围限制。
+    #[tokio::test]
+    async fn 面板下发必须受_rbac_端口范围限制() {
+        let r = registry_with_guest_role();
+        let c = client("c1");
+        r.insert(c.clone()).expect("插入");
+        let cfg = Arc::new(ServerConfig::default());
+
+        // http 类型允许，但端口 12347 不在 30000-30010 内 ⇒ 仍须被拒
+        let p = ProxyConfig {
+            name: "outofrange".into(),
+            proxy_type: "http".into(),
+            local_addr: "127.0.0.1:9".into(),
+            remote_port: 12347,
+            ..Default::default()
+        };
+        let e = add_proxy(&cfg, &r, "c1", p)
+            .await
+            .expect_err("端口越界必须被角色拒绝");
+        assert!(!e.is_empty(), "应当给出拒绝理由：{e}");
     }
 }
