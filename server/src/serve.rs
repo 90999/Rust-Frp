@@ -713,7 +713,9 @@ async fn handle_frp_stream(
                 )
                 .await
             }
-            Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, &sec, registry).await,
+            Ok(ServerAccept::Work { conn, msg }) => {
+                handle_work(conn, msg, &sec, registry, peer).await
+            }
             Ok(ServerAccept::Visitor { conn, msg }) => {
                 handle_visitor(conn, msg, registry, cfg.clone()).await
             }
@@ -780,6 +782,8 @@ async fn handle_control(
         conn_limit,
         backlog_limit,
         proxy_limit,
+        // 控制连接的源 IP：工作连接的空凭证回退校验要用（见 handle_work）
+        peer.ip(),
     ));
     // 角色的 `allowManage` 在这里落地：面板能不能增删这个客户端的代理。
     // 角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到，
@@ -971,11 +975,18 @@ async fn handle_control(
                             .detail("客户端主动关闭"),
                         );
                         // stcp / xtcp 的代理名
-                        registry.visitors.remove(&m.proxy_name);
+                        //
+                        // ★ v0.5.5（第四轮 B-1）：同样必须带上发起方的 client ——
+                        //   只按名字摘会摘掉别的租户的同名 visitor 记录（跨租户 DoS）。
+                        //   这是 H1 修复漏掉的第二处（同一根因）。
+                        registry.visitors.remove(&client, &m.proxy_name);
                         // 客户端主动关代理时，它占的 http/https 域名也得摘掉，
                         // 否则域名会一直被占着、重连注册同一个域名会被判冲突
+                        //
+                        // ★ v0.5.5（第四轮 H1）：必须带上**发起方**的 client ——
+                        //   只按名字摘会把别的租户的同名路由一起摘掉（跨租户 DoS）。
                         if let Some(t) = registry.vhosts() {
-                            t.remove_proxy(&m.proxy_name);
+                            t.remove_proxy(&client, &m.proxy_name);
                         }
                         // tcp / udp 的公网端口同理：客户端这边只是记账，
                         // 端口是注册表管的，必须显式还回去
@@ -1421,26 +1432,149 @@ async fn handle_work(
     msg: NewWorkConn,
     sec: &crate::guard::SecurityContext,
     registry: Arc<Registry>,
+    peer: SocketAddr,
 ) -> Result<()> {
     let client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
 
-    // OIDC + additionalScopes 含 NewWorkConns：工作连接上必须带一个
-    // **与登录同 subject** 的有效 token。
+    // ★★ v0.5.5 修（第四轮 A-1，高危）：工作连接必须绑定到**发起它的那个客户端**。
     //
-    // 这条挡的是：拿到 run_id 的人自己新建一条工作连接，绕过
-    // "工作连接必须来自同一个客户端"这个隐含前提。
-    if sec.auth_cfg.check_new_work_conns()
-        && sec.auth_method() == nfrp_common::security::AuthMethod::Oidc
-    {
-        if let Err(e) = sec.verify_followup(&msg.privilege_key, "新工作连接", &msg.run_id) {
+    // 原先这里被 `auth_method() == Oidc` 门住，于是 **token 模式（默认）下
+    // `msg.privilege_key` / `msg.timestamp` 从头到尾没人读** —— `run_id` 成了
+    // 唯一门槛。而 `run_id` 是在 v1 的 `LoginResp` 里**明文**下发的
+    // （登录前的报文不加密），所以拿到它并不难。
+    //
+    // 实测危险（`tmp/audit4-verify-A2b.py`，用真 frpc 拿真 run_id）：
+    //
+    // ```text
+    // privilege_key 空 + ts=0        -> 接受（连接保持）
+    // privilege_key 错误 + ts=1       -> 接受
+    // privilege_key 垃圾 + 当前 ts     -> 接受
+    // privilege_key 任意 + ts=-1      -> 接受
+    // 服务端日志：工作连接进入空闲池 client=client-83284   × 5
+    // ```
+    //
+    // 后果：攻击者往**受害者的空闲工作连接池**里灌自己的连接，
+    // 此后连到受害者隧道的用户流量会落到攻击者的连接上 —— 完整 MITM。
+    // A 组独立复现时 6/6 用户连接全部被劫持。
+    //
+    // ★★ 但"一刀切要求凭证"会**破坏与官方 frpc 的互通** —— 这是实测出来的，
+    //   不是推测。官方 `pkg/auth/token.go` 的 `SetNewWorkConn`：
+    //
+    // ```go
+    // if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeNewWorkConns) {
+    //     return nil          // ← 不改 PrivilegeKey，保持零值 ""
+    // }
+    // ```
+    //
+    //   即**默认配置下官方 frpc 的工作连接不带凭证**。第一版修复直接要求
+    //   "凭证必须等于 auth_key(token, ts)"，实测结果（`tmp/audit4-a1-diag.py`）：
+    //
+    // ```text
+    // DEBUG yamux stream 结束：工作连接凭证不符（privilege_key 不是本会话 token 派生的）
+    // → 官方 frpc 的 tcp 代理完全不通（用户连接超时）
+    // ```
+    //
+    //   README 明确承诺"官方客户端不需要改任何配置就能连上"，所以不能这么修。
+    //
+    // ★★ 最终策略（既不破坏互通、又堵住劫持）：
+    //
+    // | 凭证 | 处理 |
+    // |---|---|
+    // | **非空** | 必须等于 `auth_key(token, ts)`（NFrp 客户端走这条） |
+    // | **为空** | 要求工作连接的**源 IP 与控制连接一致**（官方 frpc 走这条） |
+    //
+    //   官方 frpc 天然满足"同源 IP"（同一个进程、同一个出口），**零兼容代价**；
+    //   而攻击者要伪造源 IP 比"知道 run_id"难得多。这不是完美方案（NAT 后的
+    //   同网段攻击者仍可能同 IP），但比"只查 run_id"强一个数量级。
+    //
+    //   实测验证：官方 frpc 0.71.0 经本服务端的 tcp 代理**转发成功**，
+    //   而伪造凭证的四种形态（空/错误/垃圾/ts=-1）在"空凭证 + 源 IP 不同"
+    //   的组合下全部被拒。
+    let is_oidc = sec.auth_method() == nfrp_common::security::AuthMethod::Oidc;
+    if is_oidc {
+        // OIDC：沿用原有语义（验签 + subject 绑定到会话）
+        if sec.auth_cfg.check_new_work_conns() {
+            if let Err(e) = sec.verify_followup(&msg.privilege_key, "新工作连接", &msg.run_id)
+            {
+                registry.audit().record(
+                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                        .client(msg.run_id.clone())
+                        .detail(format!("工作连接凭证复核失败：{e:#}")),
+                );
+                anyhow::bail!("工作连接凭证复核失败：{e:#}");
+            }
+        }
+    } else {
+        // token 模式
+        let token = sec.auth().secret().to_string();
+        if token.is_empty() {
+            // 空 token = 认证本来就没开（启动时已明确告警）。此时凭证无从校验，
+            // 仍然要求同源 IP —— 比完全放行强。
+            if peer.ip() != client.peer_ip() {
+                registry.audit().record(
+                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                        .client(msg.run_id.clone())
+                        .ip(peer.ip().to_string())
+                        .detail(format!(
+                            "工作连接源 IP {} 与控制连接 {} 不一致（空 token 模式下仍拒绝）",
+                            peer.ip(),
+                            client.peer_ip()
+                        )),
+                );
+                anyhow::bail!(
+                    "工作连接来源与登录来源不一致（{} vs {}）",
+                    peer.ip(),
+                    client.peer_ip()
+                );
+            }
+        } else if !msg.privilege_key.is_empty() {
+            // 带了凭证 ⇒ **必须正确**。这是 NFrp 客户端的路径，
+            // 也是攻击者最容易露馅的地方（凭证 = md5(token+ts)，猜不出来）。
+            let expect = nfrp_common::frp::msg::auth_key(&token, msg.timestamp);
+            if !nfrp_common::frp::msg::constant_time_eq(&expect, &msg.privilege_key) {
+                registry.audit().record(
+                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                        .client(msg.run_id.clone())
+                        .ip(peer.ip().to_string())
+                        .detail("工作连接 privilege_key 与 token 不符".to_string()),
+                );
+                anyhow::bail!("工作连接凭证不符（privilege_key 不是本会话 token 派生的）");
+            }
+        } else if client.caps().work_conn_cred {
+            // ★★ 这条会话**自己声明过**"我的工作连接带凭证"
+            //   （NFrp ≥ 0.5.5 恒声明，见 `client/src/main.rs`）。
+            //   那它就必须带，且必须正确 —— **空凭证也拒**。
+            //
+            //   这是最有说服力的判据：`work_conn_cred` 是**受害者自己**在
+            //   登录时声明的，攻击者改不了它。所以"拿 run_id 冒充"这条路
+            //   在这里彻底断了，不必依赖源 IP（同 NAT 后的攻击者也拦得住）。
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
                     .client(msg.run_id.clone())
-                    .detail(format!("工作连接凭证复核失败：{e:#}")),
+                    .ip(peer.ip().to_string())
+                    .detail("会话声明了 workConnCred 能力，但工作连接未携带凭证".to_string()),
             );
-            anyhow::bail!("工作连接凭证复核失败：{e:#}");
+            anyhow::bail!("该会话声明了工作连接凭证能力，但本次工作连接未携带凭证");
+        } else if peer.ip() != client.peer_ip() {
+            // 没声明这个能力（官方 frpc、或老版 NFrp）：官方默认**不带凭证**，
+            // 所以不能拦。退而求其次 —— 要求同源 IP。
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                    .client(msg.run_id.clone())
+                    .ip(peer.ip().to_string())
+                    .detail(format!(
+                        "工作连接源 IP {} 与控制连接 {} 不一致（无凭证时必须同源）",
+                        peer.ip(),
+                        client.peer_ip()
+                    )),
+            );
+            anyhow::bail!(
+                "工作连接来源与登录来源不一致（{} vs {}）—— 无凭证时必须同源",
+                peer.ip(),
+                client.peer_ip()
+            );
         }
     }
     // 工作连接必须与控制连接用同一套线协议 —— 与官方 frps 的
@@ -1530,16 +1664,26 @@ async fn handle_visitor(
 
     // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
     if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none() {
+        // ★★ v0.5.5 修（第四轮 A-3）：**这一条无论如何都只回通用文案**，
+        // 不受 `detailed_errors_to_client` 影响。
+        //
+        // 为什么单独处理它：它本质上是一个 **run_id 在线预言机** ——
+        // 攻击者可以拿任意 run_id 来问"这个会话在线吗"。而
+        // `detailed_errors_to_client` 默认是 `true`（与官方一致），
+        // 于是默认配置下这个预言机是**敞开的**（实弹 `tmp/a4_t10_state.py`
+        // 打出三条可区分文本）。
+        //
+        // 为什么可以直接忽略那个开关：`run_id` 是**服务端/客户端内部**生成的，
+        // 合法的 visitor 从来不需要"我这条 run_id 在不在线"这个细节 ——
+        // 那个开关的存在意义是帮用户排查**自己的配置**（代理名、密钥），
+        // 而这条错误里没有任何用户配置信息。所以对它脱敏**不损失可用性**，
+        // 只堵掉探测面。详情仍然进服务端日志与审计。
         return reject_with(
             &mut conn,
             &proxy_name,
             format!("no client control found for run id [{}]", msg.run_id),
             &registry,
-            // ★ 脱敏：不回显 run_id（那是在探测某个会话是否在线）。
-            Some(cfg.error_to_client(
-                "visitor connection failed",
-                &format!("no client control found for run id [{}]", msg.run_id),
-            )),
+            Some("visitor connection failed".to_string()),
         )
         .await;
     }
@@ -1924,6 +2068,7 @@ mod tests {
             conn_limit,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
     }
 
