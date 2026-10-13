@@ -689,6 +689,7 @@ mod tests {
             conn,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
     }
 
