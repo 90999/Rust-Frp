@@ -125,8 +125,45 @@ pub struct VhostTable {
     inner: Mutex<VhostInner>,
 }
 
+/// "这两条路由属于同一个客户端吗"（第四轮 H1）。
+///
+/// 用 `Arc::ptr_eq` 比**连接身份**，而不是比客户端可自报的字段：
+/// `VhostRoute.client` 是服务端在握手后持有的 `Arc<ClientState>`，
+/// 客户端无法伪造。与 `unregister_client` 用的是同一套判据。
+fn same_owner(a: &VhostRoute, b: &VhostRoute) -> bool {
+    Arc::ptr_eq(&a.client, &b.client)
+}
+
 impl VhostTable {
     /// 注册路由；同一域名 + 同一路径前缀冲突时报错（与 frp 行为一致）。
+    ///
+    /// ★★ v0.5.5 修（第四轮 H1）：**"这条路由是不是我的"必须同时比客户端身份，
+    /// 不能只比代理名。**
+    ///
+    /// 原先这里三处都只比 `proxy_name`：
+    ///
+    /// ```ignore
+    /// let same_proxy = existing.proxy_name == route.proxy_name;
+    /// ...
+    /// list.retain(|r| r.proxy_name != route.proxy_name);
+    /// ```
+    ///
+    /// 而 `proxy_name` 是**线协议名** `{user}.{name}`，其中的 `user` 由客户端在
+    /// 登录报文里**自报**（`serve.rs:774` 的 `login.user`），默认配置（无 `[[roles]]`）
+    /// 下 `role_for` 对任何用户名都返回 unrestricted（`security.rs:785`）。
+    ///
+    /// 于是两个**不同租户**只要声明同一个 `user`，就得到**同一个 wire name**：
+    /// `same_proxy` 为真 ⇒ 冲突检查被跳过 ⇒ `retain` 把**对方**的路由删掉 ⇒
+    /// 攻击者顶掉受害者已生效的域名，之后发往该域名的**全部流量**（含 Cookie、
+    /// Authorization）都改投攻击者的内网服务。
+    ///
+    /// 实测（`tmp/audit4-probe-vhost-hijack.py`）：受害者注册后 `web.test` 回
+    /// `I-AM-VICTIM`，攻击者用同一 `user` 注册同名代理后变成 `I-AM-ATTACKER`。
+    ///
+    /// 对照：**TCP 端口那条路径没有这个洞**（`registry.rs:573` 用的是
+    /// `same_client(&b.client, &client) && b.proxy_name == proxy_name`）。
+    /// 也就是说"这条代理是不是我的"这个判断，仓库里**已经有一处写对了**，
+    /// 只是没铺到 vhost。本函数与下面的 `remove_proxy` 就是把那半截补上。
     pub fn register(&self, route: Arc<VhostRoute>) -> Result<()> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let list = if let Some(suffix) = route.domain.strip_prefix("*.") {
@@ -135,7 +172,9 @@ impl VhostTable {
             g.exact.entry(route.domain.clone()).or_default()
         };
         for existing in list.iter() {
-            let same_proxy = existing.proxy_name == route.proxy_name;
+            // ★ 同一个客户端 + 同一个名字，才算"同一条代理的重复注册"。
+            let same_proxy =
+                same_owner(existing, &route) && existing.proxy_name == route.proxy_name;
             // 只有**完全相同**的路径才算冲突。
             //
             // 早先这里把"前缀互相包含"也算冲突（`/api` 与 `/api/admin` 不能共存），
@@ -156,7 +195,8 @@ impl VhostTable {
                 );
             }
         }
-        list.retain(|r| r.proxy_name != route.proxy_name);
+        // ★ 只清理**自己**的旧路由（同一客户端 + 同名），不再误删别人的。
+        list.retain(|r| !(same_owner(r, &route) && r.proxy_name == route.proxy_name));
         list.push(route);
         Ok(())
     }
@@ -166,17 +206,22 @@ impl VhostTable {
     /// 早先只有 `unregister_client`，于是客户端单独关掉一个 http 代理时，
     /// 域名仍然留在表里：重连再注册同一个域名会被判成路径冲突，
     /// 而且请求还会被路由到一个已经关掉的代理上。
-    pub fn remove_proxy(&self, proxy_name: &str) -> bool {
+    ///
+    /// ★★ v0.5.5 修（第四轮 H1，同一根因的第二个面）：本函数原先也**只比名字**，
+    /// 于是客户端 A 对 `"victim.web"` 调一次 `CloseProxy`，就能把**受害者 B**
+    /// 的路由一起摘掉 —— 一次不需要任何权限的拒绝服务（B 的隧道在自己的客户端
+    /// 还活着的情况下对外静默失效）。现在必须带客户端身份。
+    pub fn remove_proxy(&self, client: &Arc<ClientState>, proxy_name: &str) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut removed = false;
         for list in g.exact.values_mut() {
             let before = list.len();
-            list.retain(|r| r.proxy_name != proxy_name);
+            list.retain(|r| !(Arc::ptr_eq(&r.client, client) && r.proxy_name == proxy_name));
             removed |= list.len() != before;
         }
         for list in g.wildcard.values_mut() {
             let before = list.len();
-            list.retain(|r| r.proxy_name != proxy_name);
+            list.retain(|r| !(Arc::ptr_eq(&r.client, client) && r.proxy_name == proxy_name));
             removed |= list.len() != before;
         }
         g.exact.retain(|_, v| !v.is_empty());
@@ -910,10 +955,39 @@ where
             return Ok(());
         }
 
+        // ★★ v0.5.5 修（第四轮 C 组 TE.TE 走私）：**只接受"唯一的 chunked"**。
+        //
+        // H2 修的是 CL 侧，**TE 侧没修** —— 这是同一个教训的又一次复现。
+        // 原先判定用 `contains("chunked")`（"只要出现就按 chunked 解帧"），
+        // 而 RFC 7230 §3.3.3 规定传输编码看**最后一个** token，且转发时
+        // `Transfer-Encoding` 是**原样**搬给上游的 ⇒ 两边口径不一致 = 走私：
+        //
+        //   `chunked, identity` / `xchunked` / `chunked, gzip`
+        //   ⇒ NFrp 按 chunked 读完，上游（按 RFC）认为不是 chunked
+        //   ⇒ 剩余字节被上游当成**下一个请求**。
+        //
+        // 修法与 CL 侧同款：**双方口径必须完全一致**，做不到就 400。
+        // 未知编码我们本来就处理不了（没有解码器），拒绝而不是猜。
+        if nfrp_common::http_relay::transfer_encoding_is_unsupported(&req) {
+            debug!(%peer, te = ?req.get("transfer-encoding"),
+                   "不支持的 Transfer-Encoding 形态，按走私风险直接拒绝");
+            io.stream
+                .write_all(&simple_response(
+                    "400 Bad Request",
+                    "Transfer-Encoding 只支持唯一的 chunked\n",
+                ))
+                .await?;
+            return Ok(());
+        }
+
         let body = if let Some(te) = req.get("transfer-encoding") {
-            if te.to_ascii_lowercase().contains("chunked") {
+            // ★ 复用公共判定（与转发侧同一个口径），不要再写一遍 contains
+            if nfrp_common::http_relay::is_chunked(&req) {
                 io.read_chunked().await?
             } else {
+                // 走到这里说明通过了上面的检查，理论上不可能；
+                // 但留一条明确的日志，别静默把 body 丢掉。
+                debug!(%peer, te = %te, "既不是 chunked 又通过了校验，按无体处理");
                 Vec::new()
             }
         } else if has_cl {
@@ -1175,6 +1249,31 @@ mod tests {
         route(name, domain, &["/"], VhostKind::Http)
     }
 
+    /// 用**指定的**客户端构造路由（第四轮 H1 的测试要用它来区分租户）。
+    ///
+    /// `route()` 每次都会新建一个 `Arc<ClientState>`，两个路由即便同名也属于
+    /// **不同**租户 —— 这正好是 H1 要覆盖的场景，所以需要能显式传入归属。
+    fn route_of(
+        client: &Arc<ClientState>,
+        name: &str,
+        domain: &str,
+        locations: &[&str],
+    ) -> Arc<VhostRoute> {
+        Arc::new(VhostRoute {
+            proxy_name: name.to_string(),
+            client: client.clone(),
+            domain: domain.to_string(),
+            locations: locations.iter().map(|s| s.to_string()).collect(),
+            http_user: String::new(),
+            http_pwd: String::new(),
+            route_by_http_user: String::new(),
+            rewrite_host: String::new(),
+            req_headers: HashMap::new(),
+            resp_headers: HashMap::new(),
+            kind: VhostKind::Http,
+        })
+    }
+
     fn table_with(routes: Vec<Arc<VhostRoute>>) -> VhostTable {
         let t = VhostTable::default();
         for r in routes {
@@ -1338,16 +1437,91 @@ mod tests {
         );
     }
 
+    /// 同一条代理（**同一客户端**同名）重复注册 ⇒ 替换而非堆积。
+    ///
+    /// ★ v0.5.5（第四轮 H1）：这个用例现在必须显式用**同一个** client ——
+    /// 原先 `route()` 每次都新建 Arc，两个路由其实属于不同租户，
+    /// 恰好因为修复前的代码"只比名字"才通过。修复后它正确地判成了冲突，
+    /// 于是这条测试暴露了自己在无意中依赖了那个 bug（见下面的 H1 用例）。
     #[test]
     fn same_proxy_reregistration_replaces_old_route() {
         let t = VhostTable::default();
-        t.register(route("same", "x.com", &["/old"], VhostKind::Http))
+        let me = dummy_client("me");
+        t.register(route_of(&me, "same", "x.com", &["/old"]))
             .unwrap();
-        t.register(route("same", "x.com", &["/new"], VhostKind::Http))
+        t.register(route_of(&me, "same", "x.com", &["/new"]))
             .unwrap();
         let list = { t.inner.lock().unwrap().exact.get("x.com").cloned().unwrap() };
-        assert_eq!(list.len(), 1, "同名代理重复注册应替换而非堆积");
+        assert_eq!(list.len(), 1, "同一客户端的同名代理重复注册应替换而非堆积");
         assert_eq!(list[0].locations, vec!["/new"]);
+    }
+
+    // ------------------------------------------------------------------
+    // 第四轮 H1：跨租户的域名路由劫持
+    // ------------------------------------------------------------------
+
+    /// ★★ H1 核心回归：**不同租户**用同一个代理名注册同一个域名 ⇒ 必须被拒。
+    ///
+    /// 修复前的行为：`same_proxy` 只比名字 ⇒ 判成"同一条代理的重复注册" ⇒
+    /// 跳过冲突检查 ⇒ `retain` 把**对方**的路由删掉 ⇒ 攻击者顶掉受害者的域名。
+    ///
+    /// 修复后：`same_owner` 比 `Arc::ptr_eq`，两个租户 ⇒ 不是 same_proxy ⇒
+    /// 同名同路径 ⇒ 走冲突检查 ⇒ 拒绝。
+    #[test]
+    fn 跨租户同名代理不得顶掉别人的域名路由() {
+        let t = VhostTable::default();
+        let victim = dummy_client("victim-run");
+        let attacker = dummy_client("attacker-run");
+
+        // 受害者先注册并生效
+        t.register(route_of(&victim, "victim.web", "web.test", &["/"]))
+            .expect("受害者注册");
+        let (hit, _) = t
+            .lookup("web.test", "/", None, VhostKind::Http)
+            .expect("域名应可用");
+        assert!(Arc::ptr_eq(&hit.client, &victim), "域名此时应归受害者");
+
+        // 攻击者用**同一个代理名**注册**同一个域名** ⇒ 必须被拒
+        let err = t
+            .register(route_of(&attacker, "victim.web", "web.test", &["/"]))
+            .expect_err("跨租户同名同域名必须被拒绝");
+        let msg = err.to_string();
+        assert!(msg.contains("已被代理"), "错误要说清冲突：{msg}");
+
+        // ★ 关键断言：域名**仍然**归受害者，没有被顶掉
+        let (hit2, _) = t
+            .lookup("web.test", "/", None, VhostKind::Http)
+            .expect("域名仍应可用");
+        assert!(
+            Arc::ptr_eq(&hit2.client, &victim),
+            "攻击者注册被拒后，域名必须仍归受害者"
+        );
+        assert_eq!(hit2.proxy_name, "victim.web");
+    }
+
+    /// H1 的第二个面：客户端 A 不能靠 `CloseProxy` 摘掉 B 的同名路由。
+    #[test]
+    fn 跨租户不得靠关代理摘掉别人的域名路由() {
+        let t = VhostTable::default();
+        let victim = dummy_client("victim-run");
+        let attacker = dummy_client("attacker-run");
+        t.register(route_of(&victim, "victim.web", "web.test", &["/"]))
+            .unwrap();
+
+        // 攻击者"关掉"一个自己根本没有的同名代理
+        let removed = t.remove_proxy(&attacker, "victim.web");
+        assert!(!removed, "攻击者没有这条代理，不该摘掉任何东西");
+        assert!(
+            t.lookup("web.test", "/", None, VhostKind::Http).is_some(),
+            "受害者的域名路由必须还在"
+        );
+
+        // 受害者自己关才有效
+        assert!(t.remove_proxy(&victim, "victim.web"));
+        assert!(
+            t.lookup("web.test", "/", None, VhostKind::Http).is_none(),
+            "持有者自己关应当真的摘掉"
+        );
     }
 
     #[test]
