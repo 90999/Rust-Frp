@@ -681,14 +681,23 @@ fn status_json(hub: &Arc<Hub>) -> String {
 }
 
 fn proxies_json(hub: &Arc<Hub>) -> String {
-    let dynamic = hub.store.dynamic_names();
     let items: Vec<serde_json::Value> = hub
         .proxies
         .list()
         .iter()
         .map(|p| {
             let mut v = proxy_json(hub, p);
-            v["dynamic"] = serde_json::Value::Bool(dynamic.contains(&p.name));
+            // ★ v0.5.5（第四轮 F2/F3）：`dynamic` 改用**代理表自己的来源标记**，
+            // 而不是从 store 的名字列表间接推断。
+            //
+            // 原先写的是 `hub.store.dynamic_names().contains(&p.name)`：
+            // store 没配（`[store] path` 留空，默认）时它恒为空 ⇒
+            // 界面上"从面板加的代理"也会显示成非动态，用户据此以为删不掉。
+            // 现在直接问表里那条记录属于谁 —— 与"面板能不能删它"用的是
+            // **同一份事实**，不会再出现界面与实际能力不一致。
+            v["dynamic"] = serde_json::Value::Bool(
+                hub.proxies.origin_of(&p.name) == Some(crate::registry::ProxyOrigin::Dynamic),
+            );
             v
         })
         .collect();
