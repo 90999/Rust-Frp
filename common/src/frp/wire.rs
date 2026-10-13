@@ -171,6 +171,22 @@ pub fn new_client_hello(transport: &str, tls: bool, tcp_mux: bool) -> ClientHell
 }
 
 /// 服务端校验 ClientHello（对应 `ValidateClientHello`）。
+///
+/// ★ v0.5.5 修（第四轮 A-5）：`clientRandom` 补上 **base64 形态与长度**校验。
+///
+/// 原先只查"非空"（`is_empty()`）—— 于是 `clientRandom = "!!!"` 这种
+/// 根本不是 base64 的串也能通过协商。实际影响很小（见下），但
+/// **在协商阶段就报错**比"走到密钥派生再失败"清楚得多。
+///
+/// 为什么影响小：`client_random` 并不直接当密钥材料用 —— 它对密钥的贡献
+/// 只通过 transcript 哈希（`crypto::transcript_hash` 用的是 ClientHello /
+/// ServerHello 的**原始负载字节**）。密钥的真正强度来自 `token`。
+/// 所以这不是漏洞，是**输入校验的完备性**问题。
+///
+/// 校验口径刻意**宽松**（不查精确长度）：官方各版本发的长度不一定都等于
+/// `CRYPTO_RANDOM_SIZE`，卡死长度会有互通风险。这里只要求
+/// "是合法 base64（标准或 URL-safe、带不带填充都行）且解码后 ≥16 字节"——
+/// 足够挡掉明显的垃圾输入，又不会误伤合法客户端。
 pub fn validate_client_hello(hello: &ClientHello) -> Result<()> {
     if !hello
         .capabilities
@@ -181,13 +197,37 @@ pub fn validate_client_hello(hello: &ClientHello) -> Result<()> {
     {
         bail!("unsupported message codec");
     }
-    if hello.capabilities.crypto.client_random.is_empty() {
+    let random = hello.capabilities.crypto.client_random.as_str();
+    if random.is_empty() {
         bail!("invalid crypto client random length 0");
+    }
+    match decode_client_random(random) {
+        Some(bytes) if bytes.len() >= 16 => {}
+        Some(bytes) => bail!("crypto client random 太短（{} 字节，至少 16）", bytes.len()),
+        None => bail!("crypto client random 不是合法的 base64"),
     }
     if select_algorithm(&hello.capabilities.crypto.algorithms).is_none() {
         bail!("no supported crypto algorithm");
     }
     Ok(())
+}
+
+/// 把 `clientRandom` 按 base64 解出来（兼容标准 / URL-safe、带 / 不带填充）。
+///
+/// 返回 `None` 表示不是合法 base64。
+fn decode_client_random(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    for eng in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(v) = eng.decode(s.as_bytes()) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// 从客户端 advertised 列表里挑一个我们支持的算法（优先顺序跟随客户端）。
@@ -253,4 +293,63 @@ pub fn validate_server_hello(client_hello: &ClientHello, server_hello: &ServerHe
         bail!("selected crypto algorithm was not advertised by client: {algo}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★★ A-5 回归（v0.5.5）：`clientRandom` 必须是合法 base64。
+    ///
+    /// 修复前只查非空，`"!!!"` 这类垃圾串也能通过协商。
+    #[test]
+    fn client_random_必须是合法_base64() {
+        let mut hello = new_client_hello("tcp", false, true);
+        // 自带的是合法 base64（32 字节随机）⇒ 必须通过
+        assert!(
+            validate_client_hello(&hello).is_ok(),
+            "自己生成的 ClientHello 必须能通过校验"
+        );
+
+        // 垃圾串 ⇒ 拒绝
+        for bad in ["!!!", "not base64 @@", "====", "a"] {
+            hello.capabilities.crypto.client_random = bad.to_string();
+            assert!(
+                validate_client_hello(&hello).is_err(),
+                "{bad:?} 不是合法 base64，必须被拒"
+            );
+        }
+
+        // 太短（合法 base64 但解码后 <16 字节）⇒ 拒绝
+        // "AAAA" = 3 字节
+        hello.capabilities.crypto.client_random = "QUFBQQ==".to_string();
+        assert!(
+            validate_client_hello(&hello).is_err(),
+            "解码后只有 4 字节，必须被拒"
+        );
+
+        // 空串的原有错误信息要保留（面板/日志里有人在看这句话）
+        hello.capabilities.crypto.client_random = String::new();
+        let e = validate_client_hello(&hello).expect_err("空串必须被拒");
+        assert!(e.to_string().contains("length 0"), "{e}");
+
+        // ★ 兼容性：标准 / URL-safe / 带不带填充都要认
+        hello.capabilities.crypto.client_random = "AAAAAAAAAAAAAAAAAAAAAAAA".to_string(); // 16 字节
+        assert!(validate_client_hello(&hello).is_ok(), "16 字节无填充应通过");
+        hello.capabilities.crypto.client_random = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(); // 23 字节带填充
+        assert!(validate_client_hello(&hello).is_ok(), "带填充应通过");
+    }
+
+    /// base64 解码本身的口径（标准 / URL-safe / 填充）。
+    #[test]
+    fn client_random_解码口径() {
+        assert!(decode_client_random("QUFBQQ==").is_some(), "标准带填充");
+        assert!(decode_client_random("QUFBQQ").is_some(), "标准无填充");
+        assert!(decode_client_random("_-_-_w").is_some(), "URL-safe");
+        assert!(
+            decode_client_random("").is_some(),
+            "空串是合法 base64（0 字节）"
+        );
+        assert!(decode_client_random("!!!").is_none(), "非法字符");
+    }
 }
