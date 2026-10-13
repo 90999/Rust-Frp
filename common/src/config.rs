@@ -2125,6 +2125,63 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
                 )));
             }
         }
+
+        // ★★ v0.5.5 修（第四轮 F1）：**远程下发一律不允许携带插件**。
+        //
+        // 这是上面那条回环检查的**完整绕过**，而且是第四轮实测打出来的：
+        //
+        // * 上面的检查有个前提 —— `local_addr` 非空。而插件路径**根本不需要
+        //   `local_addr`**：`local_addr=""` + `plugin="http_proxy"` 时，
+        //   那段回环检查被 `if !p.local_addr.trim().is_empty()` 整个跳过；
+        // * 黑名单只列了 4 个 `plugin_local_*` 字段，**`plugin` 这个能力开关
+        //   本身没进判定**，`plugin_user` / `plugin_passwd` 也没管。
+        //
+        // 净效果：服务端（或任何能调面板 `/api/proxies/add` 的人）下发一条
+        // `plugin="http_proxy"` / `"socks5"` 的代理，客户端就把那个公网端口
+        // 变成**开放正向代理** —— 攻击者可现指定任意目标，既能内网横向，
+        // 也能拿客户端当跳板隐藏来源（出站源 IP 是客户端）。
+        //
+        // 实测对照（`tmp/audit4-verify-F1b.py`，目标 192.168.3.15:17912）：
+        //
+        // | 下发形态 | 结果 | 可达 |
+        // |---|---|---|
+        // | 普通 tcp + `local_addr=192.168.3.15:17912` | HTTP 400 拒绝 | 不可达 |
+        // | `plugin=http_proxy` + `local_addr=""` | HTTP 200 放行 | **读到数据** |
+        // | `plugin=socks5` + `local_addr=""` | HTTP 200 放行 | **读到数据** |
+        //
+        // ★ 为什么是"一律拒绝"而不是"只拒绝无鉴权的插件"：
+        //   插件的正当用途是**本机用户自己**决定"这台机器要对外提供什么能力"
+        //   （静态站点、SOCKS 代理、TLS 终结……）。这是**知情选择**，
+        //   本机配置文件里照旧完全可用。但**服务端不该能远程改变客户端的性质**
+        //   —— 这与 `local_addr` 是同一个理由，而且更强：`local_addr` 只是
+        //   "连哪里"，`plugin` 是"变成什么"。
+        //
+        // ★ 沿用 H4 的教训：**用允许清单，不继续扩黑名单**（黑名单必然漏下一个字段）。
+        let mut caps: Vec<&str> = Vec::new();
+        if !p.plugin.trim().is_empty() {
+            caps.push("plugin");
+        }
+        if !p.plugin_user.trim().is_empty() {
+            caps.push("pluginUser");
+        }
+        if !p.plugin_passwd.trim().is_empty() {
+            caps.push("pluginPasswd");
+        }
+        if !p.plugin_host_header_rewrite.trim().is_empty() {
+            caps.push("pluginHostHeaderRewrite");
+        }
+        if !p.plugin_strip_prefix.trim().is_empty() {
+            caps.push("pluginStripPrefix");
+        }
+        if !caps.is_empty() {
+            return Err(crate::error::Error::Protocol(format!(
+                "代理 [{}] 来自远程下发，不允许携带插件相关字段（{}）—— \
+                 插件决定客户端**变成什么**（本地文件服务 / 正向代理 / 私钥终结），\
+                 只能由本机配置文件指定。远程下发要连内网服务，请用普通 tcp/http 代理。",
+                p.name,
+                caps.join(" / ")
+            )));
+        }
     }
     reject_bad_proxy(p)
 }
