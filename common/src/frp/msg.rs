@@ -121,12 +121,36 @@ pub struct NfrpCaps {
     /// 支持服务端下发管理命令（面板上增删代理 / 踢人）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub server_cmd: bool,
+    /// ★ v0.5.5：本客户端会在**工作连接**上携带 `privilege_key`。
+    ///
+    /// 为什么需要这个能力位（第四轮 A-1）：工作连接原先只凭 `run_id` 接入
+    /// （`run_id` 还是明文 `LoginResp` 下发的），于是拿到它的人可以往
+    /// 受害者的空闲工作连接池里灌自己的连接 ⇒ 用户流量被中继到攻击者（MITM）。
+    ///
+    /// 修这个问题有个**互通约束**：官方 frpc 默认**不给工作连接带凭证**
+    /// （官方 `pkg/auth/token.go` 的 `SetNewWorkConn`：未配
+    /// `additionalScopes = ["NewWorkConns"]` 时直接 `return nil`）。
+    /// 实测第一版"一律要求凭证"的修法**把官方 frpc 挡死了**
+    /// （服务端日志 `工作连接凭证不符` ⇒ tcp 代理完全不通）。
+    ///
+    /// 所以用这个能力位来**区分该期待什么**：
+    ///
+    /// * 客户端声明了它（NFrp ≥ 0.5.5）⇒ 它的工作连接**必须**带正确凭证，
+    ///   空凭证也拒。攻击者伪造"我是官方客户端"没有用 ——
+    ///   这个位是**受害者自己**登录时声明的，攻击者改不了；
+    /// * 没声明（官方 frpc、或老版 NFrp）⇒ 退回"要求源 IP 与控制连接一致"，
+    ///   官方 frpc 天然满足，**零兼容代价**。
+    ///
+    /// 这比"一律要求凭证"精确（不伤互通），也比"只看源 IP"强（有真凭证兜底），
+    /// 而且对老版 NFrp 客户端向后兼容（它们不声明 ⇒ 走源 IP 回退）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub work_conn_cred: bool,
 }
 
 impl NfrpCaps {
     /// 有没有任何一项被打开；没有就整个字段都不往报文里写。
     pub fn any(&self) -> bool {
-        self.udp_binary || self.server_cmd
+        self.udp_binary || self.server_cmd || self.work_conn_cred
     }
 }
 
