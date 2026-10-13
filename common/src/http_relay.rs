@@ -109,10 +109,42 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// **原样**转给内网服务（由内网服务自己回应答）。用解析后的结构重新序列化
     /// 过一遍虽然语义等价，但会改掉头字段的原始间距 —— 对一个"我自己就是 HTTP
     /// 代理"的后端来说，没必要冒这个险。
+    /// 读出**原始**头部字节与行列表（到 `\r\n\r\n` 为止，含空行）。
+    ///
+    /// ★★ v0.5.5 修（第四轮 C-2）：**上限必须真的生效**。
+    ///
+    /// 原先的检查顺序是：
+    ///
+    /// ```ignore
+    /// loop {
+    ///     if let Some(idx) = find_subslice(...) { return Ok(...); }  // ← 先找结束符
+    ///     if self.available() > MAX_HEAD { bail!(...); }             // ← 再查大小
+    ///     if self.fill().await? == 0 { return Ok(None); }
+    /// }
+    /// ```
+    ///
+    /// 两个问题叠在一起：
+    ///
+    /// 1. **找到结束符就直接返回**，尺寸检查只在"没找到"时才执行 ——
+    ///    于是只要结束符出现在某一批数据里，那批数据就绕过了检查；
+    /// 2. `>` 是**严格大于**，`available == MAX_HEAD`（正好 65536）**恰好通过**，
+    ///    再 `fill()` 一次（每次最多 16 KiB）就能到约 80 KiB。
+    ///
+    /// 实测（C 组）：**70048 字节的请求头被完整转发**，与注释声称的 64 KiB 不符。
+    /// 内存没被吃穿（`MAX_BODY` 兜着），但"声称的限制"没落实本身就是缺陷 ——
+    /// 而且它是按 `Content-Length` 之外的路径进来的，会算错缓冲预算。
+    ///
+    /// 修法：在**返回分支**里按实际头部长度判定（`end - self.pos`），
+    /// 这样无论数据是一次到齐还是分多次到，上限都严格成立。
     pub async fn read_head_raw(&mut self) -> Result<Option<(Vec<u8>, Vec<String>)>> {
         loop {
             if let Some(idx) = find_subslice(&self.buf[self.pos..], b"\r\n\r\n") {
                 let end = self.pos + idx + 4;
+                // ★ 真正的上限判定：**这一段头的长度**（不是缓冲区大小）。
+                let head_len = end - self.pos;
+                if head_len > MAX_HEAD {
+                    bail!("HTTP 头部 {head_len} 字节，超过上限 {MAX_HEAD}");
+                }
                 let raw = self.buf[self.pos..end].to_vec();
                 self.pos = end;
                 self.compact();
@@ -124,8 +156,11 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
                     .collect();
                 return Ok(Some((raw, lines)));
             }
-            if self.available() > MAX_HEAD {
-                bail!("HTTP 头部超过 {MAX_HEAD} 字节");
+            // 没找到结束符：缓冲区已经超限 ⇒ 不可能再凑出一个合法的头了。
+            // ★ 用 `>=` 而不是 `>`：正好等于上限时再多一个字节就越界，
+            //   而 `fill()` 一次至少读 1 字节。
+            if self.available() >= MAX_HEAD {
+                bail!("HTTP 头部超过 {MAX_HEAD} 字节（未见到结束符）");
             }
             if self.fill().await? == 0 {
                 return Ok(None);
@@ -455,11 +490,79 @@ pub fn body_length(parts: &HeadParts) -> Option<usize> {
 }
 
 /// 这条报文用的是 chunked 传输编码吗。
+///
+/// ★★ v0.5.5 修（第四轮 C 组 TE.TE 走私）：按 **RFC 7230 §3.3.3** 判定 ——
+/// 传输编码是一串**按顺序应用**的编码，`chunked` 必须是**最后一个**令牌
+/// 才算"按 chunked 分帧"。
+///
+/// 原先的实现是 `to_ascii_lowercase().contains("chunked")` ——
+/// **只要串里出现 `chunked` 就按 chunked 解帧**。而转发时
+/// `Transfer-Encoding` 又**原样**搬给后端，两边口径不一致 ⇒ 请求走私：
+///
+/// | 报头 | NFrp（旧） | RFC 正确的后端 | 结果 |
+/// |---|---|---|---|
+/// | `chunked` | chunked | chunked | 一致 |
+/// | `identity, chunked` | chunked | chunked | 一致 |
+/// | **`chunked, identity`** | chunked | **不是**（看最后一个 token） | **走私** |
+/// | **`xchunked`** | chunked | 不是 | **走私** |
+/// | **`chunked, gzip`** | chunked | 不是 | **走私** |
+///
+/// 实弹（`tmp/c6_desync_proof.py`）：`chunked, identity` 下发后，RFC 正确的
+/// 后端解析出 **2 个**请求，第二个是攻击者注入的。
+///
+/// ⇒ 现在按 RFC 判定：**最后一个 token 必须是 `chunked`**，
+/// 且它之前的 token 只允许 `identity`（等价于"没有额外编码"，RFC 7230
+/// 也把它视为可忽略）。其余形态（未知编码、`chunked` 后面还有别的编码、
+/// 多个 `chunked`）一律返回 `false`，由调用方**拒绝**
+/// （见 [`transfer_encoding_is_unsupported`]）—— 与"读一个口径、写另一个口径"
+/// 这类走私的通用修法一致：**双方口径必须完全一致**。
+///
+/// ★ 第一版修得过头了：要求"恰好一个 `chunked`"，把 RFC 合法的
+///   `identity, chunked` 也 400 了（C 组脚本里的对照组立刻变红）。
+///   合法的东西不能被拒 —— 那会把"修漏洞"变成"制造不兼容"。
 pub fn is_chunked(parts: &HeadParts) -> bool {
-    parts
-        .get("transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
+    match transfer_encoding_tokens(parts) {
+        Some(t) => {
+            // 最后一个必须是 chunked，且前面只能有 identity
+            t.last().map(|s| s == "chunked").unwrap_or(false)
+                && t[..t.len() - 1].iter().all(|s| s == "identity")
+        }
+        None => false,
+    }
+}
+
+/// 把 `Transfer-Encoding` 拆成规范化的小写 token 列表（按 `,` 拆分并 trim）。
+///
+/// 返回 `None` 表示"没有这个头或全空"。
+pub fn transfer_encoding_tokens(parts: &HeadParts) -> Option<Vec<String>> {
+    let raw = parts.get("transfer-encoding")?;
+    let toks: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if toks.is_empty() {
+        None
+    } else {
+        Some(toks)
+    }
+}
+
+/// `Transfer-Encoding` 里有 NFrp **不支持**的形态吗（有则必须 400）。
+///
+/// 为什么要拒绝而不是"尽力处理"：只要两边对同一个报头的理解有分歧，
+/// 就是走私。NFrp 支持的形态只有一种：**末尾是 `chunked`，且前面只出现
+/// `identity`**（后者等价于"无额外编码"）。其余（未知编码、`chunked`
+/// 之后还有编码、重复 `chunked`）一律拒绝 —— 而不是猜，**猜错就是漏洞**。
+pub fn transfer_encoding_is_unsupported(parts: &HeadParts) -> bool {
+    match transfer_encoding_tokens(parts) {
+        None => false, // 没有这个头，不关它的事
+        Some(toks) => {
+            let last_is_chunked = toks.last().map(|s| s == "chunked").unwrap_or(false);
+            let prefix_ok = toks[..toks.len() - 1].iter().all(|s| s == "identity");
+            !(last_is_chunked && prefix_ok)
+        }
+    }
 }
 
 /// 这个状态码/方法**不允许**有报文体（即使有 `Content-Length` 也不能读）。
