@@ -246,6 +246,14 @@ async fn main() -> Result<()> {
     // 登录时逐条发 NewProxy、工作连接查本地表、面板列表。并一次，
     // 四处都自然看得见；分开维护就迟早会漏掉其中一处。
     let store = Arc::new(store::Store::from_config(&cfg)?);
+    // ★ v0.5.5（第四轮 F2/F3）：记住**哪些名字来自配置文件**。
+    //
+    // `merge_initial` 把 store 恢复的动态代理并进了 `cfg.proxies`，
+    // 于是那份列表里配置代理与动态代理混在一起、看不出区别了。
+    // 而代理表必须区分它们（远程下发只许动动态的），所以在合并**之前**
+    // 先把配置里的名字记下来，构造表时据此打来源标记。
+    let config_proxy_names: std::collections::HashSet<String> =
+        cfg.proxies.iter().map(|p| p.name.clone()).collect();
     if store.is_enabled() {
         let restored = store.dynamic();
         if !restored.is_empty() {
@@ -312,7 +320,22 @@ async fn main() -> Result<()> {
     //
     // 各建一张的话，"刚在界面上加的代理"要等下次重连才会被会话看见 ——
     // 而那期间界面显示"已添加"、流量却进不来。
-    let proxies = registry::ProxyTable::from_iter(cfg.proxies.iter().cloned());
+    // ★ v0.5.5（第四轮 F2/F3）：配置来源的先建表，**store 恢复的再作为动态并入**。
+    //
+    // 不能一把 `from_iter(cfg.proxies)` 了事 —— 那样所有条目（含 store 恢复的
+    // 动态代理）都会被标成 `Config`，于是面板连自己加的代理都删不掉了。
+    let proxies = registry::ProxyTable::from_iter(
+        cfg.proxies
+            .iter()
+            .filter(|p| config_proxy_names.contains(&p.name))
+            .cloned(),
+    );
+    proxies.load_dynamic(
+        cfg.proxies
+            .iter()
+            .filter(|p| !config_proxy_names.contains(&p.name))
+            .cloned(),
+    );
 
     // 客户端本地管理界面（`[webServer]`）。
     //
@@ -882,6 +905,15 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     let declared = msg::NfrpCaps {
         udp_binary: cfg.private_caps,
         server_cmd: cfg.private_caps,
+        // ★ v0.5.5（第四轮 A-1）：**无条件**声明"我的工作连接会带凭证"。
+        //
+        // 这不是一个可选优化，而是客户端**真实行为**的声明：客户端
+        // 一直都在工作连接上发 `auth_key(token, ts)`（`conn.rs` 的
+        // `client_work_conn`），只是服务端以前不看它。
+        // 服务端据这个位决定"对这条会话要求凭证"，从而能拒绝那些
+        // 拿 run_id 冒充的伪造工作连接 —— 又不必对官方 frpc 提同样要求
+        // （官方默认不带凭证，实测一刀切会把它挡死）。
+        work_conn_cred: true,
     };
     // 每次（重）连都重新取一次凭证：OIDC 的 access token 会过期，
     // 复用上一次的会让"重连"变成"用过期 token 再失败一次"。
@@ -1136,26 +1168,40 @@ async fn apply_server_cmd(
             let name = cmd.proxy_name.clone();
             if name.is_empty() {
                 Err(anyhow!("remove_proxy 缺少 proxy_name"))
-            } else if proxies.remove(&name).is_none() {
-                // 把当前有哪些代理一并报回去 —— 面板上最常见的失败原因
-                // 就是名字打错，光说"没有"用户没法自查
-                let have = proxies.names().join(", ");
-                Err(anyhow!(
-                    "本地没有名为 [{name}] 的代理（当前有：{}）",
-                    if have.is_empty() {
-                        "无".to_string()
-                    } else {
-                        have
-                    }
-                ))
             } else {
-                // store 里也要删 —— 否则下次启动它又"复活"，而用户已经
-                // 在面板上明确删过一次了
-                if let Err(e) = store.remove(&name) {
-                    warn!(proxy = %name, error = %e, "从 store 删除失败（内存里已移除）");
+                // ★★ v0.5.5（第四轮 F2）：**只许删动态代理，不许删配置里的**。
+                //
+                // 配置文件的语义是"本机用户写下的意图"，服务端不该有能力让它
+                // 在运行期失效。实弹（`tmp/f2_remove_config_proxy.py`）：
+                // 面板对配置里的 `victim-ssh` 发一条 remove，端口立刻连不上，
+                // 客户端日志 `按服务端命令移除代理 proxy=victim-ssh total=0`。
+                //
+                // `remove_dynamic` 会对配置来源的条目返回 Err（带人话原因）。
+                match proxies.remove_dynamic(&name) {
+                    Err(e) => Err(anyhow!(e)),
+                    Ok(None) => {
+                        // 把当前有哪些代理一并报回去 —— 面板上最常见的失败原因
+                        // 就是名字打错，光说"没有"用户没法自查
+                        let have = proxies.names().join(", ");
+                        Err(anyhow!(
+                            "本地没有名为 [{name}] 的代理（当前有：{}）",
+                            if have.is_empty() {
+                                "无".to_string()
+                            } else {
+                                have
+                            }
+                        ))
+                    }
+                    Ok(Some(_)) => {
+                        // store 里也要删 —— 否则下次启动它又"复活"，而用户已经
+                        // 在面板上明确删过一次了
+                        if let Err(e) = store.remove(&name) {
+                            warn!(proxy = %name, error = %e, "从 store 删除失败（内存里已移除）");
+                        }
+                        info!(proxy = %name, total = proxies.len(), reason = %cmd.reason, "按服务端命令移除代理");
+                        Ok(())
+                    }
                 }
-                info!(proxy = %name, total = proxies.len(), reason = %cmd.reason, "按服务端命令移除代理");
-                Ok(())
             }
         }
         other => Err(anyhow!("未知命令：{other}")),
@@ -1203,7 +1249,24 @@ fn add_proxy_cmd(
     nfrp_common::config::validate_remote_proxy(&p, true)
         .map_err(|e| anyhow::anyhow!("服务端下发的代理配置未通过校验：{e}"))?;
     let name = p.name.clone();
-    let existed = proxies.insert(p.clone()).is_some();
+    // ★★ v0.5.5（第四轮 F3）：**远程下发不许覆盖配置文件里的代理**。
+    //
+    // 这是"双杀"链条的第一环，也是必须堵的那一环：
+    //   1. 服务端下发同名 `add_proxy(my-web)`（用户配置里已有 `my-web`）；
+    //   2. 客户端 `insert` 覆盖 ⇒ **用户那条此刻已经没了**；
+    //   3. 服务端 `register_proxy` 失败（端口被旧连接占着）⇒ 走回滚，
+    //      再下发 `remove_proxy("my-web")`；
+    //   4. 客户端按名删 ⇒ 删掉的是第 2 步塞进去的那条，
+    //      **用户原本的配置永远不会被恢复**。
+    //
+    // 结果：一条**服务端自己都判为失败**（HTTP 400 "已回滚"）的命令，
+    // 把用户的隧道永久打掉了（实弹 `tmp/f3b_rollback_kills_config_proxy.py`）。
+    //
+    // 只在第一步拒绝，整条链就断了 —— 用户的配置代理从头到尾没被动过。
+    let existed = proxies
+        .insert_dynamic(p.clone())
+        .map_err(|e| anyhow::anyhow!(e))?
+        .is_some();
     if existed {
         warn!(proxy = %name, "覆盖了同名的已有代理");
     }
@@ -1978,25 +2041,127 @@ bandwidthLimitMode = 'server'
         }
     }
 
+    // ------------------------------------------------------------------
+    // 第四轮 F1：插件路径绕过 H4（远程下发开放代理）
+    // ------------------------------------------------------------------
+
+    /// ★★ F1 核心回归：远程下发**一律不许带插件**。
+    ///
+    /// 这是第四轮实弹打出来的高危（`tmp/audit4-verify-F1b.py`）：
+    ///
+    /// * H4 的回环检查有前提 —— `local_addr` 非空
+    ///   （`config.rs` 里 `if !p.local_addr.trim().is_empty()`）；
+    /// * 而插件路径**根本不需要 `local_addr`**；
+    /// * `plugin` 这个"能力开关"本身又不在黑名单里。
+    ///
+    /// 三者叠加 ⇒ 下发 `local_addr="" + plugin="http_proxy"` 全部校验通过 ⇒
+    /// 客户端那个公网端口变成**开放正向代理**，攻击者可现指定任意目标
+    /// （内网横向 + 拿客户端当跳板隐藏来源）。
+    ///
+    /// 实测对照：同一目标 `192.168.3.15:17912`，普通代理被 400 拒，
+    /// 换成 `plugin=http_proxy`/`socks5` 就 200 放行并取回内网数据。
+    #[tokio::test]
+    async fn 远程下发不得携带插件字段() {
+        // 每一种都单独验证（不能只测一个组合）
+        type Case = (&'static str, Box<dyn FnOnce(&mut ProxyConfig)>);
+        let cases: Vec<Case> = vec![
+            (
+                "plugin",
+                Box::new(|p: &mut ProxyConfig| p.plugin = "http_proxy".to_string()),
+            ),
+            (
+                "plugin",
+                Box::new(|p: &mut ProxyConfig| p.plugin = "socks5".to_string()),
+            ),
+            (
+                "plugin",
+                Box::new(|p: &mut ProxyConfig| p.plugin = "static_file".to_string()),
+            ),
+            (
+                "pluginUser",
+                Box::new(|p: &mut ProxyConfig| p.plugin_user = "u".to_string()),
+            ),
+            (
+                "pluginPasswd",
+                Box::new(|p: &mut ProxyConfig| p.plugin_passwd = "pw".to_string()),
+            ),
+            (
+                "pluginHostHeaderRewrite",
+                Box::new(|p: &mut ProxyConfig| p.plugin_host_header_rewrite = "x".to_string()),
+            ),
+            (
+                "pluginStripPrefix",
+                Box::new(|p: &mut ProxyConfig| p.plugin_strip_prefix = "/a".to_string()),
+            ),
+        ];
+
+        for (label, set) in cases {
+            let (mut me, _peer) = cmd_pair();
+            let table = registry::ProxyTable::default();
+            // ★ 关键：**local_addr 留空** —— 这正是绕开 H4 的那种形态
+            let cmd = add_cmd_with("openproxy", |p| {
+                p.local_addr = String::new();
+                set(p);
+            });
+            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+                .await
+                .expect_err(&format!("{label} 必须被拒绝（哪怕 local_addr 为空）"));
+            assert!(
+                err.to_string().contains(label),
+                "错误里要点名 {label}：{err}"
+            );
+            assert_eq!(table.len(), 0, "{label} 被拒时不该留下代理");
+        }
+    }
+
+    /// F1 的反向保护：**不带插件**的合法远程下发仍然要能用。
+    ///
+    /// 这一条防止"修得太狠" —— 面板的正常「添加代理」功能必须照旧工作。
+    #[tokio::test]
+    async fn 不带插件的远程下发仍然可用() {
+        let (mut me, _peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        let cmd = add_cmd_with("normal", |p| {
+            p.local_addr = "127.0.0.1:8080".to_string();
+            p.remote_port = 6100;
+        });
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect("普通的回环代理应当照常放行");
+        assert_eq!(table.len(), 1);
+    }
+
     /// ★ 回归测试：服务端下发**不认识的插件类型**要在解析阶段就被拒。
     ///
     /// 原先这条路径一道校验都不过，拼错的插件名能一路溜到运行期，
     /// 变成"每条工作连接逐个失败"。
     ///
-    /// 注：v0.5.1 已实现全部 9 个**官方**插件，所以这里用一个官方也没有的名字。
-    #[tokio::test]
-    async fn 远程下发的不认识插件类型必须被拒绝() {
-        let (mut me, _peer) = cmd_pair();
-        let table = registry::ProxyTable::default();
-        let cmd = add_cmd_with("bad-plugin", |p| p.plugin = "totally_made_up".to_string());
-        let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
-            .await
-            .expect_err("不认识的插件类型必须被拒绝");
+    /// ★ v0.5.5（第四轮 F1）调整：现在**任何**插件都不许远程下发，
+    /// 所以这条用例改到**配置文件**路径去验证（`is_remote = false`）——
+    /// "拼错的插件名要被解析阶段拦住"这个不变量本身仍然有效，
+    /// 只是它的适用场景从"远程下发"变成了"本机配置"。
+    #[test]
+    fn 不认识插件类型在解析阶段被拒() {
+        let mut p = ProxyConfig {
+            name: "bad-plugin".into(),
+            proxy_type: "tcp".into(),
+            local_addr: "127.0.0.1:80".into(),
+            plugin: "totally_made_up".into(),
+            ..Default::default()
+        };
+        // 本机配置路径：仍然要走插件类型自检
+        let err = nfrp_common::config::validate_remote_proxy(&p, false)
+            .expect_err("本机配置里的未知插件类型也必须被拒");
         assert!(
             err.to_string().contains("totally_made_up"),
             "错误里要点名插件：{err}"
         );
-        assert_eq!(table.len(), 0);
+
+        // 远程路径：连合法插件名都不许（F1 的更严不变量）
+        p.plugin = "socks5".into();
+        let err2 = nfrp_common::config::validate_remote_proxy(&p, true)
+            .expect_err("远程下发不得携带任何插件");
+        assert!(err2.to_string().contains("plugin"), "{err2}");
     }
 
     /// ★ 回归测试：服务端下发**不受支持的代理类型**要被拒。
@@ -2083,6 +2248,12 @@ bandwidthLimitMode = 'server'
     }
 
     /// 先加后删：整条生命周期要闭环。
+    ///
+    /// ★ v0.5.5（第四轮 F2）调整：原来这条用例删的是 `from_iter` 建进来的
+    /// `"old"` —— 那是**配置来源**的代理，现在远程 `remove` 会（正确地）拒绝它。
+    /// 也就是说这条测试原先在无意中**断言了 F2 那个漏洞**（面板能删配置代理）。
+    /// 现在改成"加一条动态的、再删那条动态的"，生命周期照样闭环，
+    /// 而配置代理必须原样留着 —— 下面多加了断言把这个不变量钉住。
     #[tokio::test]
     async fn 管理命令_先加后删() {
         let (mut me, mut peer) = cmd_pair();
@@ -2097,19 +2268,73 @@ bandwidthLimitMode = 'server'
         let _ = expect_cmd_resp(&mut peer).await;
         assert_eq!(table.len(), 2);
 
+        // 删**动态加进来的**那条 —— 这是合法路径
         let cmd = msg::ServerCmd {
             id: "cmd-4".to_string(),
+            op: msg::CMD_REMOVE_PROXY.to_string(),
+            proxy_name: "new".to_string(),
+            ..Default::default()
+        };
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect("移除动态代理");
+        let _ = expect_cmd_resp(&mut peer).await;
+        assert_eq!(table.len(), 1, "删掉之后只剩配置里那条");
+        assert!(table.get("new").is_none(), "动态那条应当被删掉");
+        assert!(table.get("old").is_some(), "配置那条必须原样留着（F2）");
+
+        // ★ 反向：远程删**配置来源**的代理必须被拒，且那条要还在
+        let cmd = msg::ServerCmd {
+            id: "cmd-5".to_string(),
             op: msg::CMD_REMOVE_PROXY.to_string(),
             proxy_name: "old".to_string(),
             ..Default::default()
         };
         apply_server_cmd(&table, &no_store(), &cmd, &mut me)
             .await
-            .expect("移除");
-        let _ = expect_cmd_resp(&mut peer).await;
-        assert_eq!(table.len(), 1, "删掉之后只剩新增的那条");
-        assert!(table.get("old").is_none());
-        assert!(table.get("new").is_some());
+            .expect_err("删配置代理必须被拒（F2）");
+        let resp = expect_cmd_resp(&mut peer).await;
+        assert!(
+            resp.error.contains("配置文件"),
+            "回执要说清原因：{}",
+            resp.error
+        );
+        assert!(table.get("old").is_some(), "被拒之后配置代理必须还在");
+    }
+
+    /// ★★ F3 回归：远程下发**同名** `add_proxy` 不得覆盖配置里的代理。
+    ///
+    /// 这是"双杀"链条的第一环：覆盖成功 → 服务端回滚发 remove →
+    /// 用户的配置永久消失。堵住第一环，整条链就断了。
+    #[tokio::test]
+    async fn 管理命令_不得覆盖配置里的同名代理() {
+        let (mut me, mut peer) = cmd_pair();
+        let mut cfg = ProxyConfig {
+            name: "my-web".into(),
+            ..Default::default()
+        };
+        cfg.remote_port = 18202;
+        let table = registry::ProxyTable::from_iter([cfg]);
+
+        let cmd = add_cmd_with("my-web", |p| {
+            p.remote_port = 9999;
+            p.local_addr = "127.0.0.1:9".into();
+        });
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect_err("覆盖配置代理必须被拒（F3）");
+        let resp = expect_cmd_resp(&mut peer).await;
+        assert!(
+            resp.error.contains("配置文件"),
+            "回执要说清原因：{}",
+            resp.error
+        );
+        // 用户那条必须原样（端口没变）
+        assert_eq!(
+            table.get("my-web").expect("配置代理必须还在").remote_port,
+            18202,
+            "配置代理不该被改掉"
+        );
     }
 
     /// 读一条回执。**带超时** —— 没有超时的话，一旦发送侧没写出去，
