@@ -789,6 +789,17 @@ where
     if declared.server_cmd {
         caps.server_cmd = true;
     }
+    // ★ v0.5.5（第四轮 A-1）：回显"工作连接必须带凭证"。
+    //
+    // 这是**服务端对这条会话的期待**，由客户端自己在 Login 里声明
+    // （NFrp ≥ 0.5.5 恒声明）。回显之后服务端就知道：这条会话的
+    // 工作连接**必须**带正确凭证，空凭证一律拒绝。
+    //
+    // 官方 frpc 不声明这个位 ⇒ 不会回显 ⇒ 服务端对它的工作连接
+    // 退回"源 IP 一致"校验（官方默认不带凭证，实测一刀切会把它挡死）。
+    if declared.work_conn_cred {
+        caps.work_conn_cred = true;
+    }
     // v2 的二进制 UDP 是握手协商出来的，与 Login 里的声明无关；
     // v1 没有握手协商这一步，只能靠这里。
     if version == WireVersion::V1 && declared.udp_binary {
@@ -1100,6 +1111,7 @@ mod tests {
         let declared = msg::NfrpCaps {
             udp_binary: true,
             server_cmd: true,
+            work_conn_cred: true,
         };
 
         let client_task = tokio::spawn(async move {
@@ -1125,7 +1137,8 @@ mod tests {
             login.nfrp,
             Some(msg::NfrpCaps {
                 udp_binary: true,
-                server_cmd: true
+                server_cmd: true,
+                work_conn_cred: true
             }),
             "客户端必须声明自己支持哪些能力"
         );
@@ -1167,6 +1180,7 @@ mod tests {
                 msg::NfrpCaps {
                     udp_binary: true,
                     server_cmd: true,
+                    work_conn_cred: true,
                 },
             )
             .await
@@ -1180,6 +1194,7 @@ mod tests {
             nfrp: Some(msg::NfrpCaps {
                 udp_binary: true,
                 server_cmd: true,
+                work_conn_cred: true,
             }),
             ..Default::default()
         })
