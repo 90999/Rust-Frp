@@ -381,7 +381,25 @@ impl<S> WsStream<S> {
 }
 
 /// 从 `raw` 里尽力解析出一个帧；返回 `Ok(None)` 表示数据还不够。
-fn take_frame(buf: &mut Vec<u8>) -> WsResult<Option<(u8, bool, Vec<u8>)>> {
+///
+/// `our_role_is_client`：**本端**是不是客户端。
+/// RFC 6455 §5.1 对掩码位的规定是**方向性**的、且都是 MUST：
+///
+/// * 客户端 → 服务端的帧**必须**带掩码（不掩码 ⇒ 报错关闭连接）；
+/// * 服务端 → 客户端的帧**必须不**带掩码（带了 ⇒ 同样报错）。
+///
+/// ★★ v0.5.5 修（第四轮 G-7）：原先只读掩码位用于"要不要异或"，
+/// **从不校验它**，于是未掩码的客户端帧被照常处理（实弹 `tmp/audit4g/g8_ws_mask.py`：
+/// 发一个 `masked=False` 的 Login 帧，服务端照回 `LoginResp`）。
+///
+/// 严重度为什么只算"低"：NFrp 自实现的 WS 不面向浏览器（没有"中间层缓存投毒"
+/// 那个经典面），所以不掩码本身不直接可利用。但它是**协议强制项**，
+/// 而且"服务端接受未掩码帧"会让它偏离 RFC —— 任何按 RFC 实现的中间设备
+/// 都可能与它产生理解差异。修它成本极低，没有理由留着。
+fn take_frame(
+    buf: &mut Vec<u8>,
+    our_role_is_client: bool,
+) -> WsResult<Option<(u8, bool, Vec<u8>)>> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -394,6 +412,18 @@ fn take_frame(buf: &mut Vec<u8>) -> WsResult<Option<(u8, bool, Vec<u8>)>> {
     let opcode = b0 & 0x0f;
     let masked = b1 & 0x80 != 0;
     let len7 = (b1 & 0x7f) as usize;
+
+    // ★ 掩码位方向性校验（RFC 6455 §5.1 的两个 MUST）。
+    if our_role_is_client && masked {
+        return Err(WsError::Protocol(
+            "服务端发来的帧不该带掩码（RFC 6455 §5.1）".into(),
+        ));
+    }
+    if !our_role_is_client && !masked {
+        return Err(WsError::Protocol(
+            "客户端发来的帧必须带掩码（RFC 6455 §5.1）".into(),
+        ));
+    }
 
     let mut need = 2;
     let payload_len = match len7 {
@@ -509,7 +539,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
 
         // 2) 从 raw 里继续解析；不够就再读
         loop {
-            match take_frame(&mut this.raw) {
+            match take_frame(&mut this.raw, this.is_client) {
                 Err(e) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -717,7 +747,7 @@ mod tests {
         for payload in [vec![], b"x".to_vec(), (0..=255u8).collect::<Vec<u8>>()] {
             let raw = build_frame(OP_BINARY, &payload, true);
             let mut buf = raw.clone();
-            let (op, fin, got) = take_frame(&mut buf).unwrap().expect("应解出一帧");
+            let (op, fin, got) = take_frame(&mut buf, false).unwrap().expect("应解出一帧");
             assert_eq!(op, OP_BINARY);
             assert!(fin);
             assert_eq!(got, payload);
@@ -726,25 +756,33 @@ mod tests {
     }
 
     /// 帧被拆成两半时要等第二半，不能把半个载荷当数据交出去。
+    ///
+    /// ★ v0.5.5（G-7）：构造的帧要带**客户端掩码** —— 现在服务端视角会
+    /// 按 RFC 校验掩码位，未掩码的帧已经不合规了。
     #[test]
     fn partial_frame_waits_for_the_rest() {
-        let raw = build_frame(OP_BINARY, b"0123456789", false);
+        let raw = build_frame(OP_BINARY, b"0123456789", true);
         let mut buf = raw[..6].to_vec();
-        assert!(take_frame(&mut buf).unwrap().is_none(), "半帧不该解出来");
+        assert!(
+            take_frame(&mut buf, false).unwrap().is_none(),
+            "半帧不该解出来"
+        );
 
         // 拼上剩余部分才能解
         buf.extend_from_slice(&raw[6..]);
-        let (_, _, got) = take_frame(&mut buf).unwrap().unwrap();
+        let (_, _, got) = take_frame(&mut buf, false).unwrap().unwrap();
         assert_eq!(got, b"0123456789");
     }
 
     /// 一段字节里连着多个帧时必须逐个取出 —— 对端可能把好几个 Write 攒在一个 TCP 段里。
+    ///
+    /// ★ v0.5.5（G-7）：同上，用带掩码的客户端帧。
     #[test]
     fn multiple_frames_in_one_buffer() {
-        let mut buf = build_frame(OP_BINARY, b"aa", false);
-        buf.extend_from_slice(&build_frame(OP_BINARY, b"bb", false));
-        let (_, _, a) = take_frame(&mut buf).unwrap().unwrap();
-        let (_, _, b) = take_frame(&mut buf).unwrap().unwrap();
+        let mut buf = build_frame(OP_BINARY, b"aa", true);
+        buf.extend_from_slice(&build_frame(OP_BINARY, b"bb", true));
+        let (_, _, a) = take_frame(&mut buf, false).unwrap().unwrap();
+        let (_, _, b) = take_frame(&mut buf, false).unwrap().unwrap();
         assert_eq!(
             (a.as_slice(), b.as_slice()),
             (b"aa".as_slice(), b"bb".as_slice())
@@ -933,25 +971,96 @@ mod tests {
 
         // 125 字节：合法
         let mut ok = make(OP_PING, 125);
-        assert!(take_frame(&mut ok).is_ok(), "125 字节的控制帧应当允许");
+        assert!(
+            take_frame(&mut ok, false).is_ok(),
+            "125 字节的控制帧应当允许"
+        );
 
         // 126 字节：必须拒绝
         let mut bad = make(OP_PING, 126);
-        let e = take_frame(&mut bad).unwrap_err();
+        let e = take_frame(&mut bad, false).unwrap_err();
         assert!(
             format!("{e:?}").contains("125"),
             "错误信息应点明 125 上限：{e:?}"
         );
 
         // PONG / CLOSE 同理
-        assert!(take_frame(&mut make(OP_PONG, 126)).is_err(), "PONG 也要限");
         assert!(
-            take_frame(&mut make(OP_CLOSE, 126)).is_err(),
+            take_frame(&mut make(OP_PONG, 126), false).is_err(),
+            "PONG 也要限"
+        );
+        assert!(
+            take_frame(&mut make(OP_CLOSE, 126), false).is_err(),
             "CLOSE 也要限"
         );
 
         // ★ 数据帧不受这条限制（只受 MAX_FRAME）
         let mut data = make(OP_BINARY, 126);
-        assert!(take_frame(&mut data).is_ok(), "数据帧不该被 125 限制误伤");
+        assert!(
+            take_frame(&mut data, false).is_ok(),
+            "数据帧不该被 125 限制误伤"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 第四轮 G-7：掩码位的方向性校验（RFC 6455 §5.1 两个 MUST）
+    // ------------------------------------------------------------------
+
+    /// 造一个可控掩码位的帧。
+    fn frame_with_mask(op: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+        let mut v = vec![0x80 | op];
+        let n = payload.len();
+        let mask_bit = if masked { 0x80 } else { 0 };
+        if n < 126 {
+            v.push(mask_bit | n as u8);
+        } else {
+            v.push(mask_bit | 126);
+            v.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        if masked {
+            v.extend_from_slice(&[0, 0, 0, 0]);
+            v.extend_from_slice(payload);
+        } else {
+            v.extend_from_slice(payload);
+        }
+        v
+    }
+
+    /// ★★ G-7 核心：**服务端视角**收到未掩码的客户端帧必须报错。
+    ///
+    /// 修复前它被照常处理（实弹：未掩码的 Login 帧收到了 LoginResp）。
+    #[test]
+    fn 服务端必须拒绝未掩码的客户端帧() {
+        let mut unmasked = frame_with_mask(OP_BINARY, b"hello", false);
+        let e = take_frame(&mut unmasked, false)
+            .expect_err("未掩码的客户端帧必须被拒（RFC 6455 §5.1 MUST）");
+        assert!(
+            format!("{e:?}").contains("掩码"),
+            "错误要说清是掩码问题：{e:?}"
+        );
+
+        // 对照：带掩码的照常解出来
+        let mut masked = frame_with_mask(OP_BINARY, b"hello", true);
+        let (op, _fin, got) = take_frame(&mut masked, false)
+            .expect("带掩码应当能解")
+            .expect("应当解出一帧");
+        assert_eq!(op, OP_BINARY);
+        assert_eq!(got, b"hello", "掩码要正确异或回来");
+    }
+
+    /// 反向：**客户端视角**收到带掩码的服务端帧也必须报错。
+    #[test]
+    fn 客户端必须拒绝带掩码的服务端帧() {
+        let mut masked = frame_with_mask(OP_BINARY, b"hi", true);
+        let e = take_frame(&mut masked, true)
+            .expect_err("服务端发来的帧不该带掩码（RFC 6455 §5.1 MUST）");
+        assert!(format!("{e:?}").contains("掩码"), "{e:?}");
+
+        // 对照：不带掩码的照常解出来
+        let mut clean = frame_with_mask(OP_BINARY, b"hi", false);
+        let (_, _, got) = take_frame(&mut clean, true)
+            .expect("不带掩码应当能解")
+            .expect("应当解出一帧");
+        assert_eq!(got, b"hi");
     }
 }
