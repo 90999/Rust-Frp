@@ -378,6 +378,7 @@ mod tests {
             conn,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
     }
 
@@ -531,6 +532,7 @@ mod tests {
             conn,
             backlog,
             proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));
         registry
             .visitors
@@ -561,6 +563,7 @@ mod tests {
             vconn,
             vbacklog,
             vproxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));
 
         let m = nat_hole_visitor("p2p", "real-key", 456);
@@ -648,6 +651,7 @@ mod tests {
             vconn,
             vbacklog,
             vproxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));
         let m = nat_hole_visitor("p2p", "key", 11);
         handle_nat_hole_visitor(&registry, &visitor, &m)
