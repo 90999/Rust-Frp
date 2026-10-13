@@ -81,6 +81,11 @@ struct HubInner {
     dropped_unroutable: u64,
     /// 统计：下游队列满了被丢掉的包。
     dropped_full: u64,
+    /// 统计：**源地址不属于发送者**而被丢弃的包（v0.5.5，第四轮 F4）。
+    ///
+    /// 这个指标是有人在冒充别人的**唯一可观测信号** —— VNet 本就没有 ACL，
+    /// 源地址就是身份；它非零就意味着网络里有人在伪造源地址。
+    dropped_spoofed: u64,
 }
 
 /// 面板展示用的快照。
@@ -96,6 +101,8 @@ pub struct VnetStats {
     pub leased: usize,
     pub dropped_unroutable: u64,
     pub dropped_full: u64,
+    /// 源地址伪造而被丢弃的包数（第四轮 F4）。非零 = 有人在冒充别人。
+    pub dropped_spoofed: u64,
 }
 
 /// 加入成功后返回给客户端的参数。
@@ -156,6 +163,7 @@ impl VnetHub {
                 sinks: HashMap::new(),
                 dropped_unroutable: 0,
                 dropped_full: 0,
+                dropped_spoofed: 0,
             }),
         })
     }
@@ -227,6 +235,18 @@ impl VnetHub {
     ///
     /// 返回 `true` 表示包被投出去了（发给了别人或由网关应答），
     /// `false` 表示丢弃（查不到人 / 解析失败）。
+    ///
+    /// ★★ v0.5.5 修（第四轮 F4）：**必须校验源地址**。
+    ///
+    /// 原先本函数**只读 `h.dst`，从不读 `h.src`**（全文件 `src` 只出现在
+    /// 一处测试断言里）。注册层抢地址是拦住的，但转发层不校验 ⇒
+    /// 成员 A 可以发出 `src = 其他成员` 甚至 `src = 网关` 的包，而 B 照收。
+    ///
+    /// 影响：VNet 里**没有任何可信的源身份** —— 可以冒充别人发起连接，
+    /// 也可以让受害者以为流量来自网关。VNet 本来就没有 ACL，
+    /// 源地址就是唯一的"身份"，不校验等于身份可以自由伪造。
+    ///
+    /// 实弹：`tmp/f4_vnet_spoof.py`（对照组：注册层抢地址是拦住的）。
     fn route(&self, from: &str, pkt: &[u8]) -> bool {
         let Some(h) = vnet::parse_ipv4(pkt) else {
             // IPv6 或畸形包。**静默丢弃**而不是回 ICMP unreachable：
@@ -234,6 +254,24 @@ impl VnetHub {
             return false;
         };
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // ★ ⓪ 源地址校验（F4）：`h.src` 必须是 `from` **自己**的地址之一。
+        //
+        // 为什么是"属于自己"而不是"等于某个固定值"：一个客户端可以注册
+        // 多个 IP（`Switch::register` 按 ip → client 存，`ips_of` 返回
+        // 一个人的全部地址），多网卡场景下源地址可以是其中任意一个。
+        //
+        // 不需要给网关开例外：网关自己回的 ICMP 回复走 `deliver`，
+        // 不经过这条路径。
+        if !g.routes.ips_of(&g.network, from).contains(&h.src) {
+            g.dropped_spoofed += 1;
+            debug!(
+                from = %from,
+                src = %h.src,
+                "虚拟网络源地址不属于发送者，丢弃（防冒充）"
+            );
+            return false;
+        }
 
         // ① 网关自己（服务端）：只应答 ICMP echo，TCP/UDP 丢弃
         if h.dst == g.gateway {
@@ -316,6 +354,7 @@ impl VnetHub {
             leased: g.pool.leased_count(),
             dropped_unroutable: g.dropped_unroutable,
             dropped_full: g.dropped_full,
+            dropped_spoofed: g.dropped_spoofed,
         })
     }
 
@@ -635,8 +674,14 @@ mod tests {
         );
 
         // 旧连接的信箱必须被清掉：往这个地址发包不能再进旧队列
-        let pkt = fake_udp(Ipv4Addr::new(100, 64, 0, 200), j2.ip, b"x");
-        assert!(h.route("someone", &pkt));
+        //
+        // ★ v0.5.5（第四轮 F4）：发送者必须是一个**真的注册过、且拥有该源地址**
+        //   的客户端 —— 源地址校验上线后，原来那个虚构的 `"someone"` 会被
+        //   正确地拒掉（它不拥有 `100.64.0.200`）。这里改成让 s 真加入。
+        let (txs, _rxs) = sink();
+        let js = h.join("s", None, txs).unwrap();
+        let pkt = fake_udp(js.ip, j2.ip, b"x");
+        assert!(h.route("s", &pkt));
         assert_eq!(rx2.try_recv().unwrap(), pkt, "新连接必须能收到");
     }
 
@@ -716,6 +761,82 @@ mod tests {
         for bad in [&b""[..], &b"\x60"[..], &b"\x45"[..]] {
             assert!(!h.route("a", bad), "畸形包必须被安全丢弃");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 第四轮 F4：源地址伪造必须被拦
+    // ------------------------------------------------------------------
+
+    /// ★★ F4 核心回归：**冒充别人的源地址必须被丢弃**。
+    ///
+    /// 修复前 `route()` 只读 `h.dst`，A 可以发出 `src = B 的地址` 的包，
+    /// 而 B 照收 —— VNet 里身份可以自由伪造。
+    #[test]
+    fn 冒充他人源地址必须被丢弃() {
+        let h = hub();
+        let (txa, mut rxa) = sink();
+        let (txb, mut rxb) = sink();
+        let ja = h.join("a", None, txa).unwrap();
+        let jb = h.join("b", None, txb).unwrap();
+
+        // A 伪造"源地址 = B"，发给 B
+        let spoof = fake_udp(jb.ip, jb.ip, b"i-am-not-b");
+        assert!(!h.route("a", &spoof), "伪造成 B 的源地址必须被丢弃");
+        assert!(
+            rxb.try_recv().is_err(),
+            "B 不该收到那条伪造包（这正是修复前会发生的事）"
+        );
+        assert_eq!(
+            h.stats().unwrap().dropped_spoofed,
+            1,
+            "必须计入 dropped_spoofed（这是唯一的可观测信号）"
+        );
+
+        // 对照：A 用自己的地址发，必须正常送达
+        let ok = fake_udp(ja.ip, jb.ip, b"from-a");
+        assert!(h.route("a", &ok), "用自己的源地址发应当正常转发");
+        assert_eq!(rxb.try_recv().unwrap(), ok);
+
+        // 确认没有误伤：合法那次不该增加 spoofed 计数
+        assert_eq!(h.stats().unwrap().dropped_spoofed, 1);
+        assert!(rxa.try_recv().is_err(), "不该回给自己");
+    }
+
+    /// 冒充**网关**的源地址同样必须被拒。
+    #[test]
+    fn 冒充网关源地址必须被丢弃() {
+        let h = hub();
+        let (txa, _rxa) = sink();
+        let (txb, mut rxb) = sink();
+        h.join("a", None, txa).unwrap();
+        let jb = h.join("b", None, txb).unwrap();
+        let gw = h.stats().unwrap().gateway.parse::<Ipv4Addr>().unwrap();
+
+        let spoof = fake_udp(gw, jb.ip, b"i-am-gateway");
+        assert!(!h.route("a", &spoof), "冒称网关必须被丢弃");
+        assert!(rxb.try_recv().is_err(), "B 不该以为这来自网关");
+        assert_eq!(h.stats().unwrap().dropped_spoofed, 1);
+    }
+
+    /// 广播：源地址校验要照常生效（伪造的广播也要丢）。
+    #[test]
+    fn 伪造源地址的广播也要丢弃() {
+        let h = hub();
+        let (txa, _rxa) = sink();
+        let (txb, mut rxb) = sink();
+        let ja = h.join("a", None, txa).unwrap();
+        let jb = h.join("b", None, txb).unwrap();
+
+        // 伪造 B 的源地址去广播
+        let spoof = fake_udp(jb.ip, Ipv4Addr::BROADCAST, b"spoofed-bcast");
+        assert!(!h.route("a", &spoof));
+        assert!(rxb.try_recv().is_err(), "B 不该收到伪造来源的广播");
+        assert_eq!(h.stats().unwrap().dropped_spoofed, 1);
+
+        // 合法广播照常
+        let ok = fake_udp(ja.ip, Ipv4Addr::BROADCAST, b"ok-bcast");
+        assert!(h.route("a", &ok));
+        assert_eq!(rxb.try_recv().unwrap(), ok);
     }
 
     /// 造一个最小的合法 IPv4/UDP 报文（只要能解析出地址就够）。
