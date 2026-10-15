@@ -239,24 +239,31 @@ pub async fn serve_on_with(
     }
 
     // 内置面板 + /metrics：与 frp 的 dashboard 一样是可选端口
+    //
+    // ★ v0.5.6 修（审计总报告 H1）：这是同一判定的**第五处**（审计报告漏列了它），
+    //   原先同样只判 `dashboard_user.is_empty()`。必须用唯一真源，
+    //   否则"用户名非空 + 密码为空"会初始化出 `Some(("admin", ""))`，
+    //   而 `dashboard.rs` 会拿它去比 `"admin:"` —— 鉴权形同虚设。
+    let has_dash_creds =
+        nfrp_common::config::has_dashboard_creds(&cfg.dashboard_user, &cfg.dashboard_pwd);
     let dashboard_auth: dashboard::DashboardAuth =
-        Arc::new(RwLock::new(if cfg.dashboard_user.is_empty() {
-            None
-        } else {
-            Some((cfg.dashboard_user.clone(), cfg.dashboard_pwd.clone()))
-        }));
+        Arc::new(RwLock::new(has_dash_creds.then(|| {
+            (cfg.dashboard_user.clone(), cfg.dashboard_pwd.clone())
+        })));
     if let Some(dport) = cfg.dashboard_port {
         // 防御性兜底：`validate()` 已经在启动路径上拦过一次，但这里再挡一次 ——
         // `serve_with` 是所有启动方式的必经之地（包括将来新加的加载路径、
         // 以及嵌进别的宿主程序时直接调它的场景）。面板无鉴权 + 非回环 =
         // 匿名者可写，这条不能只靠上游校验。
-        if cfg.dashboard_user.trim().is_empty()
+        // ★ v0.5.6（H1）：同样要判**密码**，不能只看用户名。
+        if !has_dash_creds
             && !nfrp_common::util::is_loopback_addr(&cfg.bind_addr)
             && !cfg.allow_insecure_dashboard
         {
             anyhow::bail!(
-                "拒绝启动面板：bind_addr = {:?} 是对外地址，但没有配置 dashboard_user。\
-                 要么配用户名密码，要么把 bind_addr 改成 127.0.0.1，\
+                "拒绝启动面板：bind_addr = {:?} 是对外地址，但没有配置**完整的**凭据\
+                 （dashboard_user 与 dashboard_pwd 都非空才行）。\
+                 要么配齐用户名密码，要么把 bind_addr 改成 127.0.0.1，\
                  要么显式写 allow_insecure_dashboard = true。",
                 cfg.bind_addr
             );
@@ -669,7 +676,14 @@ async fn handle_frp_stream(
     // 取 30s：正常客户端握手是毫秒级（本地实测 ~2ms），30s 足够覆盖
     // 高延迟链路 + OIDC 首次验签（JWKS 已在启动时预热）。超时即断开，
     // 对合法用户无任何可感知影响。
-    let handshake = conn::server_handshake_authz(stream, &auth_snapshot, &run_id, authorize);
+    // ★ v0.5.6（M3）：把登录时间戳窗口传进握手（0 = 关闭校验）。
+    let handshake = conn::server_handshake_authz(
+        stream,
+        &auth_snapshot,
+        &run_id,
+        authorize,
+        cfg.max_clock_skew_secs,
+    );
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
         Err(_) => {
             registry.audit().record(
@@ -732,6 +746,30 @@ async fn handle_frp_stream(
                     );
                 }
                 debug!("握手失败：{e:#}");
+
+                // ★★ v0.5.6 修（审计总报告 L10，低危）：**登录失败时重试拉 JWKS**。
+                //
+                // `guard.rs` 的 `refresh_oidc` 文档一直承诺"之后每次登录失败都会
+                // 重新尝试拉取（见 serve.rs 的登录失败路径）"—— 但**那句承诺是假的**：
+                // 全仓 `refresh_oidc` 只有 `serve.rs` 启动时那**一个**调用点。
+                //
+                // 后果（功能性缺陷，不是安全问题）：IdP 启动时不可达 ⇒
+                // `AuthProvider::OidcUnavailable` ⇒ **一直拒绝登录**，
+                // 而且**永远不会自愈** —— 即使 IdP 几秒后就恢复了，
+                // 也必须重启服务端。运维看到的是"IdP 明明好的，就是登不上"。
+                //
+                // ★ 只在 OIDC 未就绪时才尝试（`refresh_oidc` 自身是幂等的，
+                //   已是 Oidc 状态会立刻返回）。放在这里而不是每条连接都试，
+                //   是因为"登录失败"才是"可能需要刷新"的信号。
+                if matches!(
+                    sec.auth(),
+                    nfrp_common::security::AuthProvider::OidcUnavailable(_)
+                ) {
+                    match sec.refresh_oidc().await {
+                        Ok(()) => info!("OIDC JWKS 重试拉取成功，后续登录可用了"),
+                        Err(e2) => debug!("OIDC JWKS 重试拉取仍失败：{e2:#}"),
+                    }
+                }
                 Err(e)
             }
         },
@@ -767,7 +805,31 @@ async fn handle_control(
     );
 
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
-    let idle_timeout = Duration::from_secs(cfg.work_conn_idle_timeout.max(5));
+    // ★★ v0.5.6 修（审计总报告 M15，中危）：**补上上界钳制**。
+    //
+    // 原先只有 `.max(5)` —— 只挡了 0（免得"0 = 立刻超时"），
+    // **没有上界**。于是配置里写一个极大的值（比如 `u64::MAX` 秒）
+    // 就让空闲工作连接**永不回收**：
+    //
+    // * 每个客户端还能开 `maxPoolCount`（默认 5）× 多条代理的空闲工作连接；
+    // * 客户端重连后旧连接不会被及时清掉 ⇒ `idle_work_conns` 持续累积
+    //   ⇒ fd / 内存缓慢增长，且它**不是**由攻击流量触发的，
+    //   运维很难把它和配置项联系起来。
+    //
+    // 上界取 3600 秒（1 小时）：远大于任何合理配置
+    // （默认 60 秒、官方同款），但保证空闲连接**一定**会被回收。
+    // 下界 5 秒维持原样（挡住 0 造成的立刻超时）。
+    const IDLE_MIN: u64 = 5;
+    const IDLE_MAX: u64 = 3600;
+    let idle_secs = cfg.work_conn_idle_timeout.clamp(IDLE_MIN, IDLE_MAX);
+    if cfg.work_conn_idle_timeout != idle_secs {
+        warn!(
+            configured = cfg.work_conn_idle_timeout,
+            applied = idle_secs,
+            "work_conn_idle_timeout 超出 [{IDLE_MIN}, {IDLE_MAX}] 秒，已钳制到 {idle_secs}"
+        );
+    }
+    let idle_timeout = Duration::from_secs(idle_secs);
     let limits = registry.limits().clone();
     let (conn_limit, backlog_limit, proxy_limit) = limits.per_client();
     let client = Arc::new(ClientState::new(
@@ -847,10 +909,10 @@ async fn handle_control(
                         //   之所以要兜这一层：早期判断反了 —— 以为客户端该发原始名，
                         //   结果第三方 frps（LoliaFRP）按全名查隧道，查不到就回
                         //   「FRPC 配置文件错误,请检查后重试」。
-                        m.proxy_name = util::add_user_prefix(
-                            &client.user,
-                            util::strip_user_prefix(&client.user, &m.proxy_name),
-                        );
+                        // ★ v0.5.6（M5）：抽成 `canonical_wire_name()`，与面板管理
+                        //   路径（`admin.rs`）共用 —— 原先面板那条漏了 strip，
+                        //   于是全名会被叠成 `alice.alice.web`（端口/域名泄漏）。
+                        m.proxy_name = util::canonical_wire_name(&client.user, &m.proxy_name);
                         let name = m.proxy_name.clone();
                         let port = m.remote_port;
                         // (3) 授权：这个角色允许注册这种类型的代理 / 占这个端口吗？
@@ -962,7 +1024,18 @@ async fn handle_control(
                     }
                     FrpMessage::CloseProxy(m) => {
                         info!(proxy = %m.proxy_name, "客户端关闭代理");
-                        registry.metrics().proxies_active.dec();
+                        // ★★ v0.5.6 修（审计总报告 M8，中危）：`proxies_active.dec()`
+                        //   **不能无条件执行**。
+                        //
+                        // 原先它在这里就先减了，而下面 `stop_proxy` 可能返回 `None`
+                        // （名字拼错、重复发、发别人的名字）—— 那种情况下什么都没
+                        // 清理，gauge 却已经减了一次。
+                        //
+                        // 攻击：任意客户端反复发 `CloseProxy`，每次让 gauge 减 1
+                        // ⇒ 变成负数并持续走低，面板显示"生效代理 -37"，
+                        // 管理员据此发现异常的能力被破坏。
+                        //
+                        // 正确写法是"确实摘掉了才减"，与 `admin.rs` 那条对齐。
                         registry.audit().record(
                             crate::audit::AuditEvent::new(
                                 crate::audit::kind::PROXY_REMOVE,
@@ -990,8 +1063,15 @@ async fn handle_control(
                         }
                         // tcp / udp 的公网端口同理：客户端这边只是记账，
                         // 端口是注册表管的，必须显式还回去
+                        //
+                        // ★ v0.5.6（M8）：`dec()` 挪到这里 —— **确实摘掉了才减**。
                         if let Some(port) = client.stop_proxy(&m.proxy_name) {
+                            registry.metrics().proxies_active.dec();
                             registry.release_port(port, &client, &m.proxy_name);
+                        } else {
+                            // 名字对不上：什么都没清理。留一条 debug 便于排查
+                            // （不改指标 —— 这正是 M8 的修法）。
+                            debug!(proxy = %m.proxy_name, "CloseProxy 的名字不在本客户端的表里，未做任何清理");
                         }
                     }
                     FrpMessage::NatHoleVisitor(m) => {
@@ -1409,7 +1489,11 @@ pub fn admit_user(user: PendingUser, client: &Arc<ClientState>, registry: &Arc<R
         return;
     }
     registry.metrics().conns_total.inc();
-    registry.metrics().conns_active.inc();
+    // ★★ v0.5.6 修（审计总报告 M7）：`conns_active.inc()` **不在这里**。
+    //
+    // 原先 `admit_user` 与 `handle_work` 各 inc 一次，而 `finish_conn` 只 dec 一次
+    // ⇒ "用户先到、工作连接后到"这条路径 **+2 / -1**，每来一条连接就虚高 1。
+    // 现在把 +1 收敛到配对成功的**唯一那一刻**（`bridge` 里的 `ConnGuard`）。
     match client.submit_user(user) {
         Submit::Paired(pair) => {
             let p = *pair;
@@ -1560,6 +1644,29 @@ async fn handle_work(
         } else if peer.ip() != client.peer_ip() {
             // 没声明这个能力（官方 frpc、或老版 NFrp）：官方默认**不带凭证**，
             // 所以不能拦。退而求其次 —— 要求同源 IP。
+            //
+            // ★★ v0.5.6 修（审计总报告 L5，低危）：**把"可能是误拒"说清楚**。
+            //
+            // 这条判据在**混合传输**下可能误伤合法用户：控制连接走 TCP、
+            // 工作连接走 QUIC（`protocol = "quic"`）时，两条连接的出口 IP
+            // 可能不同 —— 多宿主机、多网卡、或 NAT 池有多个公网 IP 时都会发生。
+            // 而官方 frpc 不带凭证，所以它**必然**走这条分支。
+            //
+            // 现状下用户的症状是：**控制连接登录成功、但每条用户连接都失败**，
+            // 日志里只有一句"来源与登录来源不一致" —— 完全指不到"是网络路径不同"。
+            //
+            // ★ 为什么**不**放宽判据（如实说明）：
+            //   放宽就等于让"拿 run_id 冒充"重新变得容易（那正是 A-1 要堵的）。
+            //   在"可用性"和"防冒充"之间，这里选择**保住防线**，
+            //   但把诊断信息补足，让人能一眼看出自己踩的是哪种情况。
+            // ★ 提示语之所以**不**按"哪种传输"分支：`handle_work` 里拿不到
+            //   服务端配置（它只收 registry / peer / conn），而为了写一句提示
+            //   去把 `Arc<ServerConfig>` 一路传进来，代价大于收益。
+            //   两种情况合并成一条，信息量一样够用。
+            let hint = "（常见原因：多网卡 / NAT 池有多个出口 IP / 中间有代理，\
+                        或控制连接与工作连接走了不同传输（TCP vs QUIC/KCP）\
+                        导致出口 IP 不同；\
+                        升级到 NFrp ≥0.5.5 客户端可改用凭证校验，不再依赖源 IP）";
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
                     .client(msg.run_id.clone())
@@ -1570,10 +1677,43 @@ async fn handle_work(
                         client.peer_ip()
                     )),
             );
+            warn!(
+                run_id = %msg.run_id,
+                work_ip = %peer.ip(),
+                control_ip = %client.peer_ip(),
+                "工作连接与控制连接来源 IP 不一致，已拒绝 —— 若你确认是同一台机器，\
+                 多半是两条连接走了不同网络路径"
+            );
             anyhow::bail!(
-                "工作连接来源与登录来源不一致（{} vs {}）—— 无凭证时必须同源",
+                "工作连接来源与登录来源不一致（{} vs {}）—— 无凭证时必须同源。{hint}",
                 peer.ip(),
                 client.peer_ip()
+            );
+        } else {
+            // ★★ v0.5.6 修（审计总报告 M14，中危）：**放行分支也必须审计**。
+            //
+            // 原先这条"无凭证 + 同源 IP ⇒ 放行"的路径**零审计** ——
+            // 上面三条拒绝路径全都记了审计事件，唯独**真正放行**的这条什么都没记。
+            //
+            // 为什么这条特别值得记：它正是 A-1（工作连接凭证）修复的**兼容回退**
+            // 分支，也是**最弱**的一条认证路径 —— 只靠源 IP 判断。
+            // 攻击者若与受害者在同一出口 IP（同 NAT、同办公网、云上同 VPC），
+            // 这里就是唯一还能拦住他的地方，而它**原本在日志里完全不可见**。
+            //
+            // ⇒ 事后审计时，"哪些工作连接是靠最弱判据放行的"必须是可回答的。
+            //   记成 `detail` 而不是独立事件类型，是为了不改变既有事件 schema
+            //   （避免下游解析器被新类型打乱）。
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN, true)
+                    .client(msg.run_id.clone())
+                    .user(client.user.clone())
+                    .ip(peer.ip().to_string())
+                    .target(msg.run_id.clone())
+                    .detail(format!(
+                        "工作连接以**无凭证 + 同源 IP** 放行（客户端未声明 workConnCred 能力，\
+                         判据仅源 IP={}）；若要收紧请升级客户端到 ≥0.5.5",
+                        peer.ip()
+                    )),
             );
         }
     }
@@ -1597,7 +1737,9 @@ async fn handle_work(
     match client.submit_work(work) {
         Some(p) => {
             debug!(proxy = %p.user.proxy, "工作连接与排队用户配对");
-            registry.metrics().conns_active.inc();
+            // ★★ v0.5.6（M7）：这里**不再** inc —— 计数收敛到 `bridge` 的
+            //   `ConnGuard`（配对成功那一刻 +1，作用域结束 -1）。
+            //   原先这里与 `admit_user` 各加一次，于是 +2/-1 虚高。
             spawn_bridge(p.user, p.work, registry.clone());
         }
         None => debug!(client = %client.client_id, "工作连接进入空闲池"),
@@ -1772,7 +1914,10 @@ async fn handle_visitor(
     .context("发送 NewVisitorConnResp 失败")?;
     registry.metrics().visitor_conns.inc();
     registry.metrics().conns_total.inc();
-    registry.metrics().conns_active.inc();
+    // ★★ v0.5.6（M7）：这里**不再** inc —— `bridge` / `spawn_sudp_bridge`
+    //   里的守卫会各自在配对成功那一刻 +1，并在离开作用域时 -1。
+    //   原先这里 inc + `acquire_work_conn` 失败时手工 dec，是"配对前就加、
+    //   失败要手工回滚"的脆弱写法。
 
     // 7) 向 provider 要一条工作连接并配对
     let Some(work) = entry
@@ -1780,7 +1925,6 @@ async fn handle_visitor(
         .acquire_work_conn(Duration::from_secs(10))
         .await
     else {
-        registry.metrics().conns_active.dec();
         anyhow::bail!("provider [{proxy_name}] 没有可用的工作连接，visitor 连接关闭");
     };
 
@@ -1808,11 +1952,62 @@ async fn handle_visitor(
     spawn_bridge(user, work, registry.clone());
     Ok(())
 }
-/// 一条转发连接结束时的收尾：归还活跃连接计数与流量统计。
-fn finish_conn(registry: &Registry, up: u64, down: u64) {
-    registry.metrics().conns_active.dec();
-    registry.metrics().bytes_up.inc_by(up);
-    registry.metrics().bytes_down.inc_by(down);
+/// 活跃转发连接的**计数守卫**（v0.5.6 修审计总报告 M7）。
+///
+/// # 为什么用 RAII 而不是手工 `dec()`
+///
+/// 审计报告在 `serve.rs` 里找出**四处**同类问题：
+///
+/// | 位置 | 问题 |
+/// |---|---|
+/// | `admit_user` + `handle_work` | **重复 inc**（用户先到 + 工作后到 ⇒ +2 只 -1） |
+/// | `CloseProxy` 分支 | 无条件 dec（对不存在的名字也减）—— 同 M8，已修 |
+/// | `bridge` 里两处 `?` | 提前返回**漏 dec** |
+/// | `sudp_bridge` 里两处 `?` | 同上 |
+///
+/// ⇒ 攻击者持合法凭证反复"建连接 → 立刻断开"，就能让 `conns_active`
+/// **单调上涨**（指标不可信，削弱管理员发现异常的能力；**不构成配额绕过**，
+/// 配额走信号量）。
+///
+/// ★ 关键洞察：这四处**不是四个 bug，是同一个 bug 的四个表现** ——
+///   "配对的 +1 与结束的 -1 分散在两处，中间任何一条提前返回都会漏掉 -1"。
+///   手工在每个返回点补 `dec()` 只会把"四处"变成"更多处"，下次加一个
+///   `?` 又漏。**用 Drop 把 -1 绑到作用域上，就再也不可能漏**。
+///
+/// ★ 用法：**配对成功那一刻**创建守卫，之后函数怎么返回都无所谓：
+///
+/// ```ignore
+/// let _guard = ConnGuard::new(&registry);   // +1
+/// ... 任意多个 `?` ...
+/// ```                                       // 作用域结束自动 -1
+struct ConnGuard<'a> {
+    registry: &'a Registry,
+    /// 结束时要把流量统计一起记账（`relay_between` 的返回值）。
+    bytes: std::cell::Cell<(u64, u64)>,
+}
+
+impl<'a> ConnGuard<'a> {
+    fn new(registry: &'a Registry) -> Self {
+        registry.metrics().conns_active.inc();
+        Self {
+            registry,
+            bytes: std::cell::Cell::new((0, 0)),
+        }
+    }
+
+    /// 记下本次转发的字节数（由 relay 的返回值提供）。
+    fn record_bytes(&self, up: u64, down: u64) {
+        self.bytes.set((up, down));
+    }
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        let (up, down) = self.bytes.get();
+        self.registry.metrics().bytes_up.inc_by(up);
+        self.registry.metrics().bytes_down.inc_by(down);
+        self.registry.metrics().conns_active.dec();
+    }
 }
 
 pub fn spawn_bridge(user: PendingUser, work: WorkItem, registry: Arc<Registry>) {
@@ -1834,6 +2029,11 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     } = user;
     let mut work_conn = work.conn;
 
+    // ★★ v0.5.6（M7）：**配对成功这一刻**建守卫 ⇒ +1，且保证**只有一次**。
+    //   于是 `admit_user` 与 `handle_work` 里那两处 inc 都不需要了
+    //   （它们分别在"用户到达"和"工作连接配对"时各加一次，导致 +2/-1）。
+    let guard = ConnGuard::new(registry);
+
     work_conn
         .send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
             proxy_name: proxy.clone(),
@@ -1852,16 +2052,18 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         user_stream.write_all(&leftover).await?;
     }
 
+    // 无论成功、失败、还是上面某个 `?` 提前返回，`guard` 都会在作用域结束时
+    // 归还计数 —— 这就是 RAII 修法的全部价值。
     match util::relay_between(&mut user_stream, &mut work_stream).await {
         Ok((up, down)) => {
             debug!(proxy = %proxy, "转发结束：上行 {up}B / 下行 {down}B");
-            finish_conn(registry, up, down);
+            guard.record_bytes(up, down);
         }
         Err(e) => {
             debug!(proxy = %proxy, "转发中断：{e}");
-            finish_conn(registry, 0, 0);
         }
     }
+    drop(guard);
     Ok(())
 }
 
@@ -1890,6 +2092,11 @@ async fn sudp_bridge(
 ) -> Result<()> {
     let mut provider_conn = work.conn;
 
+    // ★★ v0.5.6（M7）：配对成功这一刻建守卫 ⇒ +1，且离开作用域必然 -1。
+    //   原先 `finish_conn` 只在最后一行调用，而下面 `?` 提前返回时会漏掉
+    //   （审计报告指出的 `:1905` / `:1913` 两处）。
+    let guard = ConnGuard::new(registry);
+
     // ★ 与官方 frps 一致：拿到工作连接后**先**发 `StartWorkConn` 告诉客户端
     //   "这条连接服务哪个代理"，之后才谈业务帧。
     //   少了这一步，客户端的 `client_work_conn` 还停在等 StartWorkConn，
@@ -1912,7 +2119,8 @@ async fn sudp_bridge(
     // 注意这里按值交出连接：relay_sudp_frames 内部要把每条连接独占给一个协程。
     let (up, down) = relay_sudp_frames(visitor_conn, provider_conn).await?;
     debug!(proxy = %proxy_name, "SUDP 转发结束：上行 {up}B / 下行 {down}B");
-    finish_conn(registry, up, down);
+    guard.record_bytes(up, down);
+    drop(guard);
     Ok(())
 }
 
@@ -2304,5 +2512,70 @@ mod tests {
 
         cfg.protocol = Protocol::Nfrp;
         assert!(ensure_protocol(&cfg).is_err());
+    }
+
+    // ==================================================================
+    // v0.5.6 回归（审计总报告 M7）：活跃连接计数必须收支平衡
+    //
+    // 审计找出**四处**同类问题（重复 inc / 无条件 dec / 两处 `?` 漏 dec），
+    // 但它们其实是**同一个 bug 的四个表现**：
+    // "配对的 +1 与结束的 -1 分散在两处，中间任何提前返回都会漏掉 -1"。
+    // 修法用 RAII 把 -1 绑到作用域上 —— 下面这几条锁住这个不变量。
+    // ==================================================================
+
+    /// ★★ M7：守卫创建 +1、离开作用域 -1（**无论怎么离开**）。
+    #[test]
+    fn 连接守卫必须收支平衡() {
+        let r = Registry::unlimited();
+        assert_eq!(r.metrics().conns_active.get(), 0, "起点为 0");
+
+        {
+            let _g = ConnGuard::new(&r);
+            assert_eq!(r.metrics().conns_active.get(), 1, "建守卫后 +1");
+        }
+        assert_eq!(r.metrics().conns_active.get(), 0, "离开作用域必须 -1");
+
+        // 嵌套多个也一样
+        let g1 = ConnGuard::new(&r);
+        let g2 = ConnGuard::new(&r);
+        assert_eq!(r.metrics().conns_active.get(), 2);
+        drop(g1);
+        assert_eq!(r.metrics().conns_active.get(), 1, "只减自己那一份");
+        drop(g2);
+        assert_eq!(r.metrics().conns_active.get(), 0);
+    }
+
+    /// ★★ M7 核心：**提前返回（`?` 路径）也必须把计数还回来**。
+    ///
+    /// 这是原先漏 dec 的那两条路径的等价物：函数在守卫建好之后、
+    /// `finish_conn` 之前就 return 了。
+    #[test]
+    fn 提前返回也要归还计数() {
+        let r = Registry::unlimited();
+
+        fn early_return(r: &Registry) -> Result<()> {
+            let _g = ConnGuard::new(r);
+            // 模拟 `send_msg(...).context(...)?` 失败提前返回
+            anyhow::bail!("模拟发送 StartWorkConn 失败");
+        }
+
+        assert!(early_return(&r).is_err());
+        assert_eq!(
+            r.metrics().conns_active.get(),
+            0,
+            "提前返回绝不能漏掉 -1（M7 的核心）"
+        );
+    }
+
+    /// 流量统计同样由守卫记账（成功路径）。
+    #[test]
+    fn 守卫要记账流量() {
+        let r = Registry::unlimited();
+        {
+            let g = ConnGuard::new(&r);
+            g.record_bytes(1234, 5678);
+        }
+        assert_eq!(r.metrics().bytes_up.get(), 1234);
+        assert_eq!(r.metrics().bytes_down.get(), 5678);
     }
 }
