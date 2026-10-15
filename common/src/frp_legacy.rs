@@ -193,6 +193,16 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
             if name.is_empty() {
                 return None;
             }
+            // ★★ v0.5.6 修（审计总报告 M4，中危）：**段名统一小写**。
+            //
+            // 官方 frp 用 `go-ini` 解析，它把段名与键名都做了 `strings.ToLower`
+            // （见 `ini.LoadSources` 的 `strings.ToLower(k)`）。而这里原先
+            // **严格区分大小写** ⇒ `[Common]`、`[RDP]` 这类写法在官方能用、
+            // 在 NFRp 会"段找不到"。
+            //
+            // 对安全的影响不是"报错"，而是**静默失效**：
+            // 段名匹配不上时那条代理**整个不被加载**，用户以为隧道开着。
+            let name = name.to_ascii_lowercase();
             cur = Some(match sections.iter().position(|s| s.name == name) {
                 Some(i) => i,
                 None => {
@@ -211,13 +221,31 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
             return None;
         }
 
+        // ★★ v0.5.6 修（审计总报告 M4，中危）：**键名统一小写**。
+        //
+        // 同段名那条：官方 `go-ini` 对键名也做 `strings.ToLower`。
+        // 而这里原先严格区分大小写，于是 `admin_addr` / `Admin_Addr` /
+        // `ADMIN_ADDR` 只有一种写法能生效。
+        //
+        // ★ 特别注意**安全键**：`authentication_method`、`privilege_token`、
+        //   `tls_enable` 这些键名写错大小写时，取值返回 `None` ⇒
+        //   落到各自的默认值 ⇒ **安全配置静默失效**，而配置看起来"配了"。
+        //   这与 TOML 路径的 `deny_unknown_fields`（拼错就报错）
+        //   形成鲜明对比 —— INI 路径既大小写敏感、又不报未知键，
+        //   两个特性叠加就成了"静默失效"的温床。
+        //
+        // ★ 段名与键名现在都小写；`.truncate` 前的 `key` 已由
+        //   `split_key_value` 做过 trim。这里再做一次 `to_ascii_lowercase`
+        //   是幂等的，对已是小写的输入零影响。
+        let key = key.to_ascii_lowercase();
+
         // 段前内容归 DEFAULT 段（ini.v1 语义），它不会被当作代理
         let idx = match cur {
             Some(i) => i,
             None => {
                 let i = sections.len();
                 sections.push(IniSection {
-                    name: "DEFAULT".to_string(),
+                    name: "default".to_string(),
                     keys: Vec::new(),
                 });
                 cur = Some(i);
@@ -228,7 +256,7 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
         if let Some(slot) = sec.keys.iter_mut().find(|(k, _)| *k == key) {
             slot.1 = value.to_string(); // 键重复 → 取最后一个
         } else {
-            sec.keys.push((key.to_string(), value.to_string()));
+            sec.keys.push((key, value.to_string()));
         }
     }
 
@@ -714,7 +742,10 @@ pub fn legacy_client_to_value(text: &str) -> Result<Value> {
 
     for sec in &sections {
         // `DEFAULT`（段前裸键）与 `common` 不是代理；`range:` 已被展开
-        if sec.name == "common" || sec.name == "DEFAULT" || sec.name.starts_with("range:") {
+        //
+        // ★ v0.5.6（M4）：段名从本版起统一小写，所以这里必须用小写的
+        //   `"default"` —— 否则段前的裸键会被**当成一个代理**去加载。
+        if sec.name == "common" || sec.name == "default" || sec.name.starts_with("range:") {
             continue;
         }
 
@@ -901,10 +932,76 @@ remote_port = 27064
 
         assert_eq!(cfg.proxies.len(), 1);
         let p = &cfg.proxies[0];
-        assert_eq!(p.name, "MCCC", "段名就是代理名");
+        // ★ v0.5.6（审计总报告 M4）：段名现在**统一小写**。
+        //
+        // 这份 INI 里写的是 `[MCCC]`，而官方 frp 用 `go-ini` 解析 ——
+        // go-ini 对段名做 `strings.ToLower`，`SectionStrings()` 返回的就是
+        // 小写名，官方 `Name: name` 于是也得到 `mccc`。
+        // ⇒ 改成小写**不是**偏离官方，而是**修正**成一个本就该一致的行为
+        //   （改之前 `[MCCC]` 在官方是 `mccc`、在 NFRp 是 `MCCC`，
+        //     同一份配置在两个实现里产生不同的代理名）。
+        assert_eq!(p.name, "mccc", "段名小写化，与官方 go-ini 一致");
         assert_eq!(p.proxy_type, "tcp");
         assert_eq!(p.local_addr, "127.0.0.1:25565");
         assert_eq!(p.remote_port, 27064);
+    }
+
+    /// ★★ v0.5.6 回归（审计总报告 M4）：INI 的**段名与键名必须大小写不敏感**。
+    ///
+    /// 官方 `go-ini` 对两者都做 `strings.ToLower`，而 NFRp 原先严格区分大小写
+    /// ⇒ 同一份配置在两个实现里行为不同，而且是**静默失效**
+    /// （取不到值就落到默认值，配置看起来"配了"）。
+    #[test]
+    fn ini_的段名与键名必须大小写不敏感() {
+        // 键名的大小写变体都要认
+        for key in ["server_addr", "Server_Addr", "SERVER_ADDR", "sErVeR_aDdR"] {
+            let text = format!("[common]\n{key} = example.com\n");
+            let cfg = parse_client(&text).expect("应能解析");
+            assert_eq!(
+                cfg.server_addr, "example.com",
+                "键名 {key} 必须被识别（官方 go-ini 会小写化）"
+            );
+        }
+
+        // 段名的大小写变体都要认
+        for sec in ["proxy", "Proxy", "PROXY"] {
+            let text = format!(
+                "[common]\nserver_addr = x\n\n[{sec}]\ntype = tcp\nlocal_port = 80\nremote_port = 8080\n"
+            );
+            let cfg = parse_client(&text).expect("应能解析");
+            assert_eq!(cfg.proxies.len(), 1, "段 [{sec}] 必须被识别为一条代理");
+            assert_eq!(cfg.proxies[0].name, "proxy", "代理名统一小写");
+        }
+
+        // ★ 安全键的拼写变体：`tls_enable` 写错大小写时原先会静默走默认值
+        let text = "[common]\nserver_addr = x\nTLS_Enable = true\n";
+        let cfg = parse_client(text).expect("应能解析");
+        assert!(cfg.tls_enable, "TLS_Enable 必须等同于 tls_enable");
+
+        // 反向：段前的裸键仍归 default 段、**不得**被当成代理
+        //
+        // 注意 `[common]` 仍要写全（server_addr 从它读），裸键那份只是
+        // 用来验证"不会被当成一条代理"。
+        let text = "local_port = 1234\n\n[common]\nserver_addr = x\n";
+        let cfg = parse_client(text).expect("应能解析");
+        assert!(
+            cfg.proxies.is_empty(),
+            "段前裸键不得产出代理，实际得到 {:?}",
+            cfg.proxies.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        // ★ 大小写不敏感的核心价值：**同一份配置在官方与 NFRp 上行为一致**。
+        //   下面这份是"大小写混写"的真实样子，必须完整可用。
+        let mixed = "[Common]\nServer_Addr = frp.example.com\nServer_Port = 7000\nLogin_Fail_Exit = false\n\n[Web01]\nTYPE = tcp\nLocal_IP = 127.0.0.1\nLocal_Port = 80\nRemote_Port = 8080\n";
+        let cfg = parse_client(mixed).expect("混写大小写的配置必须能解析");
+        assert_eq!(cfg.server_addr, "frp.example.com");
+        assert_eq!(cfg.server_port, 7000);
+        assert!(!cfg.login_fail_exit);
+        assert_eq!(cfg.proxies.len(), 1);
+        assert_eq!(cfg.proxies[0].name, "web01");
+        assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+        assert_eq!(cfg.proxies[0].local_addr, "127.0.0.1:80");
+        assert_eq!(cfg.proxies[0].remote_port, 8080);
     }
 
     /// ★ 关键默认值：INI 不写 `tls_enable` 时，官方 frpc 是**开 TLS** 的
