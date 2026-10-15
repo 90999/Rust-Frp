@@ -123,9 +123,14 @@ impl SecurityContext {
         }
 
         // token 为空又开着 OIDC？那 OIDC 才是实际生效的，不用说"没有认证"。
-        if auth.method() == nfrp_common::security::AuthMethod::Token
-            && cfg.effective_auth().token.is_empty()
-        {
+        //
+        // ★ v0.5.6（审计总报告 M6）：改用唯一真源 `ServerConfig::has_no_auth()`。
+        //   原先这里是就地写的一套口径（`auth.method() == Token &&
+        //   cfg.effective_auth().token.is_empty()`），而 `main.rs` 那边用的是
+        //   裸的 `cfg.token.is_empty()` —— **两套口径必然漂移一处**：
+        //   纯 OIDC 部署会被 main.rs 误报成"没有认证，任何人都能连"。
+        //   本处的口径本来就是对的，收进 `has_no_auth()` 让两处共用。
+        if cfg.has_no_auth() {
             tracing::warn!(
                 "服务端没有配置任何 token —— 任何人都能连上来。\
                  请配置 token 或 [auth] method = \"oidc\"；\
