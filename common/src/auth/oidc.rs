@@ -68,6 +68,14 @@ pub struct ServerOidcConfig {
     /// 拉 JWKS 时走的代理。
     #[serde(rename = "proxyURL")]
     pub proxy_url: String,
+    /// 允许 `jwks_uri` 使用明文 http（v0.5.6 修审计总报告 M9，纵深防御）。
+    ///
+    /// 默认 **false**：discovery 文档里的 `jwks_uri` 必须是 `https://`。
+    ///
+    /// 为什么默认拒明文：JWKS 是**公钥**，走明文被中间人替换就等于
+    /// **认证被完全绕过**。开发时对接本地 IdP 可临时置 true。
+    #[serde(rename = "allowInsecureIssuer")]
+    pub allow_insecure_issuer: bool,
 }
 
 /// 客户端 OIDC 配置（对应 frp 的 `auth.oidc`）。
@@ -374,6 +382,32 @@ impl OidcVerifier {
             Ok(r) if (200..300).contains(&r.status) => {
                 let v = r.json()?;
                 if let Some(u) = v.get("jwks_uri").and_then(|x| x.as_str()) {
+                    // ★★ v0.5.6 修（审计总报告 M9，纵深防御）：`jwks_uri`
+                    //   是从**远端文档**里读来的，原先**原样信任、无 scheme 校验**。
+                    //
+                    // 它是 M9 那条链的"远端可控入口"：被劫持或恶意的 IdP 可以在这里
+                    // 塞一个带 CRLF 的 URL，配合 `httpc::Url::parse` 的头注入面
+                    // 构造任意请求头（`httpc` 侧已修，这里是第二道）。
+                    //
+                    // 只接受 `https://`：
+                    // * JWKS 是**公钥**，走明文被篡改就等于认证被绕过
+                    //   ⇒ 生产环境本就该是 https；
+                    // * 明文 `http://` 只允许在**显式开启的调试模式**下，
+                    //   免得开发时对接本地 IdP 直接不可用。
+                    if !u.starts_with("https://") {
+                        if !self.cfg.allow_insecure_issuer {
+                            bail!(
+                                "discovery 文档里的 jwks_uri 不是 https（{u:?}）—— \
+                                 公钥走明文会被中间人替换、从而绕过认证。\
+                                 开发环境可显式设 allowInsecureIssuer = true"
+                            );
+                        }
+                        tracing::warn!(
+                            jwks_uri = %u,
+                            "jwks_uri 不是 https —— 仅因 allowInsecureIssuer = true 才放行，\
+                             生产环境请务必改用 https"
+                        );
+                    }
                     return Ok(u.to_string());
                 }
                 bail!("discovery 文档 {url} 里没有 jwks_uri");
