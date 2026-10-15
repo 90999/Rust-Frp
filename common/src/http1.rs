@@ -25,7 +25,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// 超过就当这条请求已经读完 —— 真发这么大的头，多半是打错了协议或者在被扫描，
 /// 没必要为了把它读完而吃内存。
-pub const MAX_HEAD: usize = 32 * 1024;
+///
+/// ★★ v0.5.6 修（审计总报告 L8，低危）：**不再单独定义**，改为复用
+/// [`crate::http_relay::MAX_HEAD`]。
+///
+/// 原先这里是 `32 * 1024`，而 `http_relay::MAX_HEAD` 是 `64 * 1024` ——
+/// **同名、同语义、两处取值不同**。虽然两条路径没有交叉（不构成绕过），
+/// 但这类"同一概念各写一份"正是本项目反复出现的漂移模式
+/// （H1 / H3 / M2 / M5 / M7 全是它）。
+///
+/// 统一到 64 KiB：与 `http_relay` 一致，且仍是"远小于任何真实请求头"的量级。
+pub const MAX_HEAD: usize = crate::http_relay::MAX_HEAD;
 
 /// 一条已经读完的请求。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -521,5 +531,31 @@ mod tests {
             head: "GET /a:b HTTP/1.1".into(),
         };
         assert!(r2.headers_all("a").is_empty(), "请求行不该被当成头");
+    }
+}
+
+#[cfg(test)]
+mod max_head_tests {
+    /// ★★ v0.5.6 回归（审计总报告 L8）：`MAX_HEAD` **只能有一个真源**。
+    ///
+    /// 修复前这里是独立的 `32 * 1024`，而 `http_relay::MAX_HEAD` 是 `64 * 1024`
+    /// —— **同名、同语义、两处取值不同**。虽然两条路径无交叉（不构成绕过），
+    /// 但"同一概念各写一份"正是本项目反复出现的漂移模式
+    /// （H1 / H3 / M2 / M5 / M7 全是它）。
+    ///
+    /// 这条把它钉死：将来有人再改其中一处，测试会红。
+    #[test]
+    fn max_head_必须与_http_relay_同源() {
+        assert_eq!(
+            super::MAX_HEAD,
+            crate::http_relay::MAX_HEAD,
+            "http1::MAX_HEAD 与 http_relay::MAX_HEAD 必须指向同一个值（L8）"
+        );
+        // 顺带确认它是"合理量级"（别被改成 0 或 1G）
+        assert!(
+            (4096..=1024 * 1024).contains(&super::MAX_HEAD),
+            "MAX_HEAD 应在 4 KiB ~ 1 MiB 之间，实际 {}",
+            super::MAX_HEAD
+        );
     }
 }
