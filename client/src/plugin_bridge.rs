@@ -212,6 +212,41 @@ impl Bridge {
             let client_keep = wants_keep_alive(&req);
             let upgrading = wants_upgrade(&req);
 
+            // ★★ v0.5.6 修（审计总报告 M2，中危）：**请求侧 framing 校验**。
+            //
+            // 服务端 `vhost.rs` 早就做了这三项（TE+CL 并存 / 重复 CL /
+            // 不支持的 TE），而客户端这条路径**一项都没有** ——
+            // "同一语义写了两遍、只加固了一遍"的典型。
+            //
+            // 危害：`relay_request_body` 用的是弱判据 `body_length()`
+            // （v0.5.4 的 H2 已经把它判定为不够用：只取第一个同名头、
+            // 垃圾值静默变 None）⇒ 客户端与上游对"请求体到哪结束"的认知可能
+            // 不一致 ⇒ **请求走私**。
+            //
+            // ⚠️ 可利用性前提（如实说明，不夸大）：服务端**不解析** plugin 路径的
+            //    HTTP（plugin 类型走 TCP 透传），所以服务端不会替这里把关；
+            //   但要触发它，本机用户得**主动**配 `plugin = "http_proxy"` 之类
+            //   （v0.5.5 的 F1 修复已禁止服务端远程下发 plugin，攻击者无法自行制造）。
+            //   定级因此是 Medium 而非 High。
+            if let Err(e) = nfrp_common::http_relay::validate_request_framing(&req) {
+                debug!(proxy = %ctx.proxy_name, "请求 framing 非法，按走私风险直接拒绝：{e}");
+                let body = format!("{e}\n");
+                io.stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\n\
+                             Content-Type: text/plain; charset=utf-8\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                io.stream.flush().await?;
+                return Ok(());
+            }
+
             // 客户端在等 100-continue 才肯发请求体。上游那边我们不做中间态转发
             // （那要处理"响应先于请求体"的重排序），直接自己回一个 100 ——
             // 这是各家代理的通行做法，语义上也说得通：我们确实继续了。
@@ -246,12 +281,22 @@ impl Bridge {
             let framed =
                 has_no_body(&resp) || is_chunked(&resp) || body_length(&resp).is_some() || switched;
             let keep = client_keep && wants_keep_alive(&resp) && framed;
+
+            // ★★ v0.5.6 修（审计总报告 M2，中危）：**响应侧剥逐跳头**。
+            //
+            // 原先这里只在两个分支里分别 `set("Connection","close")` /
+            // `remove("connection")` —— **只处理了 `Connection` 这一个头**。
+            // 而 `Connection: keep-alive, X-Secret` 里点名的字段、
+            // 以及 `Upgrade` / `Keep-Alive` / `Proxy-*` 等常驻逐跳头
+            // 全都**原样泄漏给公网访客**（已实测复现）。
+            //
+            // 服务端 `vhost.rs` 的响应侧早就用 `HOP_BY_HOP + connection_tokens`
+            // 全量剥过了 —— 这又是"两条路径只加固了一条"。
+            //
+            // ★ 顺序：**先剥、再写我们自己的 `Connection`**（否则刚写的会被剥掉）。
+            nfrp_common::http_relay::strip_hop_by_hop(&mut resp);
             if !keep {
                 resp.set("Connection", "close");
-            } else {
-                // 客户端要复用、上游也给得了边界：把头原样交给客户端，
-                // `Connection` 由服务端下发的那个决定不了什么，摘掉更干净。
-                resp.remove("connection");
             }
 
             io.stream.write_all(&resp.to_bytes()).await?;
@@ -470,6 +515,121 @@ mod tests {
         assert_eq!(origin_form("https://a.b"), Some("/".to_string()));
         assert_eq!(origin_form("/c?d=1"), None);
         assert_eq!(origin_form("*"), None);
+    }
+
+    // ==================================================================
+    // v0.5.6 回归（审计总报告 M2）：客户端插件路径补齐服务端已有的防护
+    //
+    // 这组测试盯的是"同一语义写了两遍、只加固了一遍"这个模式：
+    // 服务端 `vhost.rs` 早就做了全套 framing 校验与逐跳头剥离，
+    // 客户端 `plugin_bridge.rs` 只做了其中一部分。
+    // ==================================================================
+
+    /// ★★ M2 之一：**请求 framing 校验**（服务端有、客户端原先一项都没有）。
+    ///
+    /// 危害是请求走私：`relay_request_body` 用的 `body_length()` 是弱判据
+    /// （只取第一个同名头、垃圾值静默变 None），与上游的解读可能不一致。
+    #[test]
+    fn 客户端插件路径必须做请求_framing_校验() {
+        use nfrp_common::http_relay::validate_request_framing as check;
+
+        // 合法请求：三种形态都该放行
+        for ok in [
+            vec!["POST / HTTP/1.1", "Host: x", "Content-Length: 5"],
+            vec!["POST / HTTP/1.1", "Host: x", "Transfer-Encoding: chunked"],
+            // `identity, chunked` 是 RFC 允许的（末尾是 chunked）
+            vec![
+                "POST / HTTP/1.1",
+                "Host: x",
+                "Transfer-Encoding: identity, chunked",
+            ],
+            vec!["GET / HTTP/1.1", "Host: x"],
+        ] {
+            let p = parts(&ok);
+            assert!(
+                check(&p).is_ok(),
+                "合法请求被误拒：{ok:?} -> {:?}",
+                check(&p)
+            );
+        }
+
+        // ★ TE + CL 并存 ⇒ 拒绝（CL.TE 走私）
+        let p = parts(&[
+            "POST / HTTP/1.1",
+            "Host: x",
+            "Content-Length: 5",
+            "Transfer-Encoding: chunked",
+        ]);
+        assert!(check(&p).is_err(), "TE 与 CL 并存必须拒绝");
+
+        // ★ 重复的 Content-Length ⇒ 拒绝（CL.CL 走私）
+        let p = parts(&[
+            "POST / HTTP/1.1",
+            "Host: x",
+            "Content-Length: 5",
+            "Content-Length: 6",
+        ]);
+        assert!(check(&p).is_err(), "重复的 Content-Length 必须拒绝");
+
+        // ★ 不支持的 TE 形态 ⇒ 拒绝（TE.TE 走私）
+        for bad_te in ["chunked, identity", "xchunked", "chunked, gzip"] {
+            let p = parts(&[
+                "POST / HTTP/1.1",
+                "Host: x",
+                &format!("Transfer-Encoding: {bad_te}"),
+            ]);
+            assert!(check(&p).is_err(), "TE={bad_te} 必须拒绝");
+        }
+    }
+
+    /// ★★ M2 之二：**响应侧必须剥掉全部逐跳头**（原先只处理 `connection` 一个）。
+    ///
+    /// 实测泄漏场景（审计报告给的复现）：内网服务回
+    /// `Connection: keep-alive, x-secret` + `x-secret` + `upgrade` + `keep-alive`，
+    /// 服务端会全部吸收，而客户端把 `x-secret` 等**原样泄漏给公网访客**。
+    #[test]
+    fn 客户端响应侧必须剥掉全部逐跳头() {
+        use nfrp_common::http_relay::strip_hop_by_hop;
+
+        let mut resp = parts(&[
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/html",
+            "Connection: keep-alive, x-secret",
+            "X-Secret: internal-token-abc",
+            "Upgrade: h2c",
+            "Keep-Alive: timeout=5",
+            "Proxy-Authenticate: Basic",
+            "Trailer: X-Foo",
+            "Te: trailers",
+        ]);
+        strip_hop_by_hop(&mut resp);
+
+        // 业务头必须留着
+        assert_eq!(resp.get("content-type"), Some("text/html"));
+        // 常驻逐跳头 + Connection 点名的自定义头，全部不许剩
+        for gone in [
+            "connection",
+            "x-secret", // ← 这就是原先泄漏的那个内部令牌
+            "upgrade",
+            "keep-alive",
+            "proxy-authenticate",
+            "trailer",
+            "te",
+        ] {
+            assert!(
+                resp.get(gone).is_none(),
+                "{gone} 必须被剥掉，实际仍在：{:?}",
+                resp.get(gone)
+            );
+        }
+        // 序列化出来也不许含敏感值
+        let raw = String::from_utf8(resp.to_bytes())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            !raw.contains("internal-token-abc"),
+            "内网令牌绝不能出现在转发给客户的响应里：{raw}"
+        );
     }
 
     #[test]
