@@ -63,6 +63,16 @@ const IKCP_THRESH_MIN: u32 = 2;
 const IKCP_PROBE_INIT: u32 = 7000;
 const IKCP_PROBE_LIMIT: u32 = 120_000;
 
+/// KCP **接收侧**单条消息的大小上限（v0.5.6 修审计总报告 M10）。
+///
+/// 发送侧本来就有上限（`encode_segs` 的 `count > 255` 拒绝），接收侧原先
+/// **没有** —— 于是单会话在途内存可达 `IKCP_WND_RCV(128) × 65507 ≈ 8 MB`，
+/// `recv()` 的 `Vec::with_capacity` 还要再复制一份。
+///
+/// 取 64 KiB：与 `http_relay::MAX_HEAD` 同量级，且**远大于** frp 实际会用
+/// KCP 承载的单条消息（KCP 在这里只是控制连接的传输层，消息都是小 JSON）。
+const MAX_RECV_MSG: usize = 64 * 1024;
+
 /// 报文头长度：conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4)。
 const HEADER: usize = IKCP_OVERHEAD;
 
@@ -138,6 +148,21 @@ fn decode_segs(pkt: &[u8]) -> Result<Vec<Seg>, KcpError> {
         if pkt.len() - i < len {
             return Err(KcpError::Truncated);
         }
+        // ★ v0.5.6（M10）：**单段数据长度不得超过 MTU**。
+        //
+        // `len` 是 u32 字段，原先只受"实际数据报长度"约束 ——
+        // 一个 65507 字节的 UDP 数据报就能塞进一个 65507 字节的段。
+        // 正常的 KCP 实现里单段 data 绝不会超过 MTU（默认 1400），
+        // 这里按 MTU 收紧，把"用巨段撑爆接收队列"这条路一并堵掉。
+        //
+        // 与 `recv()` 里的总长上限是**两层**：这一层挡住巨段，
+        // 那一层挡住"很多正常段拼成巨消息"。
+        if len > IKCP_MTU_DEF {
+            return Err(KcpError::SegTooLarge {
+                len,
+                mtu: IKCP_MTU_DEF,
+            });
+        }
         segs.push(Seg {
             conv,
             cmd,
@@ -166,6 +191,9 @@ pub enum KcpError {
     TooShort,
     #[error("KCP 数据报被截断")]
     Truncated,
+    /// v0.5.6（M10）：单段数据长度超过 MTU 上限。
+    #[error("KCP 单段数据 {len} 字节超过 MTU 上限 {mtu}")]
+    SegTooLarge { len: usize, mtu: usize },
     #[error("KCP 会话号不匹配")]
     WrongConv,
     #[error("KCP 连接已断开")]
@@ -360,13 +388,50 @@ impl Kcp {
     }
 
     /// 取出一条完整的应用消息；没有拼完整的就返回 `None`。
+    ///
+    /// ★★ v0.5.6 修（审计总报告 M10，中危）：**接收侧补上消息大小上限**。
+    ///
+    /// # 问题
+    ///
+    /// **发送侧有上限、接收侧没有** —— 又一处"同一语义只加固了一半"：
+    ///
+    /// | 侧 | 代码 | 行为 |
+    /// |---|---|---|
+    /// | 发送 | `encode_segs` 的 `if count > 255 { return 0; }` | 有上限 |
+    /// | 接收 | 本函数 | **无上限** |
+    ///
+    /// 真实上界（审计报告自算，我核对一致）：
+    /// * 队列段数受 `rcv_wnd` 约束，标准值 **128**；
+    /// * 单段 `data` 只受**实际 UDP 数据报**长度约束（≈ 65507 字节）；
+    /// * ⇒ 单会话累计 ≈ **128 × 65507 ≈ 8 MB**，且下面 `Vec::with_capacity`
+    ///   会**再复制一份** ⇒ 峰值约 2×。
+    ///
+    /// 而 `KcpListener::accept` 对**任意源地址**无条件建会话、无鉴权
+    /// （`conv` 由发起方自定）⇒ 攻击者从多个源 IP 各发一个数据报即可
+    /// 建立大量会话，每个都吃掉这些内存。
+    ///
+    /// # 为什么是 Medium 而不是 High（审计报告主动下调，我同意）
+    ///
+    /// 1. **1:1 占用，非放大** —— `rcv_queue` 装的是实际收到的数据，
+    ///    攻击者要占用 8MB 就得真的发 8MB；
+    /// 2. **KCP 默认不启用**（需显式配 `kcpBindPort`）。
+    ///
+    /// # 上限取值
+    ///
+    /// 取 64 KiB，与 `http_relay::MAX_HEAD` 同量级，且**远大于** frp 实际
+    /// 会用 KCP 承载的单条消息（KCP 在这里只是控制连接的传输层，
+    /// 消息都是小 JSON；真正的数据面走工作连接）。
+    /// 超限时**清空接收队列**并返回 `None`：这条流已经不可信，
+    /// 继续拼下去只会让攻击者拿到更多内存。
     pub fn recv(&mut self) -> Option<Vec<u8>> {
         // 先确认有一条**完整**的消息（最后一片的 frg == 0）
         let complete = {
             let mut total = 0usize;
             let mut found = false;
             for s in &self.rcv_queue {
-                total += s.data.len();
+                // `saturating_add`：段数受 rcv_wnd 约束（不会真的溢出），
+                // 但用饱和加法可以免掉"这里要不要担心溢出"的反复思考。
+                total = total.saturating_add(s.data.len());
                 if s.frg == 0 {
                     found = true;
                     break;
@@ -378,6 +443,18 @@ impl Kcp {
                 None
             }
         }?;
+
+        // ★ v0.5.6（M10）：超限即丢弃整条流，绝不为它分配内存。
+        if complete > MAX_RECV_MSG {
+            tracing::debug!(
+                size = complete,
+                limit = MAX_RECV_MSG,
+                "KCP 消息超过接收上限，清空接收队列（可能的资源耗尽尝试）"
+            );
+            self.rcv_queue.clear();
+            self.rcv_buf.clear();
+            return None;
+        }
 
         let mut out = Vec::with_capacity(complete);
         while let Some(s) = self.rcv_queue.pop_front() {
@@ -1359,5 +1436,109 @@ mod tests {
             assert_eq!(&reply, b"pong");
         }
         server.await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M10）：接收侧消息大小上限
+    // ------------------------------------------------------------------
+
+    /// 造一个指定 `len` 字段的数据报（data 按需填充，用于测解码层）。
+    fn raw_seg(len: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u32.to_le_bytes()); // conv
+        p.push(IKCP_CMD_PUSH); // cmd
+        p.push(0); // frg
+        p.extend_from_slice(&128u16.to_le_bytes()); // wnd
+        p.extend_from_slice(&0u32.to_le_bytes()); // ts
+        p.extend_from_slice(&0u32.to_le_bytes()); // sn
+        p.extend_from_slice(&0u32.to_le_bytes()); // una
+        p.extend_from_slice(&len.to_le_bytes()); // len
+        p.resize(HEADER + len as usize, 0xAA);
+        p
+    }
+
+    /// ★★ M10 之一：**解码层拒绝超过 MTU 的单段**。
+    ///
+    /// 原先 `len` 只受"实际数据报长度"约束 ⇒ 一个 65507 字节的 UDP 数据报
+    /// 就能塞进一个 65507 字节的段（正常 KCP 单段绝不会超过 MTU）。
+    #[test]
+    fn 解码必须拒绝超过_mtu_的段() {
+        // 正常大小照常通过
+        assert!(decode_segs(&raw_seg(1400)).is_ok(), "MTU 大小应通过");
+        assert!(decode_segs(&raw_seg(1)).is_ok());
+
+        // 超过 MTU ⇒ 拒绝
+        let e = decode_segs(&raw_seg(IKCP_MTU_DEF as u32 + 1)).unwrap_err();
+        assert!(
+            matches!(e, KcpError::SegTooLarge { .. }),
+            "应报 SegTooLarge，实际：{e:?}"
+        );
+        // 审计报告里那个"一个 UDP 数据报塞满"的极端值
+        assert!(
+            decode_segs(&raw_seg(65507)).is_err(),
+            "65507 字节的单段必须拒"
+        );
+    }
+
+    /// ★★ M10 之二：**接收队列拼接超过上限时清空并丢弃**。
+    ///
+    /// 与上一条是两层：那条挡巨段，这条挡"很多正常段拼成巨消息"
+    /// （`rcv_wnd(128) × 65507 ≈ 8 MB`，`with_capacity` 还要再复制一份）。
+    #[test]
+    fn 接收拼接超限必须丢弃整条流() {
+        let mut s = Kcp::new(1, 0);
+
+        // 塞进若干"正常大小"的段，累计超过 MAX_RECV_MSG
+        let chunk = vec![0xAAu8; 1400];
+        let need = MAX_RECV_MSG / chunk.len() + 2;
+        for i in 0..need {
+            s.rcv_queue.push_back(Seg {
+                conv: 1,
+                cmd: IKCP_CMD_PUSH,
+                // 除最后一片外都置 frg=1（还有后续片）
+                frg: if i + 1 == need { 0 } else { 1 },
+                wnd: 128,
+                ts: 0,
+                sn: i as u32,
+                una: 0,
+                data: chunk.clone(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        let pushed = s.rcv_queue.len();
+        assert!(pushed * chunk.len() > MAX_RECV_MSG, "前置：累计确实超限");
+
+        assert!(
+            s.recv().is_none(),
+            "超限的消息必须被丢弃（返回 None），不能真的分配那么多内存"
+        );
+        assert!(s.rcv_queue.is_empty(), "超限后接收队列必须清空");
+        assert!(s.rcv_buf.is_empty(), "乱序缓冲也要清空");
+    }
+
+    /// 反向：正常大小的消息照常收得到（别修得过头）。
+    #[test]
+    fn 正常大小消息仍然收得到() {
+        let mut s = Kcp::new(1, 0);
+        for (i, part) in [&b"hello "[..], &b"world"[..]].iter().enumerate() {
+            s.rcv_queue.push_back(Seg {
+                conv: 1,
+                cmd: IKCP_CMD_PUSH,
+                frg: if i == 1 { 0 } else { 1 },
+                wnd: 128,
+                ts: 0,
+                sn: i as u32,
+                una: 0,
+                data: part.to_vec(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        assert_eq!(s.recv().as_deref(), Some(&b"hello world"[..]));
     }
 }
