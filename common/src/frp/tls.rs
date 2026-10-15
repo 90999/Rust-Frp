@@ -66,6 +66,22 @@ pub fn server_config() -> Result<Arc<rustls::ServerConfig>> {
 }
 
 /// 客户端 TLS 配置：与 frp 默认行为一致，不校验服务端证书。
+///
+/// ★★ v0.5.6（审计总报告 L16，低危）：保留这个默认，但**新增**
+/// [`client_config_verifying`] 提供"真正校验"的可选路径。
+///
+/// # 为什么默认不改
+///
+/// 官方 frp 的 `transport.tls.enable = true` **默认不校验对端证书**
+/// （`InsecureSkipVerify = true`）。改了默认会让"官方 frpc ↔ NFrp frps"
+/// 这条零配置互通链路直接断掉 —— 而 README 明确承诺了它。
+/// 这是**设计取舍**，不是遗漏（报告也这么定位）。
+///
+/// # 但必须给用户一条更安全的路
+///
+/// 现状的问题是"用户**没有选择**"：想校验也做不到。
+/// 同项目的 `httpc`（OIDC 那边）默认是**校验**的 —— 同一个仓库两套默认，
+/// 而其中一套无法切换。本函数补上那个开关。
 pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
     let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -73,6 +89,75 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+/// 客户端 TLS 配置：**校验服务端证书**（v0.5.6，L16）。
+///
+/// 用系统根证书 + 可选的额外信任 CA（`trustedCaFile`）。
+/// 与 [`client_config`] 的区别只有"验不验证书"。
+///
+/// # 什么时候用
+///
+/// * 服务端用的是**受信任 CA 签发的证书**（Let's Encrypt 等）⇒ 直接可用；
+/// * 服务端用**自签证书** ⇒ 把该证书填进 `transport.tls.trustedCaFile`，
+///   同时 `tlsServerName` 要能对上证书里的名字。
+///
+/// ★ 注意：开了校验之后，**官方 frpc 默认连不上**（它不校验，但也不提供
+///   证书给你）—— 所以这个开关是给"自有客户端 + 自有服务端"的部署用的。
+///   双方都配好 CA 即可。
+pub fn client_config_verifying(
+    trusted_ca_file: &str,
+    server_name: &str,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+
+    // 内置的公开根证书（与 `httpc` 用同一份 `webpki-roots`，
+    // 避免"同一个仓库两套根证书来源"）。
+    //
+    // ★ 不引 `rustls-native-certs`：它会读系统信任库（Windows 证书store /
+    //   Linux ca-certificates），覆盖面更广，但**多一个依赖 + 平台差异**；
+    //   而本项目已有的 `httpc` 走的就是 `webpki-roots`。保持一致更重要 ——
+    //   自签场景本来就必须配 `trustedCaFile`，那时系统根证书帮不上忙。
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    tracing::debug!(
+        count = roots.len(),
+        "已装载内置公开根证书（自签服务端请配 transport.tls.trustedCaFile）"
+    );
+
+    // 用户额外指定的 CA（自签服务端必填）
+    if !trusted_ca_file.trim().is_empty() {
+        let blocks = read_pem_blocks(trusted_ca_file)?;
+        let mut n = 0usize;
+        for (_label, der) in blocks.iter().filter(|(l, _)| l == "CERTIFICATE") {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der.clone()))
+                .with_context(|| format!("{trusted_ca_file} 里的第 {} 个证书无法解析", n + 1))?;
+            n += 1;
+        }
+        if n == 0 {
+            bail!("{trusted_ca_file} 里没有 CERTIFICATE 块（可能只给了私钥？）");
+        }
+        tracing::debug!(count = n, path = %trusted_ca_file, "已装载额外信任 CA");
+    }
+
+    if roots.is_empty() {
+        bail!(
+            "要校验对端证书，但一个可信 CA 都没有：\
+             内置根证书为空，且没配 transport.tls.trustedCaFile。\
+             自签服务端请把其证书填进 trustedCaFile"
+        );
+    }
+
+    let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    if !server_name.trim().is_empty() {
+        tracing::debug!(server_name, "TLS 将校验该名字");
+    }
     Ok(Arc::new(cfg))
 }
 
@@ -213,11 +298,16 @@ where
 }
 
 /// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手。
+///
+/// ★ v0.5.6（L16）：新增 `verify` 参数 —— `false` 走与官方一致的"不校验"
+/// （保互通），`true` 走真正校验（需要 `trustedCaFile` 配合自签场景）。
 pub async fn connect_client(
     mut stream: TcpStream,
     enable: bool,
     server_name: &str,
     disable_custom_first_byte: bool,
+    verify: bool,
+    trusted_ca_file: &str,
 ) -> Result<BoxStream> {
     if !enable {
         return Ok(Box::pin(stream));
@@ -228,11 +318,19 @@ pub async fn connect_client(
             .context("发送 frp 自定义首字节失败")?;
     }
     let name = to_server_name(server_name)?;
-    let connector = TlsConnector::from(client_config()?);
-    let tls = connector
-        .connect(name, stream)
-        .await
-        .context("TLS 客户端握手失败")?;
+    let cfg = if verify {
+        client_config_verifying(trusted_ca_file, server_name)?
+    } else {
+        client_config()?
+    };
+    let connector = TlsConnector::from(cfg);
+    let tls = connector.connect(name, stream).await.context(if verify {
+        "TLS 客户端握手失败（已开启证书校验 —— 若是自签服务端，\
+             请把其证书填进 transport.tls.trustedCaFile，\
+             并确认 tlsServerName 与证书里的名字一致）"
+    } else {
+        "TLS 客户端握手失败"
+    })?;
     Ok(Box::pin(tls))
 }
 
