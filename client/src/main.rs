@@ -535,13 +535,28 @@ fn cmd_verify(a: &VerifyArgs) -> Result<()> {
 /// 规则：监听非回环地址时**必须**配 `user`/`password`，除非显式写
 /// `allowInsecureRemote = true` 表明知情。回环地址上留空是允许的
 /// （默认值就是 127.0.0.1，只有本机能连）。
+///
+/// ★★ v0.5.6 修（审计总报告 H1，高危）：判据同时看 `user` **与** `password`。
+///
+/// 原先只判 `user.trim().is_empty()`，但上面这段注释写的是
+/// "必须配 `user`/`password`" —— **注释与实现不符**（审计报告 H1 的 C 处）。
+///
+/// 为什么空密码必须算"没有凭据"：`web.rs` 的鉴权把两者拼成
+/// `format!("{}:{}", user, password)` 再比 Basic 头，密码为空时期望值就是
+/// `"admin:"` —— 任何能访问该端口的人送一个 `admin:` 就能进来，
+/// 等于**鉴权退化成"知道用户名就能进"**。
+///
+/// ★ 与服务端共用同一个真源 `nfrp_common::config::has_dashboard_creds()`，
+///   保证两端口径永不漂移。
 fn check_web_server_is_safe(cfg: &ClientConfig) -> Result<()> {
-    if cfg.web_server.user.trim().is_empty()
+    let has_creds =
+        nfrp_common::config::has_dashboard_creds(&cfg.web_server.user, &cfg.web_server.password);
+    if !has_creds
         && !nfrp_common::util::is_loopback_addr(&cfg.web_server.addr)
         && !cfg.web_server.allow_insecure_remote
     {
         bail!(
-            "管理界面配置为监听 {}:{} 却没有配置 user/password —— \
+            "管理界面配置为监听 {}:{} 却没有配置**完整的** user/password（两者都不能为空）—— \
              任何能访问这个端口的人都能增删你的隧道、并可直接停止客户端。\n\
              请二选一：① 配置 [webServer] user + password；\
              ② 把 addr 改回 127.0.0.1；\
@@ -718,7 +733,28 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     };
     // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
     let tls_on = cfg.tls_enable || cfg.websocket_tls();
-    let stream = tls::connect_client(stream, tls_on, name, !cfg.tls_custom_first_byte).await?;
+    // ★ v0.5.6（L16）：`verifyServerCert = true` 时**真正校验**对端证书。
+    //   默认 false ⇒ 与官方 frp 一致（`InsecureSkipVerify = true`），保互通。
+    if cfg.tls_verify_server_cert && tls_on {
+        info!(
+            server_name = %name,
+            trusted_ca = %if cfg.tls_trusted_ca_file.is_empty() {
+                "（未配 trustedCaFile，只用内置根证书）".to_string()
+            } else {
+                cfg.tls_trusted_ca_file.clone()
+            },
+            "已开启服务端证书校验（verifyServerCert = true）"
+        );
+    }
+    let stream = tls::connect_client(
+        stream,
+        tls_on,
+        name,
+        !cfg.tls_custom_first_byte,
+        cfg.tls_verify_server_cert,
+        &cfg.tls_trusted_ca_file,
+    )
+    .await?;
 
     if !cfg.websocket_enabled() {
         return Ok(stream);
