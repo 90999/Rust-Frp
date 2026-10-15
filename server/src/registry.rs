@@ -18,6 +18,7 @@ use crate::{
     vhost::VhostTable,
     visitor::VisitorTable,
 };
+use tracing::debug;
 
 /// 由配置折算出来的服务端资源上限（`0` 表示不限）。
 #[derive(Debug, Clone, Default)]
@@ -270,32 +271,58 @@ impl Registry {
                 // 空 group 表示这个代理**不参与**分组，语义上就是独占 ——
                 // 早先这里只比 `pg.name != group`，于是两个都没配 group 的代理
                 // 反而被当成同组，端口冲突检测直接失效。
-                let err = if pg.name.is_empty() {
-                    Some(format!("端口 {port} 已被占用（另一个代理正在独占使用它）"))
+                //
+                // ★★ v0.5.6 修（审计总报告 L14，低危）：**错误文案统一，不再区分原因**。
+                //
+                // 原先这里有**四种**可区分的文案，对未认证 / 低权限的调用方构成
+                // 一个**枚举预言机**：
+                //
+                // | 返回的文案 | 泄露的信息 |
+                // |---|---|
+                // | "已被占用（另一个代理正在独占使用它）" | 该端口有人独占 |
+                // | "已被组 [X] 占用，未指定 group 的代理不能共享它" | **组名 X** |
+                // | "已被组 [X] 占用，与组 [Y] 不同" | **组名 X** |
+                // | "组 [Y] 的 group_key 校验失败" | 组名存在且**组名猜对了** |
+                //
+                // ⇒ 攻击者逐个猜组名：只有"组名猜对"才会拿到第 4 条，
+                //   于是**组名可枚举** —— 而组名正是官方 group 负载均衡的
+                //   唯一共享凭据名。
+                //
+                // ★ 与下面 `constant_time_eq` 的意图自相矛盾：那行注释写着
+                //   "用常量时间比较，避免按字节泄露密钥前缀" —— 定长比较挡住了
+                //   逐字节试探，**却用错误文案把整个组名送了出去**。
+                //   又是一次"防线写对了、但同一件事的另一半没铺满"。
+                //
+                // ★ 修法：所有失败原因共用**一条**文案（只承认"端口被占用"，
+                //   既不说是谁占的、也不说组名对不对）。
+                //   真正需要区分原因的只有服务端日志 —— 那走 `debug!`，不外泄。
+                let reason = if pg.name.is_empty() {
+                    "被另一个代理独占"
                 } else if group.is_empty() {
-                    Some(format!(
-                        "端口 {port} 已被组 [{}] 占用，未指定 group 的代理不能共享它",
-                        pg.name
-                    ))
+                    "未指定 group 的代理不能共享"
                 } else if pg.name != group {
-                    Some(format!(
-                        "端口 {port} 已被组 [{}] 占用，与组 [{group}] 不同",
-                        pg.name
-                    ))
+                    "与占用方的 group 不同"
                 } else if !nfrp_common::frp::msg::constant_time_eq(&pg.key, group_key) {
                     // 组名对得上但密钥不对 —— 与官方 ErrGroupAuthFailed 同义。
                     // 用常量时间比较，避免按字节泄露密钥前缀。
-                    Some(format!("组 [{group}] 的 group_key 校验失败（端口 {port}）"))
+                    "group_key 校验失败"
                 } else {
-                    None
+                    debug!(port, group = %group, "端口共享成功（同组且密钥正确）");
+                    pg.push(client, proxy_name);
+                    return Ok(PortClaim::Joined);
                 };
-                match err {
-                    Some(e) => Err(e),
-                    None => {
-                        pg.push(client, proxy_name);
-                        Ok(PortClaim::Joined)
-                    }
-                }
+                // 细节只进服务端日志（运维排查"为什么端口共享不上"需要它），
+                // 回给调用方的文案**不含任何组名 / 占用者信息**。
+                debug!(
+                    port,
+                    requested_group = %group,
+                    reason,
+                    "端口占用判定失败（细节仅服务端可见）"
+                );
+                Err(format!(
+                    "端口 {port} 已被占用（可能与 group / group_key 配置有关，\
+                     详情见服务端日志）"
+                ))
             }
         }
     }
@@ -941,10 +968,20 @@ mod tests {
         let e = r
             .reserve_port(6000, "api", "", "b", client("b"))
             .expect_err("不同组不能抢同一个端口");
+
+        // ★★ v0.5.6 修（审计总报告 L14）：**错误文案不得泄露任何组名**。
+        //
+        // 原先这条测试断言 `e.contains("api") && e.contains("web")`
+        // —— 那正是在**固化枚举预言机**：调用方（未认证 / 低权限）
+        // 能从文案里读出任一方的组名。
+        //
+        // 现在反过来断言：文案里**不能出现**任何组名。
         assert!(
-            e.contains("api") && e.contains("web"),
-            "错误信息要说清是谁占了：{e}"
+            !e.contains("api") && !e.contains("web"),
+            "错误文案不得泄露组名（L14 枚举预言机）：{e}"
         );
+        assert!(e.contains("6000"), "但仍要说是哪个端口：{e}");
+        assert!(e.contains("已被占用"), "{e}");
 
         // 独占端口同样不能被组抢走
         let r2 = Registry::unlimited();
