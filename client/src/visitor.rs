@@ -103,6 +103,26 @@ pub async fn run(
         .await
         .with_context(|| format!("解析 visitor 监听地址 {listen} 失败"))?;
 
+    // ★★ v0.5.6 修（审计总报告 L1 后半，低危）：**非回环监听要告警**。
+    //
+    // 原先这里对 `bind_addr` **没有任何检查、也没有告警** ——
+    // 配了 `0.0.0.0` 就把本机入口暴露到所有网卡上，而用户无从得知。
+    //
+    // 为什么只告警不拒绝：`secret_key` 是强制的、且每条连接都要过服务端
+    // 签名校验，未持密钥者用不了这条隧道 ⇒ 暴露的残余风险是
+    // "可被端口扫描指纹识别 + DoS 面"，不构成越权。
+    // 但它**确实**是一个不该默认发生的暴露，所以要说出来。
+    if !nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
+        warn!(
+            visitor = %cfg.name,
+            bind_addr = %cfg.bind_addr,
+            %addr,
+            "visitor 监听在非回环地址上 —— 该端口对所有能访问到它的主机开放。\
+             虽然 secret_key 强制且每条连接都过服务端签名校验，\
+             但仍建议改回 127.0.0.1，除非你确实需要从别的机器接入"
+        );
+    }
+
     // SUDP：数据面是 UDP。本地开 UDP socket，每个访客地址复用一条持久工作连接。
     if cfg.visitor_type == "sudp" {
         let mut rx = session_rx;
