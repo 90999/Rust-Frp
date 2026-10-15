@@ -49,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
             stream,
             &nfrp_common::security::AuthProvider::token(""),
             "dump-run-id",
+            // 抓包示例：不校验时间戳（0 = 关闭），免得回放历史报文被时间窗口挡住
+            0,
         )
         .await
         {
