@@ -390,6 +390,27 @@ pub struct Url {
 impl Url {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
+        // ★★ v0.5.6 修（审计总报告 M9，中危）：**先拒控制字符**。
+        //
+        // 原先 path 被**原样保留**（下面 `&rest[i..]`），而它随后被直接拼进
+        // 请求报文（`httpc.rs` 的 `format!("{method} {request_target} HTTP/1.1\r\n…")`）。
+        // 于是 URL 里的 `\r\n` 会**注入任意请求头、甚至切出第二个请求**。
+        //
+        // 实测（审计报告）：输入
+        // `http://idp.example.com/a HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /b`
+        // 得到的 path 里 CRLF 原样存活。
+        //
+        // ★ 危害的诚实定位（不夸大）：`issuer` 来自**本地配置**，不是攻击者
+        //   直接输入；要利用得先控制/劫持 IdP（`discovery` 里的 `jwks_uri`
+        //   会被原样信任）。所以它**不是**"未认证攻击者直达内网"，
+        //   而是"远端可控输入缺少校验"；也**不构成经典请求走私**
+        //   （这是对 IdP 的单向 GET、固定 `Connection: close`）。
+        //
+        // ★ 但仍然必须修：这一层是**通用 URL 解析器**，将来接别的调用方时
+        //   不该继承这个坑。按 RFC 3986，控制字符本来就不允许出现在 URL 里。
+        if let Some(bad) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+            bail!("URL 含非法控制字符（{bad:#04x}，如 CR/LF/NUL）：{s:?}");
+        }
         let (scheme, rest) = s
             .split_once("://")
             .ok_or_else(|| anyhow!("URL 缺少 scheme：{s}"))?;
@@ -640,5 +661,44 @@ mod tests {
             decode_chunked(raw2.as_bytes()).is_err(),
             "接近 usize::MAX 的 chunk 长度必须被拒绝"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M9）：URL 不得含控制字符
+    // ------------------------------------------------------------------
+
+    /// ★★ M9：URL 里的 CR/LF 必须被拒 —— 否则会注入任意请求头。
+    ///
+    /// 审计报告的实测用例（CRLF 原样存活、随后被拼进请求报文）。
+    /// 危害定位是"远端可控输入缺校验"（`issuer` 来自本地配置，
+    /// `jwks_uri` 来自远端 discovery 文档），不是"未认证直达内网"。
+    #[test]
+    fn url_必须拒绝控制字符() {
+        // ★ 报告里的原始 PoC：path 里夹 CRLF 再切出第二个请求
+        let poc = "http://idp.example.com/a HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /b";
+        assert!(
+            Url::parse(poc).is_err(),
+            "带 CRLF 的 URL 必须被拒（头注入）"
+        );
+
+        // 各类控制字符都要挡
+        for bad in [
+            "http://a.b/\rx-injected:1",
+            "http://a.b/\nx-injected:1",
+            "http://a.b/\0",
+            "http://a.b/\x1b[31m",
+            "http://a.b/\x7f", // DEL 也要挡
+        ] {
+            assert!(Url::parse(bad).is_err(), "必须拒绝：{bad:?}");
+        }
+
+        // 反向：正常的 URL 照常可用（别修得过头）
+        for ok in [
+            "https://idp.example.com/.well-known/openid-configuration",
+            "http://127.0.0.1:8080/jwks",
+            "https://a.b/c?d=1&e=%20", // 百分号编码是合法的
+        ] {
+            assert!(Url::parse(ok).is_ok(), "正常 URL 被误拒：{ok}");
+        }
     }
 }
