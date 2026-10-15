@@ -131,6 +131,33 @@ impl ApiError {
         }
         serde_json::json!({ "api": API_VERSION, "error": err }).to_string()
     }
+
+    /// 按 `detailedErrorsToClient` 决定是否脱敏（v0.5.6 修审计总报告 L13）。
+    ///
+    /// * `detailed_errors_to_client = true`（默认，与官方一致）⇒ **逐字不变**
+    ///   （仍走 [`Self::to_json`]）；
+    /// * `false` ⇒ 只回**状态码 + 错误码**，`message` 换成一句通用文案，
+    ///   `details` 整个去掉。
+    ///
+    /// # 为什么保留错误码
+    ///
+    /// 错误码（`bad_request` / `not_found` / `admin_failed` …）是**调用方编程用**的，
+    /// 不含任何租户信息；去掉它会让关掉详细错误的部署完全无法自动化。
+    /// 真正需要脱敏的是 `message` 与 `details` —— 它们才含
+    /// "域名已被代理 alice.web 占用"这类**别人的代理名**。
+    fn to_json_redacted(&self, cfg: &ServerConfig) -> String {
+        if cfg.detailed_errors_to_client {
+            return self.to_json();
+        }
+        serde_json::json!({
+            "api": API_VERSION,
+            "error": {
+                "code": self.code,
+                "message": "request failed（detailedErrorsToClient = false，详情见服务端日志）",
+            }
+        })
+        .to_string()
+    }
 }
 
 /// 解析后的 query string。
@@ -247,7 +274,19 @@ pub async fn route(
     Some(
         match dispatch(registry, cfg, method, rest, &q, body).await {
             Ok(r) => r,
-            Err(e) => Response::json(e.status, e.to_json()),
+            // ★★ v0.5.6 修（审计总报告 L13，低危）：**走 `detailedErrorsToClient` 脱敏**。
+            //
+            // 原先这里直接回 `e.to_json()` —— 而 v2 的错误文案里含
+            // **别的租户的代理名 / 客户端名 / 端口占用情况**
+            // （如"域名 x 已被代理 alice.web 占用"）。
+            //
+            // 同一个错误在 `serve.rs` 的客户端路径上**套了** `cfg.error_to_client()`
+            // （那里注释明确写着"详细错误里往往带着别人的代理名 / 端口占用"），
+            // 而面板这条路径**没套** —— 又是"同一语义只加固了一半"。
+            //
+            // ★ 只在 `detailed_errors_to_client = false` 时改变行为；
+            //   默认（true，与官方一致）**逐字不变**。
+            Err(e) => Response::json(e.status, e.to_json_redacted(cfg)),
         },
     )
 }
@@ -372,6 +411,8 @@ fn status_response(registry: &Registry) -> Response {
 }
 
 fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
+    // ★ v0.5.6（M13）：不带过滤条件即全平台枚举 ⇒ 必须显式 ?all=1
+    require_explicit_enumeration(q, "/api/v2/clients")?;
     let page = Page::from_query(q)?;
     let user = q.get("user").map(String::as_str).unwrap_or("");
     let needle = q
@@ -420,7 +461,70 @@ fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
     ))
 }
 
+/// **枚举门槛**：不带任何过滤条件时，必须显式写 `?all=1`
+/// （v0.5.6 修审计总报告 M13，中危）。
+///
+/// # 问题
+///
+/// `/clients`、`/proxies`、`/visitors`、`/audit` 原先在**不传 `user` 时返回全平台数据**：
+///
+/// ```text
+/// .filter(|c| user.is_empty() || c.user == user)   // user 为空 ⇒ 全部放行
+/// ```
+///
+/// 而 `run_id` / 代理名正是写接口（`POST /clients/kick`、`/proxies/remove`）
+/// 的**主键** ⇒ **读接口直接喂出了写接口所需的全部标识**。
+///
+/// # 影响（诚实定位）
+///
+/// * 写接口仍受 `allow_manage`（RBAC）拦截 ⇒ **配了 `[[roles]]` 的部署下不构成越权**；
+/// * 但**默认配置（无 roles）**下 `role_for` 对任何用户返回 `unrestricted`
+///   ⇒ **面板凭据即等于全平台管理权**。
+///
+/// 另需明确：`api_v2` 挂在面板之下，**需要面板 Basic 凭据** ——
+/// 它不是一个未认证接口。所以这不是"匿名可达"，而是
+/// "面板凭据的权限边界比使用者以为的更宽"。
+///
+/// # 修法与其局限（如实说明）
+///
+/// 要求显式 `?all=1`：**不能阻止**持有面板凭据的人枚举，
+/// 但能让"全量导出"成为一个**有意识的选择**而不是默认行为，
+/// 也让审计日志 / 反向代理日志里能看出这是一次全量查询。
+///
+/// ★ 根本解法是给面板引入**只读角色**（面板凭据 → 受限 scope），
+///   那是一次接口与配置的扩展，不在本轮范围（已记进 SECURITY-FIXES-ROUND5.md）。
+///
+/// `/status` 与 `/version` **不适用**本门槛：它们只回聚合计数、
+/// 不含任何租户标识。
+fn require_explicit_enumeration(q: &Query, what: &str) -> Result<(), ApiError> {
+    // 这些键任一非空都算"有过滤条件"（`kind`/`ok` 是 /audit 专有的）
+    let has_filter = ["user", "client", "q", "kind", "ok"]
+        .iter()
+        .any(|k| q.get(*k).is_some_and(|v| !v.trim().is_empty()));
+    if has_filter {
+        return Ok(());
+    }
+    // `all=1` / `all=true` / `all=yes` 都认（大小写不敏感）
+    let all = q
+        .get("all")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    if all {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "{what} 的全量枚举需要显式确认：请加过滤条件（?user= / ?client= / ?q=），\
+         或显式写 ?all=1 表明你要导出全平台数据。\n\
+         注意：面板凭据在全平台范围内有效，默认配置下没有租户隔离。"
+    )))
+}
+
 fn proxies_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
+    // ★ v0.5.6（M13）：全量枚举要显式确认
+    require_explicit_enumeration(q, "/api/v2/proxies")?;
     let page = Page::from_query(q)?;
     let user = q.get("user").map(String::as_str).unwrap_or("");
     let client = q.get("client").map(String::as_str).unwrap_or("");
@@ -468,6 +572,8 @@ fn proxies_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
 }
 
 fn visitors_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
+    // ★ v0.5.6（M13）：全量枚举要显式确认
+    require_explicit_enumeration(q, "/api/v2/visitors")?;
     let page = Page::from_query(q)?;
     let needle = q
         .get("q")
@@ -525,6 +631,8 @@ fn ports_response(registry: &Registry) -> Response {
 }
 
 fn audit_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
+    // ★ v0.5.6（M13）：审计日志含全部租户的 run_id / user / IP ⇒ 全量枚举要显式确认
+    require_explicit_enumeration(q, "/api/v2/audit")?;
     let page = Page::from_query(q)?;
     let ok = match q.get("ok") {
         Some(v) if !v.trim().is_empty() => Some(parse_bool(v.trim()).ok_or_else(|| {
@@ -707,7 +815,8 @@ mod tests {
     /// 列表接口没数据时也要给出完整的分页元信息。
     #[tokio::test]
     async fn 空列表也有分页元信息() {
-        let r = route(&reg(), &cfg(), "GET", "/api/v2/clients", "", "")
+        // ★ v0.5.6（M13）：全量枚举现在要显式 ?all=1
+        let r = route(&reg(), &cfg(), "GET", "/api/v2/clients", "?all=1", "")
             .await
             .expect("v2 路径");
         let v = body_of(&r);
@@ -761,7 +870,7 @@ mod tests {
             &cfg(),
             "GET",
             "/api/v2/clients",
-            &format!("?page_size={}", MAX_PAGE_SIZE + 1),
+            &format!("?all=1&page_size={}", MAX_PAGE_SIZE + 1),
             "",
         )
         .await
@@ -892,13 +1001,164 @@ mod tests {
     /// 审计默认关闭时，接口不该回一个"空错误"让人以为坏了。
     #[tokio::test]
     async fn 审计关闭时给出说明() {
-        let r = route(&reg(), &cfg(), "GET", "/api/v2/audit", "", "")
+        // ★ v0.5.6（M13）：审计日志含全部租户信息，全量枚举要显式确认
+        let r = route(&reg(), &cfg(), "GET", "/api/v2/audit", "?all=1", "")
             .await
             .expect("v2 路径");
         assert_eq!(r.status, 200);
         let v = body_of(&r);
         assert!(v["notice"].as_str().unwrap().contains("audit"));
         assert_eq!(v["data"].as_array().unwrap().len(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M13）：读接口不得默认全量枚举
+    // ------------------------------------------------------------------
+
+    /// ★★ M13：不带过滤条件时必须要求显式 `?all=1`。
+    ///
+    /// 原先 `user` 为空即返回全平台数据，而 `run_id` / 代理名正是
+    /// `POST /clients/kick` 与 `/proxies/remove` 的**主键** ——
+    /// 读接口直接喂出了写接口所需的全部标识。
+    #[tokio::test]
+    async fn 读接口不得默认全量枚举() {
+        for path in [
+            "/api/v2/clients",
+            "/api/v2/proxies",
+            "/api/v2/visitors",
+            "/api/v2/audit",
+        ] {
+            // 不带任何参数 ⇒ 必须 400，并告诉调用方怎么显式确认
+            let r = route(&reg(), &cfg(), "GET", path, "", "")
+                .await
+                .expect("v2 路径");
+            assert_eq!(r.status, 400, "{path} 不带参数时应要求显式确认");
+            let msg = body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(msg.contains("all=1"), "{path} 的提示要点明 ?all=1：{msg}");
+
+            // 显式 ?all=1 ⇒ 放行
+            let r = route(&reg(), &cfg(), "GET", path, "?all=1", "")
+                .await
+                .expect("v2 路径");
+            assert_eq!(r.status, 200, "{path} 带 ?all=1 时应放行");
+
+            // 任一过滤条件 ⇒ 放行（不需要 all）
+            let r = route(&reg(), &cfg(), "GET", path, "?user=alice", "")
+                .await
+                .expect("v2 路径");
+            assert_eq!(r.status, 200, "{path} 带 ?user= 时应放行");
+
+            // 空值不算过滤条件（`?user=` 与不传等价）
+            let r = route(&reg(), &cfg(), "GET", path, "?user=", "")
+                .await
+                .expect("v2 路径");
+            assert_eq!(r.status, 400, "{path} 的 ?user= 为空时仍需显式确认");
+        }
+
+        // `/status` 与 `/version` 只回聚合计数 ⇒ **不适用**该门槛
+        for path in ["/api/v2/status", "/api/v2/version", "/api/v2/ports"] {
+            let r = route(&reg(), &cfg(), "GET", path, "", "")
+                .await
+                .expect("v2 路径");
+            assert_eq!(r.status, 200, "{path} 不含租户标识，不该被门槛挡住");
+        }
+    }
+
+    /// `?all=` 的取值容错：1/true/yes 都认，大小写不敏感。
+    #[tokio::test]
+    async fn all_参数的取值容错() {
+        for v in ["1", "true", "TRUE", "True", "yes", "YES", " 1 "] {
+            let r = route(
+                &reg(),
+                &cfg(),
+                "GET",
+                "/api/v2/clients",
+                &format!("?all={v}"),
+                "",
+            )
+            .await
+            .expect("v2 路径");
+            assert_eq!(r.status, 200, "all={v:?} 应被认作确认");
+        }
+        for v in ["0", "false", "no", "", "x"] {
+            let r = route(
+                &reg(),
+                &cfg(),
+                "GET",
+                "/api/v2/clients",
+                &format!("?all={v}"),
+                "",
+            )
+            .await
+            .expect("v2 路径");
+            assert_eq!(r.status, 400, "all={v:?} 不该被认作确认");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 L13）：v2 错误文案必须可脱敏
+    // ------------------------------------------------------------------
+
+    /// ★★ L13：关掉详细错误后，错误文案里**不得含任何租户标识**。
+    ///
+    /// 同一个错误在 `serve.rs` 的客户端路径上套了 `cfg.error_to_client()`，
+    /// 面板这条路径原先**没套** —— 于是"域名 x 已被代理 alice.web 占用"
+    /// 这类**别人的代理名**会被回显给调用方。
+    #[tokio::test]
+    async fn 关掉详细错误后_v2_不回显租户信息() {
+        // 造一个必然报错的请求：页大小超上限
+        let q = format!("?all=1&page_size={}", MAX_PAGE_SIZE + 1);
+
+        // (1) 默认 true ⇒ 逐字不变（与官方一致，不能改行为）
+        let r = route(&reg(), &cfg(), "GET", "/api/v2/clients", &q, "")
+            .await
+            .expect("v2 路径");
+        assert_eq!(r.status, 400);
+        let detailed = body_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            detailed.contains(&MAX_PAGE_SIZE.to_string()),
+            "detailedErrorsToClient = true 时应回详细原因：{detailed}"
+        );
+
+        // (2) 关掉 ⇒ 只回通用文案，不含具体数值
+        let mut c = (*cfg()).clone();
+        c.detailed_errors_to_client = false;
+        let c = Arc::new(c);
+        let r = route(&reg(), &c, "GET", "/api/v2/clients", &q, "")
+            .await
+            .expect("v2 路径");
+        assert_eq!(r.status, 400, "状态码不变 —— 调用方仍能区分错误类别");
+        let v = body_of(&r);
+        let redacted = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !redacted.contains(&MAX_PAGE_SIZE.to_string()),
+            "脱敏后不得再含具体配置值：{redacted}"
+        );
+        // 错误码必须保留（调用方编程依赖它，且它不含租户信息）
+        assert_eq!(
+            v["error"]["code"].as_str(),
+            Some("bad_request"),
+            "错误码要保留，否则关掉详细错误的部署无法自动化"
+        );
+        assert!(v["error"]["details"].is_null(), "details 整个去掉");
+    }
+
+    /// 脱敏开关对**成功响应**零影响（别修得过头）。
+    #[tokio::test]
+    async fn 脱敏开关不影响成功响应() {
+        let mut c = (*cfg()).clone();
+        c.detailed_errors_to_client = false;
+        let r = route(&reg(), &cfg(), "GET", "/api/v2/version", "", "")
+            .await
+            .expect("v2 路径");
+        assert_eq!(r.status, 200);
+        assert_eq!(body_of(&r)["data"]["api"], "v2");
     }
 
     #[tokio::test]
