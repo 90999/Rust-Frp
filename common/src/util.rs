@@ -175,6 +175,34 @@ pub fn strip_user_prefix<'a>(user: &str, name: &'a str) -> &'a str {
     }
 }
 
+/// **规范的线上全名**：`{user}.{原始名}`，且**幂等**（v0.5.6 修审计总报告 M5）。
+///
+/// # 为什么需要它
+///
+/// 服务端有两条路径要算这个全名：
+///
+/// | 路径 | 传进来的 `name` |
+/// |---|---|
+/// | 客户端直连注册（`serve.rs` 的 `NewProxy`） | **原始名或全名都可能**（老版客户端只发原始名，官方 frpc 发全名） |
+/// | 面板管理接口（`admin.rs` 的 `remove_proxy`） | **一定是全名**（它从 `/api/status` 列表里读出来） |
+///
+/// 直连那条早就写成 `add_user_prefix(user, strip_user_prefix(user, name))`
+/// —— 先剥再补，无论传哪种都得到同一个结果。而**面板那条漏了 strip**，
+/// 于是 `user = "alice"` + 全名 `"alice.web"` 会得到 **`"alice.alice.web"`**：
+///
+/// * `stop_proxy("alice.alice.web")` 查不到 ⇒ **端口不归还、域名不释放**
+///   ⇒ 持续泄漏，可反复触发形成跨租户 DoS；
+/// * 但客户端侧用的是原始名 ⇒ 客户端**真的删成功了** ⇒ 返回文案"已移除"
+///   与真实状态不符（最难排查的那种不一致）。
+///
+/// # 为什么抽成函数
+///
+/// 与 `has_dashboard_creds` / `is_visitor_type` 同理：
+/// **同一语义在两条路径上各写一遍，就一定会漂移一处。**
+pub fn canonical_wire_name(user: &str, name: &str) -> String {
+    add_user_prefix(user, strip_user_prefix(user, name))
+}
+
 /// 双向转发的统一入口（使用 [`RELAY_BUF`] 大小的缓冲）。
 pub async fn relay_between<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
 where
