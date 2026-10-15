@@ -717,6 +717,54 @@ pub fn connection_tokens(parts: &HeadParts) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// **请求 framing 校验**（v0.5.6 修审计总报告 M2）。
+///
+/// 服务端 `vhost.rs` 早就做了这三项检查，客户端 `plugin_bridge.rs`
+/// **一项都没有** —— 于是"同一语义写了两遍、只加固了一遍"。
+/// 现在抽到这里，服务端与客户端**共用同一份判据**。
+///
+/// 三项检查（都是请求走私的经典入口）：
+///
+/// 1. `Transfer-Encoding` 与 `Content-Length` **同时出现** ⇒ 拒绝
+///    （RFC 7230 §3.3.3 要求二选一，两边解读不一致就是走私）；
+/// 2. **重复的 `Content-Length`** ⇒ 拒绝（不同实现合并策略不一致）；
+/// 3. `Transfer-Encoding` 不是"末尾唯一的 chunked" ⇒ 拒绝
+///    （见 [`transfer_encoding_is_unsupported`]）。
+///
+/// 返回 `Err(原因)`，调用方负责回 400。
+pub fn validate_request_framing(req: &HeadParts) -> Result<(), String> {
+    let has_te = req.get("transfer-encoding").is_some();
+    let cl_count = req.count("content-length");
+    if has_te && cl_count > 0 {
+        return Err("Transfer-Encoding 与 Content-Length 不能同时出现".to_string());
+    }
+    if cl_count > 1 {
+        return Err("重复的 Content-Length 头".to_string());
+    }
+    if transfer_encoding_is_unsupported(req) {
+        return Err("Transfer-Encoding 只支持唯一的 chunked".to_string());
+    }
+    Ok(())
+}
+
+/// **剥掉逐跳头**（v0.5.6 修审计总报告 M2）。
+///
+/// 常驻的 [`HOP_BY_HOP`] 加上 `Connection` 里点名的那批。
+/// 服务端 `vhost.rs` 的请求侧与响应侧都做了，客户端 `plugin_bridge.rs`
+/// **只在响应侧处理了 `connection` 单个头** ⇒ 内网服务回的
+/// `Connection: keep-alive, X-Secret` 会让 `X-Secret`、`Upgrade`、
+/// `Keep-Alive` 等**原样泄漏给公网访客**（已实测复现）。
+///
+/// ★ 调用顺序要紧：**先剥再写自己的 `Connection`**，
+///   否则刚写的那条会被自己剥掉。
+pub fn strip_hop_by_hop(head: &mut HeadParts) {
+    let mut hop: Vec<String> = HOP_BY_HOP.iter().map(|s| (*s).to_string()).collect();
+    hop.extend(connection_tokens(head));
+    for k in hop {
+        head.remove(&k);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
