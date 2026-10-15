@@ -179,11 +179,27 @@ async fn handle(
         return Ok(());
     }
 
-    // Basic Auth：只在配置了用户名时才校验。
+    // Basic Auth：只在配置了**完整**凭据时才校验。
     //
     // 必须比对完整的 `user:password` —— 只比用户名等于把面板敞开，
     // 这里用定长比较，避免通过响应耗时逐字节猜密码。
-    let expected = auth.read().ok().and_then(|g| g.clone());
+    //
+    // ★★ v0.5.6 修（审计总报告 H1，纵深防御）：**用户名非空但密码为空
+    //   一律按"没有凭据"处理**（`expected` 视为 None）⇒ 走下面的拒绝分支。
+    //
+    //   为什么不能去比 `"admin:"`：那等于"知道用户名就能进"，
+    //   攻击者随手构造一个 `Authorization: Basic YWRtaW46` 就通过了。
+    //   这正是 H1 攻击链的第 ⑤⑥ 步。
+    //
+    //   注意这条是**纵深防御**：真正的闸门在启动校验与热重载闸门
+    //   （它们已经用 `has_dashboard_creds()` 拦住了这种配置）。
+    //   但鉴权点是"最后一米"，这里也必须自己站得住 ——
+    //   不能假设上游永远拦住了（`serve_with` 可被别的宿主直接调用）。
+    let expected = auth
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(u, p)| nfrp_common::config::has_dashboard_creds(u, p));
     if let Some((user, pwd)) = expected {
         let expect_cred = format!("{}:{}", user, pwd);
         match &given {
@@ -640,11 +656,32 @@ fn html_page() -> String {
 const KB = 1024, MB = 1024*1024, GB = 1024*1024*1024;
 function bytes(n){ if(n>=GB) return (n/GB).toFixed(2)+' GB'; if(n>=MB) return (n/MB).toFixed(2)+' MB';
   if(n>=KB) return (n/KB).toFixed(1)+' KB'; return n+' B'; }
-function card(k,v){ return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
+function card(k,v){ return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`; }
+// ★★ v0.5.6 修（审计总报告 H4，高危 · 存储型 XSS）：
+//   `table()` 原先**直接插值单元格**，而单元格里装着攻击者可控的字符串 ——
+//   低权限客户端注册一个名字为 `<img src=x onerror=...>` 的代理，
+//   管理员一打开面板就在**管理员会话**里执行攻击者的脚本
+//   ⇒ 越权调用 /api/*（踢人、增删代理、开公网端口）。
+//
+//   数据来源全部可控（`/api/status`）：
+//     clients[].client_id / user / proxies[]（代理名）
+//     visitors[].proxy_name / type / provider_user / allow_users
+//
+//   `esc()` 本来就存在、也在这同一个文件里被正确用过（`c.run_id`、
+//   下拉框的每个字段）—— **唯独 `table()` 这条路径漏了**。
+//   客户端 `web.rs` 的实现一直是对的（`card()` 辅助函数内部自己转义），
+//   这里照它的模式改。
+//
+//   需要嵌入 HTML 的（"踢出"按钮）用 `raw()` **显式**标记，
+//   避免二次转义把按钮变成文本。
+function raw(html){ return {__raw: String(html)}; }
+function cell(c){
+  return (c && typeof c === 'object' && '__raw' in c) ? c.__raw : esc(c);
+}
 function table(headers, rows){
   if(!rows.length) return '<div class="empty">暂无数据</div>';
-  return `<table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>`
-    + rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') + '</tbody></table>';
+  return `<table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>`
+    + rows.map(r=>`<tr>${r.map(c=>`<td>${cell(c)}</td>`).join('')}</tr>`).join('') + '</tbody></table>';
 }
 async function refresh(){
   try {
@@ -663,7 +700,10 @@ async function refresh(){
       ['客户端', 'user', '代理', '排队', '空闲', '管理'],
       (s.clients||[]).map(c=>[c.client_id, c.user||'-', (c.proxies||[]).join(', ')||'-',
         c.backlog, c.idle_work_conns,
-        '<button data-kick="'+esc(c.run_id)+'">踢出</button>']));
+        // ★ H4：这是**唯一**需要嵌 HTML 的单元格 ⇒ 用 raw() 显式标记，
+        //   否则会被 esc() 转义成文本、按钮显示不出来。
+        //   注意里面的 run_id 仍然要 esc()（它进了 HTML 属性）。
+        raw('<button data-kick="'+esc(c.run_id)+'">踢出</button>')]));
     // 客户端下拉框（新增代理要选一个客户端）
     const sel = document.getElementById('target');
     if (sel) {
@@ -926,6 +966,64 @@ Authorization: Basic ",
         assert!(html.contains("refresh()"));
         assert_eq!(html.matches("<script>").count(), 1);
         assert_eq!(html.matches("</script>").count(), 1);
+    }
+
+    // ==================================================================
+    // v0.5.6 回归（审计总报告 H4）：面板表格必须转义单元格
+    // ==================================================================
+
+    /// ★★ H4 核心回归：`table()` 必须逐个单元格走 `cell()`（默认 `esc()`）。
+    ///
+    /// 修复前它直接 `<td>${c}</td>` 插值，而单元格里装着**攻击者可控**的
+    /// 代理名 / 用户名 ⇒ 低权限客户端注册一个名字为
+    /// `<img src=x onerror=...>` 的代理，管理员一开面板就在**管理员会话**里
+    /// 执行攻击者的脚本（存储型 XSS）⇒ 越权调 `/api/*`。
+    ///
+    /// ★ 这里断言的是"接线"，不是"运行时行为"（面板 JS 不在 Rust 测试里跑）。
+    ///   但接线正是本 bug 的全部内容 —— `esc()` 一直存在，
+    ///   只是 `table()` 这条路径没接上。
+    #[test]
+    fn 面板表格必须转义单元格() {
+        let html = html_page();
+
+        // 表头与单元格都必须过 esc()/cell()
+        assert!(
+            html.contains("headers.map(h=>`<th>${esc(h)}</th>`)"),
+            "表头必须转义"
+        );
+        assert!(
+            html.contains("r.map(c=>`<td>${cell(c)}</td>`)"),
+            "单元格必须走 cell()（内部默认 esc）"
+        );
+        // ★ 反向：绝不能残留"直接插值"的旧写法
+        assert!(
+            !html.contains("r.map(c=>`<td>${c}</td>`)"),
+            "不得残留未转义的单元格插值（H4）"
+        );
+
+        // cell() / raw() 必须存在且语义正确
+        assert!(html.contains("function cell(c)"), "cell() 必须存在");
+        assert!(html.contains("function raw(html)"), "raw() 必须存在");
+        assert!(
+            html.contains("'__raw' in c) ? c.__raw : esc(c)"),
+            "cell() 必须默认转义、只对 raw() 放行"
+        );
+        // 唯一的 raw() 使用点是那个按钮
+        assert_eq!(
+            html.matches("raw('<button").count(),
+            1,
+            "只有『踢出』按钮该用 raw()"
+        );
+        // 按钮里的 run_id 自己仍然要转义（它进了 HTML 属性）
+        assert!(html.contains("esc(c.run_id)"), "属性里的 run_id 仍须转义");
+
+        // 卡片也一并转义（原先同样直接插值；虽然当前只喂数字，但别留地雷）
+        assert!(
+            html.contains(
+                "function card(k,v){ return `<div class=\"card\"><div class=\"k\">${esc(k)}</div>"
+            ),
+            "card() 也必须转义"
+        );
     }
 
     #[test]
