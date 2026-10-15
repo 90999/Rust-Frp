@@ -608,15 +608,21 @@ pub enum ServerAccept {
 /// 服务端握手。**自动探测**对端是 v1 还是 v2（与官方 frps 一致）。
 ///
 /// * `run_id` —— 本次会话的标识，会写进 LoginResp 下发给客户端。
+/// * `max_clock_skew_secs` —— 登录时间戳允许的偏差（0 = 不校验，v0.5.6 M3）。
 pub async fn server_handshake(
     stream: BoxStream,
     auth: &crate::security::AuthProvider,
     run_id: &str,
+    max_clock_skew_secs: u64,
 ) -> Result<ServerAccept> {
     // 不做授权：任何通过认证的用户都拿到全权角色，等价于"没启用 RBAC"。
-    server_handshake_authz(stream, auth, run_id, |_| {
-        Ok(crate::security::Role::unrestricted())
-    })
+    server_handshake_authz(
+        stream,
+        auth,
+        run_id,
+        |_| Ok(crate::security::Role::unrestricted()),
+        max_clock_skew_secs,
+    )
     .await
 }
 
@@ -634,6 +640,7 @@ pub async fn server_handshake_authz<F>(
     auth: &crate::security::AuthProvider,
     run_id: &str,
     authorize: F,
+    max_clock_skew_secs: u64,
 ) -> Result<ServerAccept>
 where
     F: FnOnce(&str) -> std::result::Result<crate::security::Role, String>,
@@ -745,6 +752,30 @@ where
         FrpMessage::Login(l) => l,
         _ => unreachable!(),
     };
+
+    // ★★ v0.5.6 修（审计总报告 M3，中危）：**先校验时间戳新鲜性**，
+    //   再比凭证。
+    //
+    // 顺序有讲究：先判时间成本更低，而且能让"过期"与"凭证错"两种失败
+    // 在日志里**分开**，便于运维定位（时钟不准 vs 配置错）。
+    //
+    // 为什么必须加这一步：v1 的凭证是 `md5(token + ts)`，原先只用报文
+    // 自报的 ts 重算比对、**不做新鲜性校验**；而 `Login` 在加密建立之前
+    // **明文发送**。⇒ 同链路嗅探到一条 Login 就能**原样重放**拿到完整会话
+    // （无期限），并且每个候选 token 只需 1 次 MD5 即可离线验证。
+    //
+    // `max_clock_skew_secs == 0` 表示关闭（逃生开关，给时钟严重不准的设备）。
+    // 官方 frpc 的 `Login.Timestamp` 就是发报文时的 unix 时间，
+    // 默认 ±300 秒窗口对它**零感知**。
+    if let Err(e) = auth.check_timestamp(login.timestamp, max_clock_skew_secs) {
+        let _ = conn
+            .send_msg(&FrpMessage::LoginResp(LoginResp {
+                error: e.to_string(),
+                ..Default::default()
+            }))
+            .await;
+        bail!("认证失败：{e}");
+    }
 
     // 认证：token 方式比 `md5(secret+ts)`，OIDC 方式验签 access token。
     //
