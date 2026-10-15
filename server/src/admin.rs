@@ -156,7 +156,26 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     }
 
     // 服务端这侧：端口 / 域名 / visitor 全摘掉（与客户端主动 CloseProxy 同款清理）
-    let wire_name = nfrp_common::util::add_user_prefix(&client.user, name);
+    //
+    // ★★ v0.5.6 修（审计总报告 M5，中危）：**前缀必须幂等**（strip 再 add）。
+    //
+    // 面板传进来的 `name` 是**线上全名**（带 `{user}.` 前缀，因为它是从
+    // `/api/status` / `/api/v2/proxies` 列表里读出来的，那些地方展示的就是全名）。
+    // 原先直接 `add_user_prefix(&client.user, name)` ⇒ 得到 `"alice.alice.web"`，
+    // 而 `add_user_prefix` **只在 `user` 为空时短路**，不认已有的前缀。
+    //
+    // 后果（逐条都可观测）：
+    // * `client.stop_proxy("alice.alice.web")` → `None` ⇒ **`release_port` 被跳过，
+    //   端口不归还** ⇒ 端口/域名**持续泄漏**，期间任何人重注册同一端口都得到
+    //   "已被占用"，可反复触发形成**跨租户 DoS**；
+    // * `t.remove_proxy(&client, "alice.alice.web")` → 摘不到 ⇒ 域名仍被占；
+    // * 但**客户端侧**用的是原始名（下面发的是 `name`）⇒ 客户端**真的删成功了**；
+    // * 返回文案还说"已移除" —— 与真实状态不符。
+    //
+    // ★ 服务端直连那条路径（`serve.rs` 的 `NewProxy` 处理）一直是
+    //   `add_user_prefix(user, strip_user_prefix(user, name))` 的幂等写法，
+    //   面板这条路漏了那半截。现在抽成 `canonical_wire_name()` 让两处共用。
+    let wire_name = nfrp_common::util::canonical_wire_name(&client.user, name);
     // ★ v0.5.5（第四轮 B-1）：同样带上归属，避免误删其它租户的同名 visitor 记录。
     registry.visitors.remove(&client, &wire_name);
     if let Some(t) = registry.vhosts() {
@@ -164,10 +183,18 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
         //   只按名字摘会误删其它租户的同名路由。
         t.remove_proxy(&client, &wire_name);
     }
+    // ★★ v0.5.6 修（审计总报告 M8，中危）：`proxies_active.dec()` 必须**只在本客户端
+    //   确实持有这条代理时**执行。
+    //
+    // 原先它是无条件执行的 —— 于是任何客户端反复发 `CloseProxy`（或面板反复删
+    // 一个不存在/别人的名字），每次都能把 gauge 减 1 ⇒ 变成负数并持续走低，
+    // 面板显示"生效代理 -37"，管理员据此判断异常的能力被破坏。
+    //
+    // 参照：`serve.rs` 的 `CloseProxy` 分支也是同样的写法问题（一并在本轮修了）。
     if let Some(port) = client.stop_proxy(&wire_name) {
+        registry.metrics().proxies_active.dec();
         registry.release_port(port, &client, &wire_name);
     }
-    registry.metrics().proxies_active.dec();
 
     // 客户端那侧：失败也只是它表里多留一条（服务端已经不放流量进来了），
     // 所以这里只告警、不回滚
