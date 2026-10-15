@@ -62,7 +62,21 @@ fn is_empty_map(m: &HashMap<String, String>) -> bool {
 // 消息体
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// ★★ v0.5.6 修（审计总报告 L9，低危）：**手工实现 `Debug`，`privilege_key` 打码**。
+//
+// 去掉 `derive(Debug)` 是为了不让 `privilege_key` 进日志。它是一条
+// **可直接用来重放登录**的凭据（M3 把重放窗口压到 5 分钟，但没有消除重放），
+// 一旦被 `tracing::debug!("{login:?}")` 打出来就等于把凭据写进日志文件。
+//
+// ★ 这是**同一类坑的第三处**：`ServerAuthConfig` 与 `ClientAuthConfig`
+//   都因为同样的原因手工实现了 `Debug`（各自带 `不得泄漏_token` 的锁定测试）。
+//   本处目前**不可达**（全仓没有生产代码打印 `Login`），所以定 Low ——
+//   但"等它能被打出来时再修"就晚了，而且下一个人加一行 debug 日志
+//   不会有任何提示。
+//
+// ★ 参照那两处的做法：敏感字段显示为 `<redacted>`，
+//   非敏感字段照常显示（否则排查问题时日志毫无用处）。
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Login {
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub version: String,
@@ -92,6 +106,35 @@ pub struct Login {
     /// 回显才算协商成功。理由见 [`NfrpCaps`] 的文档。
     #[serde(rename = "_nfrp", default, skip_serializing_if = "Option::is_none")]
     pub nfrp: Option<NfrpCaps>,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("version", &self.version)
+            .field("hostname", &self.hostname)
+            .field("os", &self.os)
+            .field("arch", &self.arch)
+            .field("user", &self.user)
+            // ★ v0.5.6（L9）：凭据**绝不**进日志。空/非空也区分显示 ——
+            //   长度本身是可用信息（能区分"没带凭证"与"带了错的"），
+            //   所以只区分"空"与"非空"，不暴露长度。
+            .field(
+                "privilege_key",
+                &if self.privilege_key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("timestamp", &self.timestamp)
+            .field("run_id", &self.run_id)
+            .field("client_id", &self.client_id)
+            .field("metas", &self.metas)
+            .field("pool_count", &self.pool_count)
+            .field("nfrp", &self.nfrp)
+            .finish()
+    }
 }
 
 /// NFrp 的**私有能力协商**。
@@ -634,8 +677,43 @@ impl UdpAddr {
     }
 
     /// 用作会话 map 的 key（与 frp 的 `UDPAddr.String()` 语义一致）。
+    ///
+    /// ★★ v0.5.6 修（审计总报告 M16，中危）：**必须消掉 IPv6 的歧义**。
+    ///
+    /// 原先直接 `format!("{}:{}", self.ip, self.port)`，而 IPv6 地址**自身
+    /// 就含冒号** ⇒ 表示不唯一：
+    ///
+    /// | 地址 | 拼接结果 | 另一组能拼出同一个串的地址 |
+    /// |---|---|---|
+    /// | `::1` + 8080 | `::1:8080` | `::1:8080`？也可读成 `::1:80` 带端口 `80`… |
+    /// | `2001:db8::1` + 443 | `2001:db8::1:443` | `2001:db8::1:443` + 0 等 |
+    ///
+    /// 两个后果：
+    /// * **会话串访客**：两个不同的 (ip, port) 得到同一个 key ⇒
+    ///   后者的 UDP 响应被写回前者（`udp_proxy` 按 key 分发）；
+    /// * **会话爆炸**：同一个对端因表示差异产生多个 key，
+    ///   每个都建独立 socket，`max_conns` 计数被绕过。
+    ///
+    /// 修法：**IPv6 一律加方括号**（RFC 3986 的写法），并带上 zone ——
+    /// 这样 `[::1]:8080` 只有唯一一种解读。IPv4 保持原样
+    /// （`1.2.3.4:80` 本就无歧义，且**不改它**才能与既有 map 语义、
+    /// 以及官方 frp 的 v4 行为完全一致）。
     pub fn key(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+        // 判据用"解析出来的地址是不是 v6"，而不是"串里有没有冒号" ——
+        // 后者对畸形输入会误判。
+        let is_v6 = self
+            .ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_ipv6());
+        if is_v6 {
+            if self.zone.is_empty() {
+                format!("[{}]:{}", self.ip, self.port)
+            } else {
+                format!("[{}%{}]:{}", self.ip, self.zone, self.port)
+            }
+        } else {
+            format!("{}:{}", self.ip, self.port)
+        }
     }
 }
 
@@ -1268,5 +1346,66 @@ mod tests {
             }
             other => panic!("解出的类型不对：{other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M16）：UdpAddr::key() 的 IPv6 歧义
+    // ------------------------------------------------------------------
+
+    /// ★★ M16：IPv6 的 key 必须带方括号，否则不同地址会撞成同一个 key。
+    ///
+    /// 碰撞的后果是**会话串访客**（UDP 响应写回错误的对端）
+    /// 与**会话爆炸**（同一对端多个 key，每个建独立 socket，
+    /// 绕过 `max_conns` 计数）。
+    #[test]
+    fn udp_addr_key_不得有_ipv6_歧义() {
+        let mk = |ip: &str, port: u16| UdpAddr {
+            ip: ip.into(),
+            port,
+            zone: String::new(),
+        };
+
+        // ★ 原先这两组会拼出**同一个串** `::1:8080`
+        let a = mk("::1", 8080);
+        let b = mk("::1:8080", 0);
+        assert_ne!(
+            a.key(),
+            b.key(),
+            "不同的 (ip,port) 绝不能得到同一个 key：{}",
+            a.key()
+        );
+        assert_eq!(a.key(), "[::1]:8080");
+
+        // 带 zone 的也要唯一
+        let z1 = UdpAddr {
+            ip: "fe80::1".into(),
+            port: 80,
+            zone: "eth0".into(),
+        };
+        let z2 = UdpAddr {
+            ip: "fe80::1%eth0".into(),
+            port: 80,
+            zone: String::new(),
+        };
+        assert_ne!(z1.key(), z2.key(), "zone 的两种表示不能撞");
+
+        // ★ 反向：IPv4 保持原样（不能改，否则与既有 map 语义 / 官方行为分叉）
+        assert_eq!(mk("1.2.3.4", 80).key(), "1.2.3.4:80");
+        assert_eq!(mk("0.0.0.0", 0).key(), "0.0.0.0:0");
+    }
+
+    /// `key()` 与 `to_socket()` 对 IPv6 的往返要一致。
+    #[test]
+    fn udp_addr_ipv6_往返一致() {
+        let a = UdpAddr {
+            ip: "2001:db8::1".into(),
+            port: 443,
+            zone: String::new(),
+        };
+        assert_eq!(a.key(), "[2001:db8::1]:443");
+        // to_socket 走的是裸 ip 解析，不受 key 的括号影响
+        let s = a.to_socket().expect("应能解析");
+        assert_eq!(s.port(), 443);
+        assert!(s.is_ipv6());
     }
 }
