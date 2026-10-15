@@ -13,7 +13,7 @@ use nfrp_common::{
     frp::{
         conn::{self, FrpConn},
         kcp::KcpStream,
-        msg::{FrpMessage, NewProxy, NewProxyResp, UdpPacket},
+        msg::{FrpMessage, NewProxy, NewProxyResp, NewWorkConn, UdpPacket},
         stream::BoxStream,
         WireVersion,
     },
@@ -192,6 +192,39 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
         &empty_metas(),
         0,
         Default::default(),
+    )
+    .await
+    .expect("frp 握手");
+    (conn, run_id)
+}
+
+/// 与 [`login_with`] 相同，但**声明 `workConnCred` 能力位**。
+///
+/// ★ 为什么需要单独一个：`login_with` 传 `Default::default()`（无能力位），
+/// 行为**等价于官方 frpc** —— 服务端走的是"源 IP 一致"那条兼容回退。
+/// 而 A-1 修复的**强制凭证**分支只在客户端声明了能力位时才生效
+/// （NFrp ≥0.5.5 的客户端恒声明，见 `client/src/main.rs`）。
+///
+/// 两条分支都必须被测到：
+/// * 本函数（声明了）⇒ 空凭证**必须被拒**；
+/// * [`login_with`]（没声明）⇒ 退回源 IP 校验（互通所必需）。
+async fn login_declaring_work_conn_cred(port: u16, token: &str, user: &str) -> (FrpConn, String) {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let caps = nfrp_common::frp::msg::NfrpCaps {
+        work_conn_cred: true,
+        ..Default::default()
+    };
+    let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
+        Box::pin(stream),
+        WireVersion::V2,
+        &nfrp_common::security::Credential::Token(token.to_string()),
+        "e2e-client-cred",
+        user,
+        &empty_metas(),
+        0,
+        caps,
     )
     .await
     .expect("frp 握手");
@@ -1524,6 +1557,289 @@ async fn wire_v1_and_v2_coexist_on_one_port() {
         b"v2:ping",
         "v2 通道应连到 v2 后端"
     );
+}
+
+// ===========================================================================
+// v0.5.6 回归（审计总报告 L7）：A-1 工作连接凭证 —— 之前**零 e2e 测试**
+//
+// 第四轮最高危的修复（工作连接必须带凭证，否则任何人拿到明文下发的
+// run_id 就能往受害者的空闲连接池里灌自己的连接 ⇒ 完整 MITM）
+// 在 `e2e.rs` 里**一次都没被测过**。而它有两条分支：
+//
+//   * 客户端**声明**了 `workConnCred` 能力（NFrp ≥0.5.5）⇒ 必须带凭证，空也拒；
+//   * 客户端**没声明**（官方 frpc）⇒ 退回"源 IP 与控制连接一致"，以保互通。
+//
+// 第二条是**兼容回退**、也是整条防线上最弱的一环 —— 它必须被显式锁住，
+// 否则某次重构把它放松成"无条件放行"不会有任何测试报警。
+// ===========================================================================
+
+/// 手工发一条指定 `privilege_key` 的工作连接，判断服务端**接受还是拒绝**。
+///
+/// ★ 判据为什么不是"有没有回 `StartWorkConn`"（这是读 `handle_work` 得出的）：
+///
+/// | 服务端行为 | 连接状态 |
+/// |---|---|
+/// | 凭证通过 ⇒ 进**空闲池**等待配对 | **保持打开**，且**不回**任何消息 |
+/// | 凭证被拒 ⇒ `bail!` | **被关闭** |
+///
+/// 所以"接受"表现为 `recv_msg()` 一直挂着（直到超时）；
+/// "拒绝"表现为 `recv_msg()` 立刻返回 `None`（或一条带 error 的 StartWorkConn）。
+///
+/// 返回 `Ok(())` = 被接受；`Err(原因)` = 被拒。
+///
+/// ★ 为什么不用 `conn::client_work_conn`：它内部**自己**按 token 算
+/// `auth_key`，没法构造"伪造凭证"的场景。测试要的恰恰是伪造。
+async fn try_work_conn(
+    port: u16,
+    run_id: &str,
+    privilege_key: &str,
+    ts: i64,
+) -> Result<(), String> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| e.to_string())?;
+    // 局部变量叫 `wc` 而不是 `conn` —— 本文件顶部 `use ... conn::{self, FrpConn}`，
+    // 同名会遮蔽那个模块（别处还要用 `conn::client_handshake`）。
+    // ★ 线协议必须与**控制连接**一致（都走 V2），否则会被服务端的
+    //   "work connection wire protocol mismatch" 检查拒掉 ——
+    //   那是另一个测试（work_conn_wire_protocol_mismatch_is_rejected）覆盖的事。
+    let mut wc = FrpConn::new(Box::pin(stream), WireVersion::V2);
+    wc.write_magic().await.map_err(|e| e.to_string())?;
+    wc.send_msg(&FrpMessage::NewWorkConn(NewWorkConn {
+        run_id: run_id.to_string(),
+        privilege_key: privilege_key.to_string(),
+        timestamp: ts,
+    }))
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 给它 300ms：被拒是**立刻**关连接，被接受则一直安静挂着。
+    // （300ms 远小于任何合法路径的延迟，也不会让测试变慢。）
+    match tokio::time::timeout(std::time::Duration::from_millis(300), wc.recv_msg()).await {
+        // 超时 ⇒ 服务端收下了、进空闲池等配对 ⇒ **接受**
+        Err(_elapsed) => Ok(()),
+        Ok(Ok(Some(FrpMessage::StartWorkConn(s)))) => {
+            if s.error.is_empty() {
+                Ok(()) // 立刻配对上用户了 —— 也是接受
+            } else {
+                Err(s.error)
+            }
+        }
+        // 连接被关 ⇒ **拒绝**
+        Ok(Ok(None)) => Err("服务端关闭了工作连接（被拒）".into()),
+        Ok(Ok(Some(other))) => Err(format!("收到意外消息 {}", other.name())),
+        Ok(Err(e)) => Err(e.to_string()),
+    }
+}
+
+/// ★ A-1 正向：**带正确凭证的工作连接必须被接受**（别修得过头 —— 这条
+/// 同时是"官方互通没被破坏"的单元级护栏）。
+#[tokio::test]
+async fn work_conn_with_valid_credential_is_accepted() {
+    let mut cfg = base_cfg();
+    cfg.token = TOKEN.to_string();
+    let (port, _registry) = start_server_with_registry(cfg).await;
+
+    let (mut ctrl, run_id) = login(port, TOKEN, "cred-user").await;
+    let remote = free_port();
+    let resp = register_proxy(
+        &mut ctrl,
+        NewProxy {
+            proxy_name: "cred-user.ok".into(),
+            proxy_type: "tcp".into(),
+            remote_port: remote,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(resp.error, "", "注册应成功");
+
+    let ts = util::now_unix_secs() as i64;
+    let key = nfrp_common::frp::msg::auth_key(TOKEN, ts);
+    let r = try_work_conn(port, &run_id, &key, ts).await;
+    assert!(
+        r.is_ok(),
+        "带正确凭证的工作连接必须被接受（进空闲池）：{r:?}"
+    );
+}
+
+/// ★★ A-1 核心：**声明了能力位的会话，空凭证必须被拒**。
+///
+/// 攻击场景：攻击者嗅探到明文 `Login`（含 `run_id`），自己开一条工作连接
+/// 灌进受害者的空闲池 ⇒ 之后所有用户流量都从攻击者那里过（完整 MITM）。
+#[tokio::test]
+async fn work_conn_without_credential_is_rejected() {
+    let mut cfg = base_cfg();
+    cfg.token = TOKEN.to_string();
+    let (port, _registry) = start_server_with_registry(cfg).await;
+
+    // ★ 关键：这个客户端**声明了** workConnCred 能力（等价于 NFrp ≥0.5.5），
+    //   所以空凭证必须被拒。若用 `login()`（不声明），服务端会退回源 IP 校验，
+    //   而本测试里攻击者与受害者都是 127.0.0.1 ⇒ 那条回退会放行。
+    let (mut ctrl, run_id) = login_declaring_work_conn_cred(port, TOKEN, "victim").await;
+    let remote = free_port();
+    let resp = register_proxy(
+        &mut ctrl,
+        NewProxy {
+            proxy_name: "victim.web".into(),
+            proxy_type: "tcp".into(),
+            remote_port: remote,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(resp.error, "", "注册应成功");
+
+    // 攻击者：知道 run_id，但**不带凭证**
+    let ts = util::now_unix_secs() as i64;
+    let r = try_work_conn(port, &run_id, "", ts).await;
+    assert!(
+        r.is_err(),
+        "声明了 workConnCred 的会话，空凭证的工作连接必须被拒（A-1）：{r:?}"
+    );
+    let msg = r.unwrap_err();
+    // ★ 服务端拒绝走的是 `bail!` 路径 ⇒ 直接**关连接**，不一定回一条带原因的
+    //   `StartWorkConn`。所以这里只断言"被拒"这个事实，**不**断言错误文案 ——
+    //   文案属于服务端日志的职责（见 M14：那里已经保证只写日志、不回显细节）。
+    assert!(
+        !msg.is_empty(),
+        "拒绝必须可被调用方观测到（当前表现为连接被关闭）：{msg}"
+    );
+}
+
+/// ★ A-1 另一条：**伪造的 `privilege_key`** 同样必须被拒。
+///
+/// 审计报告实测过四种形态（空 / 错误 / 垃圾 / `ts=-1`）在修复前**全部被接受**。
+#[tokio::test]
+async fn work_conn_with_forged_credential_is_rejected() {
+    let mut cfg = base_cfg();
+    cfg.token = TOKEN.to_string();
+    let (port, _registry) = start_server_with_registry(cfg).await;
+
+    // 同上：必须声明能力位，才走"强制凭证"分支
+    let (mut ctrl, run_id) = login_declaring_work_conn_cred(port, TOKEN, "victim2").await;
+    let remote = free_port();
+    let resp = register_proxy(
+        &mut ctrl,
+        NewProxy {
+            proxy_name: "victim2.web".into(),
+            proxy_type: "tcp".into(),
+            remote_port: remote,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(resp.error, "", "注册应成功");
+
+    let ts = util::now_unix_secs() as i64;
+    let forged = [
+        "0".to_string(),
+        "deadbeef".to_string(),
+        // 正确的算法、错误的 token
+        nfrp_common::frp::msg::auth_key("wrong-token", ts),
+        // 正确的 token、错误的 timestamp ⇒ 派生出的 key 也不同
+        nfrp_common::frp::msg::auth_key(TOKEN, ts - 3600),
+    ];
+    for bad in forged {
+        let r = try_work_conn(port, &run_id, &bad, ts).await;
+        assert!(r.is_err(), "伪造凭证 {bad:?} 必须被拒（A-1）：{r:?}");
+    }
+}
+
+// ===========================================================================
+// v0.5.6 回归（审计总报告 M3）：登录时间戳新鲜性 —— **调用点**覆盖
+//
+// `security.rs` 里的单测只覆盖了 `check_timestamp()` 这个函数本身；
+// 若 `conn.rs` 里那处调用被删掉，那个单测**仍然全绿**。
+// 真正挡住"重放一条旧 Login 报文"的，是那处调用 —— 所以必须在这里锁住。
+// ===========================================================================
+
+/// 手工发一条带指定 `timestamp` 的登录，返回服务端的回执。
+async fn login_with_raw_ts(port: u16, token: &str, ts: i64) -> Result<String, String> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut lc = FrpConn::new(Box::pin(stream), WireVersion::V2);
+    lc.write_magic().await.map_err(|e| e.to_string())?;
+    lc.send_msg(&FrpMessage::Login(nfrp_common::frp::msg::Login {
+        version: "0.71.0".into(),
+        hostname: "e2e".into(),
+        os: "test".into(),
+        arch: "test".into(),
+        user: "ts-user".into(),
+        privilege_key: nfrp_common::frp::msg::auth_key(token, ts),
+        timestamp: ts,
+        client_id: "e2e-ts".into(),
+        ..Default::default()
+    }))
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match lc.recv_msg().await {
+        Ok(Some(FrpMessage::LoginResp(r))) => {
+            if r.error.is_empty() {
+                Ok(r.run_id)
+            } else {
+                Err(r.error)
+            }
+        }
+        Ok(Some(other)) => Err(format!("期望 LoginResp，收到 {}", other.name())),
+        Ok(None) => Err("服务端在 LoginResp 之前断开".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// ★★ M3 核心：**一小时前抓到的登录报文必须被拒**（即使凭证完全正确）。
+///
+/// 这就是审计报告描述的重放场景：`Login` 在加密建立**之前**明文发送，
+/// 嗅探到它就能原样重放。修复前服务端只重算 `md5(token+ts)` 比对、
+/// **不做任何时间校验** ⇒ 无限期可重放。
+#[tokio::test]
+async fn login_with_stale_timestamp_is_rejected() {
+    let mut cfg = base_cfg();
+    cfg.token = TOKEN.to_string();
+    let (port, _registry) = start_server_with_registry(cfg).await;
+
+    let now = util::now_unix_secs() as i64;
+
+    // 前置：当前时间的登录必须成功（证明凭证与配置都没问题）
+    login_with_raw_ts(port, TOKEN, now)
+        .await
+        .expect("当前时间戳的登录应当成功");
+
+    // ★ 一小时前的报文：凭证**完全正确**，只是时间过期 ⇒ 必须被拒
+    let e = login_with_raw_ts(port, TOKEN, now - 3600)
+        .await
+        .expect_err("一小时前的登录报文必须被时间窗口拦下（M3）");
+    assert!(!e.is_empty(), "拒绝必须可观测；实际错误：{e}");
+
+    // 未来时间同样不行
+    login_with_raw_ts(port, TOKEN, now + 3600)
+        .await
+        .expect_err("未来一小时的时间戳同样必须被拒");
+
+    // 极端值（审计报告实测过这些在修复前**能登录成功**）
+    for bad in [0i64, -1, i64::MAX, i64::MIN] {
+        assert!(
+            login_with_raw_ts(port, TOKEN, bad).await.is_err(),
+            "ts={bad} 必须被时间窗口拒绝（M3）"
+        );
+    }
+}
+
+/// 反向保护：**窗口内**的时间戳必须照常能登录（别修得过头）。
+#[tokio::test]
+async fn login_within_clock_skew_is_accepted() {
+    let mut cfg = base_cfg();
+    cfg.token = TOKEN.to_string();
+    let (port, _registry) = start_server_with_registry(cfg).await;
+
+    let now = util::now_unix_secs() as i64;
+    for ok in [now, now - 60, now + 60, now - 299, now + 299] {
+        login_with_raw_ts(port, TOKEN, ok)
+            .await
+            .unwrap_or_else(|e| panic!("窗口内 ts={ok} 不该被拒：{e}"));
+    }
 }
 
 /// 工作连接跟控制连接**协议不一致**时必须被拒。
