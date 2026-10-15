@@ -140,11 +140,49 @@ async fn main() -> Result<()> {
             cfg.unsupported_fields.join(", ")
         );
     }
+    // ★★ v0.5.6 修（审计总报告 L4，低危）：**明文控制通道也要告警**。
+    //
+    // 原先"空 token""面板无密码"都有强告警，唯独 `transport.tls.force = false`
+    // （= 控制通道可明文）**完全静默** —— 三处安全项、两处有告警。
+    //
+    // 为什么值得说：控制通道明文意味着 token / 面板凭据 / 全部代理元数据
+    // 在链路上可被嗅探；而 `login` 报文里的 `privilege_key` 也可以被
+    // **原样重放**（M3 只把重放窗口压到 5 分钟，没消除重放本身）。
+    //
+    // ★ 与官方 frp 一致：官方也默认不强制 TLS（`transport.tls.force` 默认 false），
+    //   所以**只告警、不拒绝启动** —— 拒绝会破坏"官方客户端零配置直连"
+    //   这个核心承诺（官方 frpc 默认 `tls.enable = false` 时走明文）。
+    if !cfg.tls_force {
+        tracing::warn!(
+            "未强制 TLS（transport.tls.force = false）—— 控制通道可能以**明文**建立，\
+             token 与登录凭据在链路上可被嗅探。\
+             跨公网部署请设 transport.tls.force = true（官方 frpc 默认走明文，\
+             置 true 前请确认客户端也开了 tls.enable）"
+        );
+    }
+
     // 端口白名单是安全项：配了就明确说一句"生效范围"，免得用户不确定到底拦没拦住。
     if !cfg.allow_ports.is_empty() {
         tracing::info!(
             "allowPorts 已生效：客户端只能申请这些远端端口 {}",
             nfrp_common::config::format_port_ranges(&cfg.allow_ports)
+        );
+    } else {
+        // ★★ v0.5.6 修（审计总报告 L3，低危）：**空白名单必须告警**。
+        //
+        // 原先只有 `if`、**没有 `else`** —— 于是 `allowPorts` 留空（= 全放行）
+        // 这件事在启动日志里**完全静默**。
+        //
+        // 为什么值得告警：管理员写了 `allowPorts` 却因为拼错键名 / 放错段
+        // 而没生效时，日志同样是静默的 ⇒ 他以为限制了、实际全放行。
+        // 而同样是安全项的"空 token""面板无密码"都有强告警，
+        // 唯独这一项没有（`serve.rs` 里有对应的强告警，启动路径漏了）。
+        //
+        // ★ 只是 warn 不是拒绝：默认配置就是全放行，
+        //   拒绝启动会让出厂配置起不来（与空 token 那条同一个考量）。
+        tracing::warn!(
+            "未配置 allowPorts —— 客户端可以申请**任意**远端端口（除系统保留端口）。\
+             若要限制，请配置 allowPorts = [\"20000-30000\"] 之类的范围"
         );
     }
 
@@ -264,6 +302,39 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
             "p2p_port({v}) 不能与控制端口 {frp_port} 相同（UDP 与 TCP 端口空间是共用的）"
         );
     }
+    // ★★ v0.5.6 修（审计总报告 L2，低危）：**另外两个 UDP 监听口也要查**。
+    //
+    // 原先只有 `p2p_port` 有冲突检查，`kcp_bind_port` 与 `vnet_port`
+    // **同为 UDP 监听口却一个都没查** —— 又是一处"同一语义只加固了一个"。
+    //
+    // 后果与其他端口冲突一样：撞在一起时只有一个能抢到端口，
+    // 另一个在 bind 时报"地址被占用"，错误信息完全指不到配置上
+    // （尤其是 KCP：它绑不上只表现为"KCP 客户端连不上"，离原因很远）。
+    //
+    // ★ 用同一个循环处理三个 UDP 口，避免下次再加 UDP 口时又漏一个。
+    let udp_ports = [
+        ("p2p_port", cfg.p2p_port),
+        ("kcp_bind_port", cfg.kcp_bind_port),
+        ("vnet_port", cfg.vnet_port),
+    ];
+    // (1) 每个 UDP 口都不能与控制端口撞（UDP/TCP 端口空间共用）
+    for (name, p) in udp_ports.iter() {
+        if let Some(p) = p {
+            anyhow::ensure!(
+                *p != frp_port,
+                "{name}({p}) 不能与控制端口 {frp_port} 相同（UDP 与 TCP 端口空间是共用的）"
+            );
+        }
+    }
+    // (2) UDP 口之间也不能互相撞
+    for (i, (name_a, a)) in udp_ports.iter().enumerate() {
+        let Some(a) = a else { continue };
+        for (name_b, b) in &udp_ports[i + 1..] {
+            if let Some(b) = b {
+                anyhow::ensure!(a != b, "{name_a} 与 {name_b} 不能相同（{a}）");
+            }
+        }
+    }
     if let Some(d) = cfg.dashboard_port {
         anyhow::ensure!(
             d != frp_port,
@@ -305,19 +376,35 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     // 所以：绑非回环 + 没配用户名 ⇒ **拒绝启动**，而不是只打一条 warn 让人
     // 从日志里自己发现。真要裸奔（比如面板只在跳板机能到的内网里），
     // 显式写 `allow_insecure_dashboard = true` 表明是知情选择。
-    if cfg.dashboard_port.is_some() && cfg.dashboard_user.trim().is_empty() {
+    //
+    // ★★ v0.5.6 修（审计总报告 H1，高危）：判据同时看**用户名与密码**。
+    //
+    // 原先这里只判 `dashboard_user.trim().is_empty()`，而上面那段注释写的却是
+    // "配置 dashboard_user + dashboard_pwd" —— **注释与实现不符**，
+    // 这也正是审计漏看它的原因。
+    //
+    // 为什么空密码必须算"没有凭据"：鉴权处把两者拼成 `"user:pwd"` 再比
+    // Basic 头，密码为空时期望值就是 `"admin:"` —— 攻击者随手可构造，
+    // 等于**鉴权退化成"知道用户名就能进"**。空密码不是弱密码，是**没有密码**。
+    //
+    // ★ 四个判据现在共用 `nfrp_common::config::has_dashboard_creds()` 这一个真源
+    //   （本处 + 热重载闸门 + 暴露判定 + 客户端 webServer 校验）。
+    if cfg.dashboard_port.is_some()
+        && !nfrp_common::config::has_dashboard_creds(&cfg.dashboard_user, &cfg.dashboard_pwd)
+    {
         let loopback = nfrp_common::util::is_loopback_addr(&cfg.bind_addr);
         if loopback {
             tracing::warn!(
-                "面板未配置 dashboard_user —— 当前只监听回环地址 {}，仅本机可访问。",
+                "面板未配置完整凭据（dashboard_user / dashboard_pwd 需同时非空）—— \
+                 当前只监听回环地址 {}，仅本机可访问。",
                 cfg.bind_addr
             );
         } else {
             anyhow::ensure!(
                 cfg.allow_insecure_dashboard,
-                "面板端口 {} 配在了非回环地址 {}，但没有配置 dashboard_user —— \
+                "面板端口 {} 配在了非回环地址 {}，但没有配置**完整的**凭据 —— \
                  这会让匿名者可以读面板、踢掉任意客户端、并（对 nfrp 客户端）直接开公网端口。\n\
-                 请二选一：① 配置 dashboard_user + dashboard_pwd；\
+                 请二选一：① 配置 dashboard_user + dashboard_pwd（两者都不能为空）；\
                  ② 把 bind_addr 设成 127.0.0.1 只让本机访问；\
                  ③ 确实要裸奔就显式写 allow_insecure_dashboard = true（自担风险）。",
                 cfg.dashboard_port.unwrap_or_default(),
@@ -345,7 +432,22 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     //     除非显式 `allow_insecure_no_auth = true`（知情选择）；
     //   * 绑**对外** + `bind_addr` 是**默认值**（用户没写过）⇒
     //     不拒绝启动（否则默认配置废掉），但给出可操作的强告警。
-    if cfg.token.is_empty() {
+    // ★★ v0.5.6 修（审计总报告 M6，中危）：判据改用**唯一真源** `has_no_auth()`。
+    //
+    // 原先这里是 `cfg.token.is_empty()` —— **只看顶层 token 字段、且不看
+    // `auth.method`**。而 `guard.rs` 那边用的是
+    // `auth.method() == Token && cfg.effective_auth().token.is_empty()`。
+    // 两套口径。
+    //
+    // 后果：**纯 OIDC 部署**（`[auth] method = "oidc"` + `issuer`，
+    // **不配 token —— 这是完全正确的配置**）下 `cfg.token` 为空 ⇒
+    // 会打出"未配置 token 且正在监听对外地址 —— **任何人**都能连上来注册代理"。
+    // **而事实是 OIDC 认证已正确启用，告警与事实完全相反。**
+    //
+    // `effective_auth()` 会做字段合并（`[auth] token` 为空时回落到顶层 `token`），
+    // 所以判据必须走它；`has_no_auth()` 同时判了 `method`，
+    // 这样 OIDC 模式下"没有 token"就不会被误判成"没有认证"。
+    if cfg.has_no_auth() {
         if nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
             tracing::warn!(
                 "未配置 token：任何人只要能连上 {}:{} 就能使用本服务端（当前只监听回环，仅本机可达）",
