@@ -184,10 +184,53 @@ impl VhostTable {
                 .locations
                 .iter()
                 .any(|a| route.locations.iter().any(|b| a == b));
-            // `route_by_http_user` 的作用恰恰是让多个代理共用同一个域名 + 路径，
-            // 只按访问用户名区分，所以作用域不同就不算抢。
+            // ★ `route_by_http_user` 的**合法用途**：**同一个租户**自己在
+            //   同一「域名 + 路径」上开多条路由，靠访问者用户名区分
+            //   （官方 tcpmux 的 "Route by HTTP user" 就是这个拓扑）。
+            //
+            // ★★ v0.5.6 修（审计总报告 M1，中危）：**跨租户一律算冲突**，
+            //   不许用 `route_by_http_user` 逃逸归属判定。
+            //
+            // 原先是 `duplicate && same_scope`（作用域**相同**才算冲突），
+            // 于是**跨租户 + 作用域不同**这一组合被放行。而
+            // `route_by_http_user` **完全由客户端自报、注册时全仓无校验**
+            // （`serve.rs` → `msg.rs` 直传；`CompiledRbac::check_proxy` 从不读它）。
+            //
+            // 攻击链（实测可复现）：
+            //   ① 受害者 B 注册 `custom_domains=["web.test"]` + `locations=["/"]`，
+            //      未配 `routeByHTTPUser`（默认空串 ⇒ 兜底路由）；
+            //   ② 攻击者 A 注册**同样的域名与路径**，但带 `routeByHTTPUser="alice"`；
+            //   ③ `same_proxy=false`（H1 已拦）、`duplicate=true`、
+            //      **`same_scope=false`** ⇒ 冲突检查跳过 ⇒ 攻击者路由入表，
+            //      且**返回注册成功、无任何告警**；
+            //   ④ 之后**带 `Authorization: Basic alice:...` 的访客请求**会在
+            //      `lookup` 的第 1 轮（`exact_user=true`）命中攻击者的路由
+            //      ⇒ 流量改投攻击者内网服务 —— 可读取其 Authorization / Cookie
+            //      （**凭证收割**）并返回任意响应（钓鱼）。
+            //      而 `same_scope` 永久为 false ⇒ 受害者之后怎么重注册都不冲突，
+            //      域名被**静默寄生**。
+            //
+            // ★★ 关于审计报告给的修法：它建议
+            //   `same_scope = same_owner(existing,&route) && existing.route_by_http_user == route.route_by_http_user`。
+            //   **那个写法是错的**（本轮实测核对）：跨租户攻击时 `same_owner` 本来就是
+            //   false，改完 `same_scope` 仍是 false、结论**完全不变**（对攻击无效）；
+            //   反而在"跨租户 + 作用域相同"时把原本生效的冲突检查**关掉**了
+            //   —— 等于**新开一个洞**。这正是"审计建议不能照抄"的又一例。
+            //
+            // ★ 正确判据（本处实现）：**豁免共存的前提是"同一个租户"**，
+            //   与作用域是否相同无关：
+            //   * 同租户 + 作用域不同 ⇒ 允许共存（自己的二级路由）；
+            //   * 同租户 + 作用域相同 ⇒ 冲突（真重复）；
+            //   * 跨租户 ⇒ 一律冲突。
+            //
+            // ★ 这是一处**有意的行为收紧**：跨租户共用域名 + 路径、靠
+            //   `routeByHTTPUser` 区分，从本版起不再允许。同租户的多作用域
+            //   拓扑（官方 tcpmux 文档里的用法）**不受影响**。
+            //   理由：服务端无法分辨"合法的跨租户多作用域"与"寄生劫持"，
+            //   而后者能直接收割凭据 —— 收紧比放开安全。
             let same_scope = existing.route_by_http_user == route.route_by_http_user;
-            if !same_proxy && duplicate && same_scope {
+            let cross_owner = !same_owner(existing, &route);
+            if !same_proxy && duplicate && (cross_owner || same_scope) {
                 bail!(
                     "域名 {} 的路径已被代理 {} 占用",
                     route.domain,
@@ -1372,13 +1415,22 @@ mod tests {
         assert!(t.lookup("x.com", "/", None, VhostKind::Https).is_some());
     }
 
+    /// `route_by_http_user` 让**同一个租户**的多条路由共用一个域名 + 路径。
+    ///
+    /// ★ v0.5.6（审计总报告 M1）：这些路由必须来自**同一个客户端** ——
+    ///   跨租户的"多作用域"现在一律算冲突（服务端无法分辨合法的多作用域
+    ///   与寄生劫持，而后者能直接收割凭据）。原先用 `route()` 辅助函数
+    ///   逐个新建客户端，恰好把"跨租户"这个语义喂了进去。
     #[test]
     fn route_by_http_user_filters_candidates() {
         let t = VhostTable::default();
-        let mut alice = route("alice-app", "x.com", &["/"], VhostKind::Http);
+        // ★ 两条路由同属一个客户端（真实拓扑：一台 frpc 挂多条代理）
+        let me = dummy_client("me");
+        let mut alice = route_of(&me, "alice-app", "x.com", &["/"]);
         Arc::get_mut(&mut alice).unwrap().route_by_http_user = "alice".to_string();
         t.register(alice).expect("注册");
-        t.register(http_route("anon", "x.com")).expect("注册");
+        t.register(route_of(&me, "anon", "x.com", &["/"]))
+            .expect("同租户 + 不同作用域 ⇒ 允许共存");
 
         assert_eq!(
             t.lookup("x.com", "/", Some("alice"), VhostKind::Http)
@@ -1400,6 +1452,60 @@ mod tests {
                 .0
                 .proxy_name,
             "anon"
+        );
+    }
+
+    /// ★★ v0.5.6 回归（审计总报告 M1）：**跨租户**不得靠 `route_by_http_user`
+    /// 在同一个域名 + 路径上寄生。
+    ///
+    /// 修复前 `same_scope` 只比字符串 ⇒ 攻击者填一个**不同的作用域值**
+    /// 就能跳过冲突检查、注册成功且无告警；之后**带该用户名的 Basic 凭据**
+    /// 的访客请求会被 `lookup` 第 1 轮命中攻击者的路由，流量与凭据一起被收割。
+    #[test]
+    fn 跨租户不得靠_route_by_http_user_寄生() {
+        let t = VhostTable::default();
+        let victim = dummy_client("victim-run");
+        let attacker = dummy_client("attacker-run");
+
+        // 受害者：兜底路由（未配 routeByHTTPUser）
+        t.register(route_of(&victim, "victim-web", "web.test", &["/"]))
+            .expect("受害者注册");
+
+        // 攻击者：同样的域名 + 路径，但带一个**不同的**作用域值
+        let mut evil = route_of(&attacker, "evil-web", "web.test", &["/"]);
+        Arc::get_mut(&mut evil).unwrap().route_by_http_user = "alice".to_string();
+        let e = t
+            .register(evil)
+            .expect_err("跨租户 + 不同作用域也必须冲突（M1）");
+        assert!(e.to_string().contains("已被代理"), "{e}");
+
+        // 关键断言：带 alice 凭据的请求仍然打到**受害者**那里，没被寄生
+        assert_eq!(
+            t.lookup("web.test", "/", Some("alice"), VhostKind::Http)
+                .unwrap()
+                .0
+                .proxy_name,
+            "victim-web",
+            "攻击者没能入表，带凭据的请求必须仍归受害者"
+        );
+    }
+
+    /// 跨租户 + **相同**作用域同样冲突（原有保护，防回退）。
+    ///
+    /// ★ 这一条专门盯着审计报告给的那个**错误修法**：它建议把
+    ///   `same_scope` 改成 `same_owner && (作用域相等)`，那会让跨租户同作用域
+    ///   从"冲突"变成"共存" —— **新开一个洞**。
+    #[test]
+    fn 跨租户同作用域必须冲突() {
+        let t = VhostTable::default();
+        let a = dummy_client("a-run");
+        let b = dummy_client("b-run");
+        t.register(route_of(&a, "a-web", "web.test", &["/"]))
+            .expect("先注册");
+        assert!(
+            t.register(route_of(&b, "b-web", "web.test", &["/"]))
+                .is_err(),
+            "跨租户 + 同作用域 + 同路径必须冲突"
         );
     }
 
@@ -2300,10 +2406,15 @@ mod tests {
     /// 官方 tcpmux 的 "Route by HTTP user" 用例就是这个拓扑：同一个域名上挂
     /// `user1` / `user2` 两条精确路由 + 一条兜底路由。早先 `lookup` 只按
     /// "最长前缀、平手取先注册" 选，兜底路由只要先注册就会把两条精确路由全吃掉。
+    ///
+    /// ★ v0.5.6（审计总报告 M1）：三条路由必须同属**一个客户端** ——
+    ///   跨租户的多作用域现在一律算冲突（服务端分辨不出合法多作用域与寄生劫持）。
     #[test]
     fn tcpmux_兜底路由不能盖掉精确用户名路由() {
+        let me = dummy_client("me");
         let mk = |name: &str, user: &str| {
-            let mut r = route(name, "normal.example.com", &[""], VhostKind::TcpMux);
+            let mut r = route_of(&me, name, "normal.example.com", &[""]);
+            Arc::get_mut(&mut r).unwrap().kind = VhostKind::TcpMux;
             Arc::get_mut(&mut r).unwrap().route_by_http_user = user.to_string();
             r
         };
