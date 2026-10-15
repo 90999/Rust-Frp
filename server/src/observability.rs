@@ -207,6 +207,31 @@ fn push(out: &mut String, ns: &str, name: &str, help: &str, kind: &str, value: i
     out.push_str("\n\n");
 }
 
+/// `u64` 计数器 → Prometheus 用的 `i64`（v0.5.6 修审计总报告 L15，低危）。
+///
+/// # 为什么不能直接 `as i64`
+///
+/// Rust 的 `as` 在溢出时**回绕**：`u64::MAX as i64 == -1`。
+/// 于是一个累加到超过 `i64::MAX`（约 9.22 × 10¹⁸）的计数器会突然变成负数。
+///
+/// # 为什么这值得修（尽管触发门槛极高）
+///
+/// Prometheus 对 `counter` 类型有硬性语义：**只能单调递增**，回绕会被
+/// 判定为计数器重置（`rate()` / `increase()` 会算出离谱的值）。
+/// 尤其 `bytes_up_total` / `bytes_down_total` 是业务量指标 ——
+/// 在极高吞吐的部署上（8 EB 流量）真的可能摸到那条线，
+/// 而一旦摸到，**所有基于它的告警与容量规划同时失真**。
+///
+/// ★ 报告把这条定为"纯理论"（需 8 EB 才触发），这个判断是对的；
+///   但修它的成本是**一行 `saturating`**，而收益是"这个指标永远不会撒谎"。
+///   饱和到 `i64::MAX` 至少保持单调，Prometheus 不会误判重置。
+///
+/// ★ 用的是**饱和**而不是"报错/丢弃"：监控指标不该因为极端值而整个消失 ——
+///   那会让运维在最需要数据的时候失去数据。
+fn to_metric_u64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 /// 把快照编码成 Prometheus exposition format。
 ///
 /// `namespace` 为空时不加前缀（测试与实践里都更方便拼）。
@@ -222,73 +247,77 @@ pub fn encode_prometheus(snap: &Snapshot, namespace: &str) -> String {
         (
             "clients_total",
             "历史累计登录的客户端数",
-            snap.clients_total as i64,
+            to_metric_u64(snap.clients_total),
         ),
         (
             "clients_rejected",
             "被拒绝的客户端连接数",
-            snap.clients_rejected as i64,
+            to_metric_u64(snap.clients_rejected),
         ),
         (
             "proxies_total",
             "历史累计注册的代理数",
-            snap.proxies_total as i64,
+            to_metric_u64(snap.proxies_total),
         ),
         (
             "proxy_failures",
             "注册失败的代理数",
-            snap.proxy_failures as i64,
+            to_metric_u64(snap.proxy_failures),
         ),
         (
             "conns_total",
             "历史累计的转发连接数",
-            snap.conns_total as i64,
+            to_metric_u64(snap.conns_total),
         ),
         (
             "conns_rejected",
             "因资源上限被拒的转发连接数",
-            snap.conns_rejected as i64,
+            to_metric_u64(snap.conns_rejected),
         ),
-        ("bytes_up_total", "上行的累计字节数", snap.bytes_up as i64),
+        (
+            "bytes_up_total",
+            "上行的累计字节数",
+            to_metric_u64(snap.bytes_up),
+        ),
         (
             "bytes_down_total",
             "下行的累计字节数",
-            snap.bytes_down as i64,
+            to_metric_u64(snap.bytes_down),
         ),
         (
             "http_requests_total",
             "处理的 HTTP 请求数",
-            snap.http_requests as i64,
+            to_metric_u64(snap.http_requests),
         ),
         (
             "https_conns_total",
             "处理的 HTTPS 透传连接数",
-            snap.https_conns as i64,
+            to_metric_u64(snap.https_conns),
         ),
         (
             "tcpmux_conns_total",
             "处理的 tcpmux CONNECT 隧道数",
-            snap.tcpmux_conns as i64,
+            to_metric_u64(snap.tcpmux_conns),
         ),
         (
             "visitor_conns_total",
             "visitor 接入次数",
-            snap.visitor_conns as i64,
+            to_metric_u64(snap.visitor_conns),
         ),
         (
             "visitor_rejected_total",
             "被拒绝的 visitor 接入次数",
-            snap.visitor_rejected as i64,
+            to_metric_u64(snap.visitor_rejected),
         ),
         (
             "p2p_success_total",
             "xtcp 打洞成功次数",
-            snap.p2p_success as i64,
+            to_metric_u64(snap.p2p_success),
         ),
         (
             "p2p_failed_total",
             "xtcp 打洞失败并回退的次数",
-            snap.p2p_failed as i64,
+            to_metric_u64(snap.p2p_failed),
         ),
     ];
     for (name, help, v) in counters {
@@ -302,7 +331,7 @@ pub fn encode_prometheus(snap: &Snapshot, namespace: &str) -> String {
         (
             "uptime_seconds",
             "服务端已运行的秒数",
-            snap.uptime_secs as i64,
+            to_metric_u64(snap.uptime_secs),
         ),
     ];
     for (name, help, v) in gauges {
@@ -428,5 +457,54 @@ mod tests {
         let m2 = reg.metrics();
         m2.bytes_down.inc();
         assert_eq!(reg.metrics().bytes_down.get(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 L15）：u64 → i64 不得回绕成负数
+    // ------------------------------------------------------------------
+
+    /// ★★ L15：越界的 `u64` 计数器必须**饱和**到 `i64::MAX`，绝不能变成负数。
+    ///
+    /// 直接 `as i64` 会回绕（`u64::MAX as i64 == -1`）。Prometheus 的
+    /// `counter` 语义要求**单调递增**，一个突然变负的计数器会被判定为
+    /// "计数器重置"，`rate()` / `increase()` 随即算出离谱的值 ——
+    /// **基于它的告警与容量规划同时失真**。
+    #[test]
+    fn 越界计数器必须饱和不得回绕() {
+        assert_eq!(to_metric_u64(0), 0);
+        assert_eq!(to_metric_u64(1024), 1024);
+        assert_eq!(to_metric_u64(i64::MAX as u64), i64::MAX);
+
+        // ★ 关键：越界后必须仍是**正**的
+        for v in [i64::MAX as u64 + 1, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            let got = to_metric_u64(v);
+            assert!(got > 0, "u64 {v} 转换后不得变成非正数（回绕），实际 {got}");
+            assert_eq!(got, i64::MAX, "越界一律饱和到 i64::MAX");
+        }
+    }
+
+    /// 导出出来的文本里，计数器不得出现负号。
+    #[test]
+    fn 导出的计数器不含负值() {
+        let snap = Snapshot {
+            bytes_up: u64::MAX, // 极端值
+            clients_total: u64::MAX,
+            ..Default::default()
+        };
+        let s = encode_prometheus(&snap, "nfrp");
+
+        for line in s.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let Some((name, val)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            if name.ends_with("_total") {
+                let n: i64 = val.parse().unwrap_or_else(|_| panic!("{line} 不是整数"));
+                assert!(n >= 0, "{name} 导出了负值 {n}（u64 回绕，L15）：{line}");
+            }
+        }
+        assert!(s.contains("9223372036854775807"), "应饱和到 i64::MAX");
     }
 }
