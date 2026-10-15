@@ -229,7 +229,31 @@ impl Store {
             o.write(true).create_new(true).mode(0o600);
             o
         };
-        #[cfg(not(unix))]
+        // ★★ v0.5.6 修（审计总报告 M12，中危）：**Windows 也要收紧权限**。
+        //
+        // 原先 Windows 分支只是 `create_new`，注释说"靠父目录 ACL"——
+        // 这个假设**不成立**：文件默认继承父目录的继承 ACE，而用户目录
+        // （`C:\Users\X`）的 ACL 里含 `Users`（所有本地用户）与
+        // `Authenticated Users`。⇒ 同机**任何其他用户**都能读走这份
+        // `secret_key` / 插件密码 / `http_pwd`。
+        //
+        // 修法：建好文件后用 `icacls` 把继承**断开**，只留当前用户
+        // （`/inheritance:r` 清掉继承来的 ACE，`/grant:r` 只授当前用户）。
+        //
+        // ★ 为什么用 `icacls` 而不是 `SetSecurityInfo`：后者要引
+        //   `windows-sys` 并手写 ACL 结构（几十行 unsafe），而 `icacls`
+        //   是每台 Windows 都有的系统命令、语义明确、失败可见。
+        //   这里是**低频**操作（只在 store 变化时落盘），起进程的开销可忽略。
+        //
+        // ★ 失败处理：**不让它阻断落盘**，但要 warn —— 落盘本身是功能，
+        //   权限收紧是加固；因为加固失败就丢掉用户的动态代理更糟。
+        #[cfg(windows)]
+        let opt = {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            o
+        };
+        #[cfg(all(not(unix), not(windows)))]
         let opt = {
             let mut o = std::fs::OpenOptions::new();
             o.write(true).create_new(true);
@@ -243,6 +267,41 @@ impl Store {
             f.write_all(&body)
                 .with_context(|| format!("写临时文件 {} 失败", tmp.display()))?;
             f.sync_all().ok();
+        }
+
+        // ★ v0.5.6（M12）：Windows 上断开继承、只留当前用户。
+        #[cfg(windows)]
+        {
+            let user = std::env::var("USERNAME").unwrap_or_default();
+            if user.is_empty() {
+                warn!(
+                    path = %tmp.display(),
+                    "拿不到 USERNAME，无法收紧 store 文件权限 —— \
+                     同机其他用户可能读到其中的 secret_key，请手工检查该文件 ACL"
+                );
+            } else {
+                match std::process::Command::new("icacls")
+                    .arg(&tmp)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(format!("{user}:F"))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        debug!(path = %tmp.display(), %user, "store 文件权限已收紧为仅当前用户");
+                    }
+                    Ok(s) => warn!(
+                        path = %tmp.display(), code = ?s.code(),
+                        "icacls 收紧 store 权限失败（非致命）—— 同机其他用户可能读到 secret_key"
+                    ),
+                    Err(e) => warn!(
+                        path = %tmp.display(), error = %e,
+                        "无法执行 icacls 收紧 store 权限（非致命）—— 请手工检查该文件 ACL"
+                    ),
+                }
+            }
         }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("把 {} 改名为 {} 失败", tmp.display(), path.display()))?;
