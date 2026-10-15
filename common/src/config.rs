@@ -556,6 +556,33 @@ pub struct ServerConfig {
     /// 无意的误配置（把空 token 部署到公网），又保留了知情选择。
     #[serde(default)]
     pub allow_insecure_no_auth: bool,
+    /// 登录时间戳允许的偏差（秒），v0.5.6 修审计总报告 M3。
+    ///
+    /// # 为什么需要
+    ///
+    /// v1 的登录凭证是 `md5(token + timestamp)`，而服务端原先**只用报文自报的
+    /// timestamp 重算比对、不做新鲜性校验**；同时 `Login` 在加密建立**之前**
+    /// 明文发送（官方时序）。
+    ///
+    /// ⇒ 同链路嗅探到一条 `Login` 就能**原样重放**拿到完整会话（无期限）。
+    ///
+    /// # 为什么加它不破坏互通
+    ///
+    /// 官方 frpc 的 `Login.Timestamp` 就是发报文时的 unix 时间，
+    /// 宽窗口下**零感知**。这**不改任何线协议格式** ——
+    /// "协议格式不能改" ≠ "安全语义不能加强"。
+    ///
+    /// # 取值
+    ///
+    /// * **默认 300 秒**：容纳常见时钟漂移与网络延迟，同时把重放窗口
+    ///   从"永久"压到 5 分钟。
+    /// * **0 = 关闭校验**：给时钟严重不准的嵌入式设备留的逃生开关
+    ///   （关闭会在启动日志里告警）。
+    ///
+    /// ★ 与官方 frp 的默认值不同：官方**完全不校验**。对需要与
+    ///   时钟严重不准的官方客户端互通的场景，把它设为 0 即可。
+    #[serde(default = "default_max_clock_skew")]
+    pub max_clock_skew_secs: u64,
     /// 是否监听配置文件变化并自动重载可动态生效的字段。
     #[serde(default)]
     pub hot_reload: bool,
@@ -738,6 +765,154 @@ impl ServerConfig {
     }
 }
 
+/// **唯一判据**：这对面板 / 管理界面凭据能不能用来鉴权（v0.5.6 修审计总报告 H1）。
+///
+/// # 为什么必须是"用户名与密码都非空"
+///
+/// 两处鉴权都是把用户名和密码**拼成 `"user:pwd"`** 再与 HTTP Basic 头比较
+/// （`server/src/dashboard.rs` 与 `client/src/web.rs`）。于是密码为空时期望值
+/// 就是 `"admin:"` —— 攻击者随手可构造。
+/// **空密码不是弱密码，是"没有密码"**：鉴权退化成"知道用户名就能进"，
+/// 而用户名往往是默认的 `admin`。
+///
+/// # 为什么必须抽成唯一真源
+///
+/// 这个判定原先在**四处各写了一遍**，每处都只判了用户名：
+///
+/// | 位置 | 用途 |
+/// |---|---|
+/// | `server/src/reload.rs` 的热重载闸门 | 拒绝"运行期清空凭据" |
+/// | `server/src/reload.rs` 的 `dashboard_is_exposed` | 暴露判定 |
+/// | `server/src/main.rs` 的启动校验 | 拒绝启动 |
+/// | `client/src/main.rs` 的 `check_web_server_is_safe` | 客户端界面拒绝启动 |
+///
+/// 四处都漏了密码，于是存在一条**不需要任何配置疏漏**的攻击链：
+/// 攻击者热重载时**只清空密码**（用户名保持 `admin`），
+/// 闸门判 `"admin".is_empty()` 为 false ⇒ 不拦 ⇒ `auth` 被写成 `("admin", "")`
+/// ⇒ 匿名者用 `admin:` 即可进面板拿到全部写权限。
+///
+/// ⇒ 判定散在多处就一定会漂移 —— 这正是本项目反复出现的那个模式
+///   （"防线写对了，但没有铺满它声称保护的所有字段 / 路径"）。
+///
+/// # 只 trim 用户名，不 trim 密码
+///
+/// 密码里的空格是**合法字符**（`dashboard_pwd = " a "` 是三个字符的密码），
+/// 把它 trim 掉会让用户配的密码与期望值对不上。用户名则惯例允许两侧空白。
+pub fn has_dashboard_creds(user: &str, pwd: &str) -> bool {
+    !user.trim().is_empty() && !pwd.is_empty()
+}
+
+#[cfg(test)]
+mod has_no_auth_tests {
+    use super::*;
+    use crate::security::ServerAuthConfig;
+
+    /// ★★ M6 + L11 回归：**纯 OIDC 部署不得被判为"没有认证"**。
+    ///
+    /// 这两条是同一个根因的两个表现（审计报告分列在 M6 与 L11）：
+    /// * M6：`main.rs` 用裸 `cfg.token`，与 `guard.rs` 的 `effective_auth()` 两套口径；
+    /// * L11：结果是纯 OIDC 部署被打出"未配置 token —— 任何人都能连上来"，
+    ///   而**事实完全相反**。报告还点出一个二级危害：这个假告警会诱导用户
+    ///   加 `allow_insecure_no_auth = true` 去"消掉它" —— 那**真的**把认证关了。
+    #[test]
+    fn 纯_oidc_部署不算没有认证() {
+        use crate::security::AuthMethod;
+
+        // 纯 OIDC：method=oidc、无 token ⇒ **有认证**，不该告警
+        let c = ServerConfig {
+            auth: ServerAuthConfig {
+                method: AuthMethod::Oidc,
+                ..Default::default()
+            },
+            token: String::new(),
+            ..Default::default()
+        };
+        assert!(
+            !c.has_no_auth(),
+            "OIDC 模式没有 token 是**正常配置**，不得判为无认证"
+        );
+
+        // token 模式 + 无 token ⇒ 真的没有认证
+        let c = ServerConfig {
+            auth: ServerAuthConfig {
+                method: AuthMethod::Token,
+                ..Default::default()
+            },
+            token: String::new(),
+            ..Default::default()
+        };
+        assert!(c.has_no_auth(), "token 模式无 token ⇒ 确实没有认证");
+
+        // token 模式 + 有 token ⇒ 有认证
+        let c = ServerConfig {
+            auth: ServerAuthConfig {
+                method: AuthMethod::Token,
+                ..Default::default()
+            },
+            token: "s3cret".into(),
+            ..Default::default()
+        };
+        assert!(!c.has_no_auth());
+    }
+
+    /// `effective_auth()` 的**字段合并**语义必须被继承：
+    /// `[auth] token` 为空时回落到顶层 `token`。
+    ///
+    /// ★ 这正是不能直接读 `self.token` 的原因 —— 只看顶层会把
+    /// `[auth] token = "x"` 这种写法误判成"没有认证"。
+    #[test]
+    fn 判据必须走_effective_auth_的字段合并() {
+        use crate::security::AuthMethod;
+
+        // 凭据写在 [auth] 段里、顶层为空 ⇒ 仍然是"有认证"
+        let c = ServerConfig {
+            auth: ServerAuthConfig {
+                method: AuthMethod::Token,
+                token: "from-auth-section".into(),
+                ..Default::default()
+            },
+            token: String::new(),
+            ..Default::default()
+        };
+        assert!(
+            !c.has_no_auth(),
+            "顶层 token 为空但 [auth] token 有值 ⇒ 有认证（合并语义）"
+        );
+    }
+}
+
+impl ServerConfig {
+    /// **唯一判据**：本服务端是不是处于"**没有任何认证**"的状态
+    /// （v0.5.6 修审计总报告 M6）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// "有没有配置认证"这件事原先在**两处用了两套口径**：
+    ///
+    /// | 位置 | 口径 |
+    /// |---|---|
+    /// | `server/src/guard.rs` 的启动告警 | `auth.method() == Token && effective_auth().token.is_empty()` |
+    /// | `server/src/main.rs` 的启动告警 | `cfg.token.is_empty()` —— **只看顶层字段，且不看 method** |
+    ///
+    /// 后者的后果：**纯 OIDC 部署**（`[auth] method = "oidc"` + `issuer`，
+    /// **不配 token —— 这是完全正确的配置**）下 `cfg.token` 为空 ⇒
+    /// 进入分支 ⇒ 打出"未配置 token 且正在监听对外地址 —— **任何人**都能
+    /// 连上来注册代理、申请公网端口"。
+    ///
+    /// **而事实是 OIDC 认证已正确启用。告警与事实完全相反。**
+    ///
+    /// 二级危害是这类"狼来了"告警会训练管理员忽略同类告警，
+    /// 或者为了"消掉告警"随手塞一个多余 token —— 后者会**改变认证语义**。
+    ///
+    /// ★ `effective_auth()` 会做字段合并（`[auth] token` 为空时回落到顶层
+    ///   `token`），所以判据必须用它，而不是直接读 `self.token`。
+    /// ★ 必须同时判 `method`：OIDC 模式下没有 token 是**正常**的。
+    pub fn has_no_auth(&self) -> bool {
+        let eff = self.effective_auth();
+        eff.method == crate::security::AuthMethod::Token && eff.token.is_empty()
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -779,6 +954,8 @@ impl Default for ServerConfig {
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
             allow_insecure_no_auth: false,
+            // v0.5.6（M3）：默认 ±300 秒的登录时间戳窗口（0 = 关闭）
+            max_clock_skew_secs: default_max_clock_skew(),
             hot_reload: false,
             auth: Default::default(),
             acl: Default::default(),
@@ -1175,7 +1352,28 @@ pub struct VisitorConfig {
     #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
     /// 本地监听地址。
-    #[serde(default = "default_bind_addr")]
+    ///
+    /// ★★ v0.5.6 修（审计总报告 L1，低危）：默认值改为 **`127.0.0.1`**。
+    ///
+    /// 原先这里复用了服务端的 `DEFAULT_BIND_ADDR`（`"0.0.0.0"`），
+    /// 于是同一份配置出现**三个口径、两个答案**：
+    ///
+    /// | 来源 | 默认 `bind_addr` |
+    /// |---|---|
+    /// | TOML 解析路径（本行，原样） | **`0.0.0.0`** |
+    /// | INI 解析路径（`frp_legacy.rs`，有锁定测试） | `127.0.0.1` |
+    /// | 官方示例配置里写的 | `127.0.0.1` |
+    ///
+    /// **根因**是复用了一个语义不同的常量：服务端的 `0.0.0.0` 是
+    /// "对外提供服务"（正确），而 visitor 的监听口是**本机入口**，
+    /// 默认对外没有任何理由。
+    ///
+    /// 为什么是 Low：`VisitorConfig` 强制要求 `secret_key`，且每条连接
+    /// 都要过服务端签名校验 ⇒ 未持密钥者用不了这条隧道。
+    /// 残余风险是"不必要地暴露端口 + 可被指纹识别 + DoS 面"。
+    ///
+    /// ★ 与 INI 路径对齐后，"TOML 不写 bind_addr"与"INI 不写"行为一致。
+    #[serde(default = "default_visitor_bind_addr")]
     pub bind_addr: String,
     /// 本地监听端口。
     ///
@@ -1197,7 +1395,10 @@ impl Default for VisitorConfig {
             server_name: String::new(),
             server_user: String::new(),
             secret_key: String::new(),
-            bind_addr: default_bind_addr(),
+            // ★ v0.5.6（L1）：与 serde 的 `#[serde(default)]` 保持一致 ——
+            //   两处都必须用 visitor 专用的默认值，否则"不写 bind_addr"
+            //   在 `Default::default()` 与反序列化两条路径下会得到不同结果。
+            bind_addr: default_visitor_bind_addr(),
             bind_port: 0,
         }
     }
@@ -1305,6 +1506,34 @@ pub struct ClientConfig {
     /// TLS 的 SNI / 证书校验用的主机名，留空则用 `server_addr`。
     #[serde(default)]
     pub tls_server_name: String,
+
+    /// 是否**校验服务端证书**（v0.5.6 修审计总报告 L16，低危）。
+    ///
+    /// 默认 **false** —— 与官方 frp 一致（`InsecureSkipVerify = true`），
+    /// 改默认会破坏"官方 frpc 零配置直连"这条承诺。
+    ///
+    /// # 为什么提供这个开关
+    ///
+    /// 原先的问题不是"默认不安全"，而是**用户没有选择**：想校验也做不到。
+    /// 同仓库的 `httpc`（OIDC 那边）默认就是校验的 —— 两套默认，
+    /// 而其中最需要保护的那条（控制通道）反而无法切换。
+    ///
+    /// # 开启后要注意
+    ///
+    /// * 服务端用**公开 CA 签发的证书** ⇒ 直接可用；
+    /// * 服务端用**自签证书** ⇒ 必须同时把该证书填进 `trustedCaFile`，
+    ///   并让 `tlsServerName` 能对上证书里的名字；
+    /// * **官方 frpc 不受影响**（它自己那个 `tls.enable` 不带这个字段）——
+    ///   但反过来，你开了校验之后，**官方客户端连不上你的服务端**时
+    ///   那不是 bug，是它不提供证书。
+    #[serde(default, rename = "verifyServerCert")]
+    pub tls_verify_server_cert: bool,
+
+    /// 额外信任的 CA（PEM 路径），配合 `verifyServerCert = true` 用。
+    ///
+    /// 与官方 frp 的 `transport.tls.trustedCaFile` 同名同义。
+    #[serde(default, rename = "trustedCaFile")]
+    pub tls_trusted_ca_file: String,
 
     /// 是否在 TLS 握手前发送 frp 自定义首字节 `0x17`
     /// （对应 frp `transport.tls.disableCustomTLSFirstByte`，这里语义相反）。
@@ -1450,6 +1679,10 @@ impl Default for ClientConfig {
             tcp_mux: true,
             tls_enable: false,
             tls_server_name: String::new(),
+            // ★ v0.5.6（L16）：默认**不校验**（与官方 frp 一致，保互通）；
+            //   想要校验的用户显式开 verifyServerCert。
+            tls_verify_server_cert: false,
+            tls_trusted_ca_file: String::new(),
             tls_custom_first_byte: true,
             log_level: default_log_level(),
             log_to: String::new(),
@@ -1806,6 +2039,26 @@ fn default_health_interval() -> u64 {
 fn default_bind_addr() -> String {
     DEFAULT_BIND_ADDR.to_string()
 }
+
+/// visitor 本地监听口的默认绑定地址（v0.5.6 修审计总报告 L1）。
+///
+/// 与**服务端**的 [`DEFAULT_BIND_ADDR`]（`0.0.0.0`）刻意不同：
+/// 服务端是"对外提供服务"，默认全网卡有道理；而 visitor 的监听口是
+/// **本机入口**，默认对外没有必要。
+///
+/// 这个值同时与 INI 解析路径（`frp_legacy.rs`）和官方示例配置保持一致 ——
+/// 在此之前 TOML 路径用的是 `0.0.0.0`，导致同一份配置在两个解析路径下
+/// 得到不同的监听范围。
+fn default_visitor_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// 登录时间戳默认允许的偏差（秒），v0.5.6 修审计总报告 M3。
+/// 300 秒足够容纳常见的时钟漂移与网络延迟，同时把"录下一条 Login 报文
+/// 就能无限期重放"压到 5 分钟窗口。官方 frpc 发的是当前时间，**零感知**。
+fn default_max_clock_skew() -> u64 {
+    300
+}
 fn default_control_port() -> u16 {
     DEFAULT_CONTROL_PORT
 }
@@ -1918,7 +2171,35 @@ pub fn parse_server(raw: &str) -> Result<ServerConfig> {
 const SUPPORTED_PROXY_TYPES: &[&str] = &[
     "tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp",
 ];
-const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp", "sudp"];
+/// 访客类代理的类型清单（**唯一真源** —— 判定请用 [`is_visitor_type`]）。
+pub const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp", "sudp"];
+
+/// **唯一真源**：这个代理类型是不是"访客类"（v0.5.6 修审计总报告 H3）。
+///
+/// # 为什么必须抽出来
+///
+/// `sudp` 与 `stcp` 走**同一条 visitor 注册路径**，项目在**三处**都把它
+/// 归为访客类：
+///
+/// | 位置 | 定义 |
+/// |---|---|
+/// | 本文件的 [`SUPPORTED_VISITOR_TYPES`] | `["stcp","xtcp","sudp"]` |
+/// | `frp_legacy.rs` 的 `LEGACY_VISITOR_TYPES` | `["stcp","xtcp","sudp"]` |
+/// | `server/src/serve.rs` 的注册分派 | `"sudp" => register_visitor_proxy(...)` |
+///
+/// 但 RBAC 的 `allowVisitors` 判定**就地硬编码了 `"stcp" | "xtcp"`、漏了 `sudp`**
+/// ⇒ 管理员配 `allowVisitors = false` 之后，攻击者把 `type` 换成 `"sudp"`
+/// 即可完整绕过该限制。
+///
+/// 而且危害被放大：`sudp` **不占公网端口**，因此不受 `allowPorts` /
+/// `portRange` 约束 ⇒ `allowVisitors` 是管理员**唯一**能关掉它的开关。
+///
+/// ⇒ 与 `has_dashboard_creds` 同理：**同一判定各写一遍，就一定会漂移**。
+///   凡是"某类型属不属于某集合"的判断，一律走这里。
+pub fn is_visitor_type(ty: &str) -> bool {
+    let t = ty.trim().to_ascii_lowercase();
+    SUPPORTED_VISITOR_TYPES.iter().any(|v| *v == t)
+}
 
 /// 官方 frp 的客户端插件类型全集（`pkg/config/v1/plugin.go` 的 `UnmarshalJSON` 分支）。
 ///
@@ -2157,6 +2438,22 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
         //   "连哪里"，`plugin` 是"变成什么"。
         //
         // ★ 沿用 H4 的教训：**用允许清单，不继续扩黑名单**（黑名单必然漏下一个字段）。
+        //
+        // ★★ v0.5.6 修（审计总报告 L6，低危）：**补上 `plugin_request_headers`**。
+        //
+        // 上面这段注释写着"用允许清单、不继续扩黑名单"，但代码实际是一个
+        // **5 字段枚举** —— 恰好漏了 `plugin_request_headers`
+        // （一个 `BTreeMap<String,String>`，可注入任意请求头 + CRLF）。
+        //
+        // ★ 与"注释声称用允许清单、实际是枚举"这个不符同时出现 ——
+        //   审计报告把"注释与实现不符"列为**高效漏洞信号源**，这里正是一例。
+        //
+        // ★ 可利用性：`http_relay.rs` 的 `strip_crlf` 对键和值都做了过滤
+        //   （注释也点明了该字段远程可控），所以**不能注入 CRLF**；
+        //   残余能力是"给内网服务加任意请求头"（如 `X-Forwarded-For` 伪造、
+        //   绕过后端的 IP 白名单）。危害低于 F1，故定 Low —— 但它
+        //   **仍然属于"服务端不该能远程改变客户端行为"**的同一类，
+        //   且既然这段代码的意图是"一律拒绝插件相关字段"，漏一个就是漏。
         let mut caps: Vec<&str> = Vec::new();
         if !p.plugin.trim().is_empty() {
             caps.push("plugin");
@@ -2172,6 +2469,10 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
         }
         if !p.plugin_strip_prefix.trim().is_empty() {
             caps.push("pluginStripPrefix");
+        }
+        // ★ v0.5.6（L6）：这一项原先漏了
+        if !p.plugin_request_headers.is_empty() {
+            caps.push("pluginRequestHeaders");
         }
         if !caps.is_empty() {
             return Err(crate::error::Error::Protocol(format!(
