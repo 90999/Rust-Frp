@@ -472,7 +472,43 @@ async fn serve_conn(
         }
     };
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PEER_QUEUE);
-    let joined = match hub.join(&reg.client, want, tx) {
+    // ★★ v0.5.6 修（审计总报告 L12，低危）：**身份键不再用客户端自报的字符串**。
+    //
+    // # 问题
+    //
+    // `reg.client` 是**客户端自报**的任意非空字符串（上面只查了非空），
+    // 而它被当作 `Hub` 的**唯一身份键**：
+    //
+    // * `Hub::join` 的第一件事就是 —— 如果这个键已存在，
+    //   **先把旧的踢掉**（`leave_locked`，注释写着"同一个 client_id 重连"）；
+    // * 它同时是 IP 池的 `claim` / `acquire` 的键、`routes` 的键、`sinks` 的键。
+    //
+    // ⇒ 攻击者只要用**别人的 client 名**注册，就能：
+    //   ① 把对方**踢下线**（其 `sinks` 被移除、路由被撤）；
+    //   ② 顶替对方的虚拟 IP（`routes.register` 会把旧路由顶掉并 warn）。
+    //
+    // # 为什么这仍然是 Low（如实说明，不夸大）
+    //
+    // 上面那道 `sec.verify_login(&reg.token, reg.timestamp, &reg.client)`
+    // **要求通过认证**（token / OIDC）—— 未持凭据者进不来。
+    // 所以这是"**已认证租户之间**可以互相打断"，
+    // 在默认配置（无 RBAC、单一共享 token）下等价于"同一个信任域内的成员互扰"。
+    // 定 Low 合适；但它确实是全仓**唯一**用客户端自报字段当身份键的地方
+    // （其余身份键都绑定了连接身份或服务端生成值）。
+    //
+    // # 修法：会话键 = 服务端生成的随机值，`reg.client` 降级为**显示名**
+    //
+    // 这样"同名"不再等于"同一个身份"：两个客户端可以都叫 `laptop`，
+    // 但它们拿到各自独立的会话键、各自独立的 IP，谁也踢不掉谁。
+    //
+    // ★ 兼容性：`reg.client` 仍然照原样用于**日志与审计**，
+    //   客户端侧看不到任何变化（响应里从来不含这个键）。
+    //   代价是"同名重连时自动顶掉旧连接"这个便利没了 ——
+    //   但那正是漏洞本身，去掉是对的；旧连接会由 `JoinGuard` / 读写超时回收。
+    // ★ 会话键用项目自己的随机 ID 生成器（`OsRng` 支撑，16 字节十六进制）。
+    //   不引新依赖 —— `util::new_run_id()` 就是为这类场景写的。
+    let session_key = format!("{}-{}", reg.client, nfrp_common::util::new_run_id());
+    let joined = match hub.join(&session_key, want, tx) {
         Ok(j) => j,
         Err(e) => {
             let _ = write_resp(&mut stream, &VnetRegisterResp::denied(format!("{e:#}"))).await;
@@ -484,7 +520,7 @@ async fn serve_conn(
     // 无论下面是从正常路径返回还是 panic/取消，都不会漏。
     let _guard = JoinGuard {
         hub: hub.clone(),
-        client: reg.client.clone(),
+        client: session_key.clone(),
     };
 
     let resp = VnetRegisterResp {
@@ -851,5 +887,65 @@ mod tests {
         pkt.extend_from_slice(&[0u8; 8]);
         pkt.extend_from_slice(payload);
         pkt
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 L12）：身份键不得用客户端自报字符串
+    // ------------------------------------------------------------------
+
+    /// ★★ L12：**同名会话必须是两个独立身份**，不能互相踢。
+    ///
+    /// 修复前 `reg.client` 直接当 `Hub` 的身份键，而 `Hub::join` 第一件事
+    /// 就是"这个键已存在 ⇒ 先把旧的踢掉"（那段逻辑本意是处理重连）。
+    /// ⇒ 攻击者用别人的 client 名注册即可把对方**踢下线并顶替其虚拟 IP**。
+    ///
+    /// 这里在 `Hub` 层面锁住不变量：**不同的 key 就是不同的成员**。
+    /// 调用方（`handle_vnet`）负责把 `reg.client` 换成一个服务端生成的
+    /// `session_key`（`reg.client` 只留作显示名）。
+    #[test]
+    fn 同名会话必须是独立身份() {
+        let h = hub();
+        let (tx1, _rx1) = sink();
+        let (tx2, _rx2) = sink();
+
+        // 模拟两个客户端都自报 "laptop"，但会话键不同（服务端生成）
+        let key1 = format!("laptop-{}", nfrp_common::util::new_run_id());
+        let key2 = format!("laptop-{}", nfrp_common::util::new_run_id());
+        assert_ne!(key1, key2, "前置：两个会话键必须不同");
+
+        let j1 = h.join(&key1, None, tx1).expect("第一个加入");
+        let j2 = h.join(&key2, None, tx2).expect("第二个加入");
+
+        assert_ne!(j1.ip, j2.ip, "同名但不同会话 ⇒ 必须拿到不同的 IP");
+        // ★ 关键：第二个加入**不能**把第一个挤掉 —— 两个会话都还在
+        assert_eq!(
+            h.address_of(&key1),
+            Some(j1.ip),
+            "后加入的同名会话不得踢掉先加入者（L12）"
+        );
+        assert_eq!(h.address_of(&key2), Some(j2.ip));
+    }
+
+    /// 反向：**同一个会话键**重连时，仍然要清掉旧登记（原有行为，防回归）。
+    ///
+    /// 这条保证修 L12 时没把"重连自愈"一起弄坏。
+    #[test]
+    fn 同一会话键重连仍然清掉旧登记() {
+        let h = hub();
+        let key = "laptop-same-session";
+        let (tx1, _rx1) = sink();
+        let (tx2, _rx2) = sink();
+
+        let j1 = h.join(key, None, tx1).expect("首次加入");
+        let j2 = h.join(key, None, tx2).expect("重连");
+
+        assert_eq!(j1.ip, j2.ip, "同一会话重连应拿回同一个 IP");
+        assert_eq!(h.address_of(key), Some(j2.ip));
+        // 旧登记必须被清掉：只有一个成员
+        assert_eq!(
+            h.stats().map(|s| s.peers).unwrap_or(0),
+            1,
+            "旧登记必须被清掉，不能留两份"
+        );
     }
 }
