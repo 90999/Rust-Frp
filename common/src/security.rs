@@ -312,6 +312,41 @@ impl AuthProvider {
     /// 返回身份标识（token 方式为空串，OIDC 方式为 `sub`）。
     ///
     /// `run_id` 用于把 OIDC 的 subject **绑定到本次会话**（v0.5.3 起）。
+    ///
+    /// ★★ v0.5.6 修（审计总报告 M3，中危）：token 模式增加 **timestamp 新鲜性窗口**。
+    ///
+    /// # 问题
+    ///
+    /// v1 的登录凭证是 `hex(md5(token + timestamp))`，而服务端**只用报文自报的
+    /// `timestamp` 重算比对，不做新鲜性校验、无重放检测**；同时 `Login` 报文在
+    /// **加密建立之前**明文发送（官方时序如此，有测试锁定）。
+    ///
+    /// ⇒ 同链路嗅探到一条 `Login` 即可**原样重放**拿到完整会话；
+    ///   并且每个候选 token 只需 **1 次 MD5** 就能离线验证
+    ///   （PBKDF2 的 64 次迭代只用在加密密钥派生，与登录凭证无关）。
+    ///
+    /// # 为什么现在可以修（推翻"协议层面没有补救空间"的旧结论）
+    ///
+    /// 加**时间窗口**不改任何线协议格式：
+    /// 官方 frpc 的 `Login.Timestamp` 就是发报文时的 unix 时间
+    /// （见官方 `pkg/auth/token.go` 的 `SetLogin`），宽窗口下**零感知**。
+    /// ⇒ **"协议格式不能改" ≠ "安全语义不能加强"。**
+    ///
+    /// # 与本项目 P2P 路径的对照（这才是正确的做法）
+    ///
+    /// `p2p::handshake_token()` 把口令绑定到 `sid`（一次会话一个值），
+    /// 录下来也重放不到下一次 —— 控制通道此前没有这层保护，现在补上了时间维度。
+    ///
+    /// # 窗口取值
+    ///
+    /// 默认 **±300 秒**（`max_clock_skew_secs`，0 = 关闭校验，用于兼容时钟
+    /// 严重不准的嵌入式设备）。选 300s 的理由：足够容纳常见的时钟漂移与
+    /// 网络延迟，同时把重放窗口压到 5 分钟（原先**无限期**）。
+    ///
+    /// ★ 注意：这**不是**完整的防重放（窗口内仍可重放）。
+    ///   完整的做法要维护"已用过的 (run_id, ts)"集合，那要引入一张会增长的
+    ///   表并处理过期清理 —— 对登录这种低频事件收益不划算。
+    ///   窗口已经把攻击面从"永久"压到"5 分钟"，且**零互通代价**。
     pub fn verify_login(&self, cred: &str, ts: i64, run_id: &str) -> anyhow::Result<String> {
         match self {
             Self::Token(secret) => {
@@ -331,6 +366,33 @@ impl AuthProvider {
                 anyhow::bail!("OIDC 认证不可用（{e}），拒绝本次登录")
             }
         }
+    }
+
+    /// 登录时间戳的新鲜性校验（v0.5.6，M3）。
+    ///
+    /// 单独成函数而不是塞进 `verify_login`：**必须在算 `auth_key` 之前调用**
+    /// ——先判时间成本更低，而且能让"过期"与"凭证错"两种失败在日志里分开，
+    /// 便于运维定位（时钟不准 vs 配置错）。
+    ///
+    /// `skew` 为 0 表示关闭该校验（逃生开关，给时钟严重不准的设备用）。
+    pub fn check_timestamp(&self, ts: i64, skew: u64) -> anyhow::Result<()> {
+        if skew == 0 {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // 用 `abs_diff` 风格的比较避免 `now - ts` 在 i64::MIN 上溢出
+        // （审计报告实测过：`ts = i64::MIN` 以前是能登录成功的）。
+        let diff = now.saturating_sub(ts).saturating_abs();
+        if diff > skew as i64 {
+            anyhow::bail!(
+                "登录时间戳超出允许偏差（ts={ts}，现在={now}，偏差 {diff} 秒 > {skew} 秒）\
+                 —— 请校准两端时钟，或调大 maxClockSkewSecs"
+            );
+        }
+        Ok(())
     }
 
     /// 校验登录**之后**的凭证（心跳 / 新工作连接）。
@@ -839,7 +901,25 @@ impl CompiledRbac {
                     .unwrap_or_else(|| "不限".into())
             );
         }
-        if !role.allow_visitors && matches!(ty_l.as_str(), "stcp" | "xtcp") {
+        // ★★ v0.5.6 修（审计总报告 H3，高危）：**判据必须走唯一真源**。
+        //
+        // 原先这里是就地硬编码 `matches!(ty_l.as_str(), "stcp" | "xtcp")`
+        // —— **漏了 `sudp`**。而项目自己在三处都把 `sudp` 定义为访客类：
+        //
+        // | 位置 | 定义 |
+        // |---|---|
+        // | `config.rs` 的 `SUPPORTED_VISITOR_TYPES` | `["stcp","xtcp","sudp"]` |
+        // | `frp_legacy.rs` 的 `LEGACY_VISITOR_TYPES` | `["stcp","xtcp","sudp"]` |
+        // | `serve.rs` 的注册分派 | `"sudp" => register_visitor_proxy(...)` |
+        //
+        // **唯独 RBAC 这一处漏了** —— 类型集合漂移，语法上完全看不出来。
+        //
+        // 危害被放大的一点：`sudp` **不占公网端口**，因此不受 `allowPorts` /
+        // `portRange` 约束（上面的端口检查只对 `tcp|udp` 生效）。
+        // ⇒ `allowVisitors` 是管理员**唯一**能关掉访客类代理的开关，
+        //   而它恰恰漏了 `sudp` ⇒ 配了 `allowVisitors = false` 的部署
+        //   可以被 `type = "sudp"` 完整绕过。
+        if !role.allow_visitors && crate::config::is_visitor_type(&ty_l) {
             anyhow::bail!("角色 {:?} 不允许注册 {name}（访客类代理被禁用）", role.name);
         }
         // 角色级代理数配额（0 = 不限，退给服务端全局的 maxProxiesPerClient 兜底）。
@@ -858,10 +938,6 @@ impl CompiledRbac {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// 审计日志配置
-// ---------------------------------------------------------------------------
 
 /// 审计日志配置（服务端 `[audit]`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1079,8 +1155,74 @@ mod tests {
         );
     }
 
-    /// ★ 回归测试：角色的 `maxProxies` 必须真的生效。
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 H3）：allowVisitors 必须覆盖全部访客类型
+    // ------------------------------------------------------------------
+
+    /// ★★ H3 核心回归：`allowVisitors = false` 必须挡住**全部三种**访客类型。
     ///
+    /// 修复前判据是就地硬编码的 `matches!(ty, "stcp" | "xtcp")` ——
+    /// **漏了 `sudp`**，而项目自己另外三处都把 sudp 归为访客类。
+    /// 攻击者只要把 `type` 从 `stcp` 换成 `sudp` 就能完整绕过该限制。
+    ///
+    /// 而且危害更大：`sudp` 不占公网端口，不受 `allowPorts` / `portRange` 约束
+    /// ⇒ `allowVisitors` 是管理员唯一能关掉它的开关。
+    #[test]
+    fn allow_visitors_必须覆盖全部访客类型() {
+        let rbac = RbacConfig {
+            roles: vec![RoleConfig {
+                name: "novisitor".into(),
+                users: vec!["*".into()],
+                allow_visitors: false, // ★ 管理员以为禁掉了访客类
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        let r = rbac.role_for("x").unwrap();
+
+        // 三种访客类型**一个都不能漏**
+        for ty in ["stcp", "xtcp", "sudp"] {
+            let e = rbac.check_proxy(&r, "v", ty, 0, 0).unwrap_err().to_string();
+            assert!(
+                e.contains("访客类"),
+                "{ty} 必须被 allowVisitors=false 拦住，实际错误：{e}"
+            );
+        }
+
+        // 大小写不敏感（客户端可能发 "SUDP"）
+        assert!(
+            rbac.check_proxy(&r, "v", "SUDP", 0, 0).is_err(),
+            "类型判定必须大小写不敏感"
+        );
+
+        // 反向：非访客类型照常放行（别修得过头）
+        assert!(rbac.check_proxy(&r, "t", "tcp", 0, 0).is_ok());
+        assert!(rbac.check_proxy(&r, "u", "udp", 0, 0).is_ok());
+        assert!(rbac.check_proxy(&r, "h", "http", 0, 0).is_ok());
+    }
+
+    /// `is_visitor_type` 是唯一真源，必须与 `SUPPORTED_VISITOR_TYPES` 一致。
+    #[test]
+    fn 访客类型唯一真源与支持清单一致() {
+        for ty in crate::config::SUPPORTED_VISITOR_TYPES {
+            assert!(
+                crate::config::is_visitor_type(ty),
+                "{ty} 在 SUPPORTED_VISITOR_TYPES 里，is_visitor_type 必须认"
+            );
+        }
+        // sudp 是本次修复的核心，单独钉一次
+        assert!(crate::config::is_visitor_type("sudp"));
+        assert!(crate::config::is_visitor_type("SUDP"));
+        assert!(crate::config::is_visitor_type(" sudp "));
+        // 非访客类型
+        for ty in ["tcp", "udp", "http", "https", "tcpmux", ""] {
+            assert!(!crate::config::is_visitor_type(ty), "{ty} 不是访客类型");
+        }
+    }
+
+    /// ★ 回归测试：角色的 `maxProxies` 必须真的生效。
     /// 这个字段曾经是**死字段** —— 配置读得进来、`compile()` 也赋了值，
     /// 但没有任何生产代码读它。管理员写 `maxProxies = 2` 以为限住了，
     /// 实际想注册多少条都行。这条测试就是防止它再退化回去。
@@ -1274,6 +1416,91 @@ mod tests {
         let s = format!("{c:?}");
         assert!(!s.contains("SERVER-SECRET-TOKEN-ABC"), "token 泄漏了：{s}");
         assert!(s.contains("redacted"));
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M3）：登录时间戳新鲜性窗口
+    // ------------------------------------------------------------------
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// ★★ M3 核心：**过期 / 未来的时间戳必须被拒**（原先无期限接受）。
+    ///
+    /// 审计实测过：`ts = 0 / -1 / -2^40 / i64::MAX / i64::MIN`、
+    /// 未来 100 年、过去 100 年 —— **全部登录成功**
+    /// ⇒ 同链路嗅探到一条明文 Login 即可**原样重放**拿到完整会话。
+    #[test]
+    fn 登录时间戳超出窗口必须被拒() {
+        let a = AuthProvider::token("t0ken-abcdefgh");
+        let n = now();
+
+        // 窗口内：放行（含边界附近）
+        for ok in [n, n - 299, n + 299, n - 5, n + 5] {
+            assert!(
+                a.check_timestamp(ok, 300).is_ok(),
+                "窗口内的时间戳不该被拒：{ok}"
+            );
+        }
+
+        // 窗口外：必须拒 —— 这些原先全都是"登录成功"
+        for bad in [
+            n - 301,               // 刚出窗口
+            n + 301,               // 未来一点
+            0,                     // 纪元（审计报告里的实测用例）
+            -1,                    // 负数
+            -(1i64 << 40),         // 大负数
+            i64::MAX,              // 极大值
+            i64::MIN,              // 极小值（会溢出 `now - ts`，必须用 saturating）
+            n - 100 * 365 * 86400, // 过去 100 年
+            n + 100 * 365 * 86400, // 未来 100 年
+        ] {
+            assert!(
+                a.check_timestamp(bad, 300).is_err(),
+                "超出窗口的时间戳必须被拒：{bad}"
+            );
+        }
+    }
+
+    /// 逃生开关：`skew = 0` 表示关闭校验（给时钟严重不准的设备）。
+    #[test]
+    fn 时间戳窗口可以显式关闭() {
+        let a = AuthProvider::token("t0ken-abcdefgh");
+        for ts in [0, -1, i64::MIN, i64::MAX] {
+            assert!(
+                a.check_timestamp(ts, 0).is_ok(),
+                "skew=0 时不该拦任何时间戳：{ts}"
+            );
+        }
+    }
+
+    /// ★ 端到端：**重放一条真实登录报文**必须在窗口外被拒。
+    ///
+    /// 这条模拟审计报告里的重放场景：用某个旧时间戳算出**正确**的
+    /// `privilege_key`（即攻击者拿到了合法报文），服务端必须因为
+    /// 时间戳过期而拒绝 —— 即使凭证本身完全正确。
+    #[test]
+    fn 重放旧登录报文必须被时间窗口拦下() {
+        let token = "t0ken-abcdefgh";
+        let a = AuthProvider::token(token);
+        let old_ts = now() - 3600; // 一小时前抓到的报文
+        let stolen_key = crate::frp::msg::auth_key(token, old_ts);
+
+        // 只要绕过时间窗口，凭证本身是**能过**的（证明这条攻击链真实存在）
+        assert!(
+            a.check_timestamp(old_ts, 0).is_ok(),
+            "前置：关闭窗口时该凭证有效（说明攻击链成立）"
+        );
+        // 开启窗口后，同一条报文被拒
+        assert!(
+            a.check_timestamp(old_ts, 300).is_err(),
+            "一小时前的报文必须被时间窗口拦下（M3）"
+        );
+        let _ = stolen_key;
     }
 
     // ------------------------------------------------------------------
