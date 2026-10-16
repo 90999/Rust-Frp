@@ -767,21 +767,27 @@ where
     // `max_clock_skew_secs == 0` 表示关闭（逃生开关，给时钟严重不准的设备）。
     // 官方 frpc 的 `Login.Timestamp` 就是发报文时的 unix 时间，
     // 默认 ±300 秒窗口对它**零感知**。
-    if let Err(e) = auth.check_timestamp(login.timestamp, max_clock_skew_secs) {
-        let _ = conn
-            .send_msg(&FrpMessage::LoginResp(LoginResp {
-                error: e.to_string(),
-                ..Default::default()
-            }))
-            .await;
-        bail!("认证失败：{e}");
-    }
+    //
+    // ★★ v0.5.7（第六轮审计 G-1，高危）：**这一步不再单独调用** ——
+    //   新鲜性校验已经并进 `verify_login` 内部（见那里的长注释）。
+    //
+    //   为什么并进去：原先它是**独立的一步**，于是"想校验凭证就顺手调一下"
+    //   成了调用方的责任，而**另外四条凭证路径全都忘了**（vnet / 工作连接 /
+    //   visitor 签名 / p2p 打洞签名），实测可无限期重放并打通双向 MITM。
+    //   现在 `verify_login` 的 `skew` 是必需参数，**没有"只校验凭证"的入口**。
+    //
+    //   两种失败在日志里仍然分得开（错误文案不同），所以原设计的收益没丢。
 
     // 认证：token 方式比 `md5(secret+ts)`，OIDC 方式验签 access token。
     //
     // 失败时回的文案与官方 frps **逐字一致**（token 方式下），因为第三方
     // 平台的错误提示会拿它做匹配 —— 换了措辞用户会以为是自己配置错了。
-    let subject = match auth.verify_login(&login.privilege_key, login.timestamp, run_id) {
+    let subject = match auth.verify_login(
+        &login.privilege_key,
+        login.timestamp,
+        run_id,
+        max_clock_skew_secs,
+    ) {
         Ok(s) => s,
         Err(e) => {
             // 官方 frps 也是明文回这条错误（此时还没建立加密）
