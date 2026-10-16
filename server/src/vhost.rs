@@ -231,11 +231,39 @@ impl VhostTable {
             let same_scope = existing.route_by_http_user == route.route_by_http_user;
             let cross_owner = !same_owner(existing, &route);
             if !same_proxy && duplicate && (cross_owner || same_scope) {
-                bail!(
-                    "域名 {} 的路径已被代理 {} 占用",
-                    route.domain,
-                    existing.proxy_name
+                // ★★ v0.5.7 修（第六轮审计 D-3，低危）：**文案不再回显占用者的代理名**。
+                //
+                // 原先这里是 `"域名 {} 的路径已被代理 {} 占用"`，把
+                // `existing.proxy_name`（带租户前缀的**线上全名**，
+                // 如 `alice.site`）原样回给了调用方。实测可复现：
+                //
+                // ```json
+                // {"error":"域名 alice-internal.corp.local 的路径已被代理 alice.site 占用"}
+                // ```
+                //
+                // # 为什么这是问题
+                //
+                // 1. **同轮已经修过同类问题**：`registry.rs::reserve_port` 的
+                //    端口冲突文案已被刻意统一成"不含占用者"（见那里的 L14 注释），
+                //    **这条漏了** —— 又一次"防线没铺满"。
+                // 2. 它把**别人的代理名**送出来，而代理名正是 D-4/D-2 那类
+                //    攻击所需的"别家租户的名字"。
+                // 3. 它的可复现性取决于 `detailed_errors_to_client`
+                //    （默认 `true`，与官方一致）—— 但"要不要回显**别人的**名字"
+                //    不该由那个面向**自己配置排查**的通用开关决定。
+                //
+                // # 修法
+                //
+                // 照搬 `registry.rs` 的做法：回一条只承认"冲突"的固定文案，
+                // 细节（域名 + 占用者）走 `debug!` 只进服务端日志。
+                // ★ 注意**保留 route.domain**：它是**调用方自己请求的**域名，
+                //   不是别人的信息，回显它有助于用户排查自己的配置。
+                debug!(
+                    domain = %route.domain,
+                    occupied_by = %existing.proxy_name,
+                    "http 路由冲突（细节仅服务端可见）"
                 );
+                bail!("域名 {} 的路径已被占用（详情见服务端日志）", route.domain);
             }
         }
         // ★ 只清理**自己**的旧路由（同一客户端 + 同名），不再误删别人的。
@@ -1477,7 +1505,14 @@ mod tests {
         let e = t
             .register(evil)
             .expect_err("跨租户 + 不同作用域也必须冲突（M1）");
-        assert!(e.to_string().contains("已被代理"), "{e}");
+        // ★ v0.5.7（第六轮审计 D-3）：文案改为"已被占用"，**不再回显占用者**。
+        //   同时断言它**不泄露**别人的代理名。
+        let msg = e.to_string();
+        assert!(msg.contains("已被占用"), "{msg}");
+        assert!(
+            !msg.contains("victim-web"),
+            "冲突文案不得回显占用者的代理名（D-3）：{msg}"
+        );
 
         // 关键断言：带 alice 凭据的请求仍然打到**受害者**那里，没被寄生
         assert_eq!(
@@ -1592,7 +1627,12 @@ mod tests {
             .register(route_of(&attacker, "victim.web", "web.test", &["/"]))
             .expect_err("跨租户同名同域名必须被拒绝");
         let msg = err.to_string();
-        assert!(msg.contains("已被代理"), "错误要说清冲突：{msg}");
+        // ★ v0.5.7（第六轮审计 D-3）：文案改为"已被占用"，**不再回显占用者**。
+        assert!(msg.contains("已被占用"), "错误要说清冲突：{msg}");
+        assert!(
+            !msg.contains("victim.web"),
+            "冲突文案不得回显占用者的代理名（D-3）：{msg}"
+        );
 
         // ★ 关键断言：域名**仍然**归受害者，没有被顶掉
         let (hit2, _) = t
