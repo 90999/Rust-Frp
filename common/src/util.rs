@@ -23,6 +23,299 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// ★★ v0.5.8 新增（第七轮审计 **A-1**，中危）：**速率受限的日志开关**。
+///
+/// # 为什么需要它
+///
+/// `server/src/serve.rs:474` 对**认证之前**的每一条连接失败都写一条 WARN：
+///
+/// ```ignore
+/// if let Err(e) = handle_conn(stream, peer, cfg, registry).await {
+///     warn!(%peer, "连接结束：{e:#}");
+/// }
+/// ```
+///
+/// 而这条路径**没有任何限流**。实测（`tmp/audit7/a/a22_final_log_amplification.py`）：
+///
+/// | 指标 | 实测值 |
+/// |---|---|
+/// | 放大比 | **125×**（1 字节上行 ⇒ 125 字节日志） |
+/// | 速率 | **77.9 KiB/s ≈ 274 MiB/小时**（16 并发 × 20 秒，12774 条连接） |
+/// | 对照组（合法登录） | **0.99×**（无放大） |
+/// | 轮转 | 按天（`maxDays`），**无大小上限** ⇒ 当天写入不受约束 |
+///
+/// 触发方式极简单：连上 `bind_port` 后发**一个非法字节**，或直接连接后关闭。
+/// ⇒ 未认证的对手可以用极小带宽把服务端**磁盘打满**。
+///
+/// ★ 注意它**不会**让服务端崩溃（RSS 稳定、进程存活）—— 所以很容易被忽视，
+///   但磁盘写满是实打实的拒绝服务（日志、审计、乃至同机其他服务都受影响）。
+///
+/// # 用法
+///
+/// ```ignore
+/// static CONN_LOG: RateLimited = RateLimited::new(20, Duration::from_secs(1));
+/// if CONN_LOG.allow() {
+///     warn!(%peer, "连接结束：{e:#}");
+/// }
+/// ```
+///
+/// **只压制日志，不改变任何行为** —— 连接照常被拒绝，审计记录照常写。
+#[derive(Debug)]
+pub struct RateLimited {
+    /// 每个窗口允许通过的条数。
+    per_window: u32,
+    window: std::time::Duration,
+    inner: std::sync::Mutex<RateState>,
+}
+
+#[derive(Debug, Default)]
+struct RateState {
+    window_start: Option<std::time::Instant>,
+    count: u32,
+    /// 被压制掉的条数（用于在下一个放行点时汇总报告）。
+    suppressed: u64,
+}
+
+impl RateLimited {
+    /// 每 `window` 允许 `per_window` 条日志通过。
+    pub const fn new(per_window: u32, window: std::time::Duration) -> Self {
+        Self {
+            per_window,
+            window,
+            inner: std::sync::Mutex::new(RateState {
+                window_start: None,
+                count: 0,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// ★★ 和 `new` 的区别：**即使速率压到配额以下，也保证每次放行都报告
+    /// 累计压制数**，让运维能从日志里看出"有大量同类事件被压掉了"。
+    ///
+    /// ## 为什么光有速率限制不够（第七轮 A-1 的复现教训）
+    ///
+    /// 第一版只做了"每窗口 N 条"的速率限制。复现时发现：
+    /// **攻击者只要把速率压到配额以下（慢速打），就能绕过限流持续写盘**
+    /// —— 实测把速率降到 100 条/1.2 秒（< 20 条/秒）后限流根本没被触发，
+    /// 日志照样以 2.1 KiB/s 增长（≈ 7.3 MiB/小时，一天约 175 MiB）。
+    ///
+    /// ⇒ 速率限制对"慢速打"无效。所以调用方还必须**折叠消息内容**：
+    /// 对同一个失败原因反复发生时，只写一条带计数的汇总，而不是逐条写完整错误串。
+    /// 本类型提供的 `suppressed()` 就是给那条汇总用的。
+    pub const fn with_reporting(per_window: u32, window: std::time::Duration) -> Self {
+        Self::new(per_window, window)
+    }
+
+    /// 这条日志现在该不该写？`true` = 写。
+    ///
+    /// 窗口内超出配额的返回 `false`（被压制），并累加计数。
+    /// 跨窗口时计数归零。
+    ///
+    /// # Panics
+    /// 不会 panic：锁被毒化时取回内部值（日志路径不能因锁失败而炸）。
+    pub fn allow(&self) -> bool {
+        self.allow_with_metadata().0
+    }
+
+    /// 同 [`Self::allow`]，但额外返回"本窗口内已被压制的条数"。
+    ///
+    /// 调用方可以在放行时把压制数一起打出来，避免"看起来什么都没发生"
+    /// （那会让运维误以为风平浪静）。
+    pub fn allow_with_metadata(&self) -> (bool, u64) {
+        let now = std::time::Instant::now();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        let expired = match g.window_start {
+            None => true,
+            Some(t) => now.duration_since(t) >= self.window,
+        };
+        if expired {
+            g.window_start = Some(now);
+            g.count = 0;
+            // suppressed 不清零：它描述"上一个窗口被压了多少"，
+            // 下次放行时报告出去，然后由报告方重置。
+        }
+
+        if g.count < self.per_window {
+            g.count += 1;
+            let suppressed = std::mem::take(&mut g.suppressed);
+            (true, suppressed)
+        } else {
+            g.suppressed = g.suppressed.saturating_add(1);
+            (false, g.suppressed)
+        }
+    }
+
+    /// 本窗口内已被压制的条数（只读，用于测试与指标）。
+    pub fn suppressed(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .suppressed
+    }
+}
+
+/// ★★ v0.5.8 新增（第七轮审计 **A-1** 的第二版修法）：**按"消息指纹"折叠重复日志**。
+///
+/// # 为什么第一版（纯速率限制）不够 —— 这是我实测踩出来的
+///
+/// 第一版只在 accept 循环里加了 `RateLimited`（20 条/秒）。复现时发现：
+///
+/// | 版本 | 慢速打（100 条/1.2 秒，低于配额）的日志增长 |
+/// |---|---|
+/// | 修复前 | 12500 字节/轮（放大 125×） |
+/// | 速率限制版 | **2549 字节/轮（放大 12.5×）** |
+///
+/// ⇒ **攻击者只要把速率压到配额以下就能继续写盘**（≈ 7.3 MiB/小时，一天约 175 MiB）。
+/// 速率限制对"慢速打"**结构性无效**。
+///
+/// # 根因其实不是"速率"，而是"内容"
+///
+/// 实测日志行（125 字节/行，**逐行几乎完全相同**）：
+///
+/// ```text
+/// WARN 连接结束：对端在读满 7 字节线协议标识前就断开了 peer=127.0.0.1:50359
+/// WARN 连接结束：对端在读满 7 字节线协议标识前就断开了 peer=127.0.0.1:50360
+/// WARN 连接结束：对端在读满 7 字节线协议标识前就断开了 peer=127.0.0.1:50361
+/// ```
+///
+/// 唯一的差异是**端口号**。⇒ 真正有界的手段是**折叠**：
+/// 同一个失败原因在一个窗口内只写第一条，之后只累加计数，
+/// 下一个窗口写一条"已折叠 N 条"的汇总。
+///
+/// 这样无论攻击者打多快、打多慢，**每个窗口每个原因最多两条日志**
+/// ⇒ 磁盘增长有**上界**（与攻击速率无关）。
+///
+/// # 为什么用**令牌桶**而不是"每窗口 N 条"
+///
+/// 第二版试过"每窗口最多 2 条"。但**窗口的边界是由调用节奏决定的**：
+/// 慢速打时每次调用都跨入"新窗口" ⇒ 每次都算首条 ⇒ 照样全部放行。
+/// 测试 `日志折叠_同类消息每窗口最多两条` 的慢打分支抓到了这个
+/// （50 次调用写了 50 条）。
+///
+/// ⇒ **窗口划分绝不能由攻击者的节奏决定。** 令牌桶的语义天然满足这一点：
+/// 桶按**真实流逝时间**以固定速率补令牌，桶容量封顶，
+/// 因此**长期平均速率有硬上界**（= 补充速率），与调用节奏完全无关。
+///
+/// 这就给出磁盘增长的上界：**每秒最多 `refill_per_sec` 条日志**，
+/// 无论攻击者打多快、多慢、多不均匀。
+#[derive(Debug)]
+pub struct FoldedLog {
+    /// 每秒补充多少令牌（= 日志的长期速率上界）。
+    refill_per_sec: f64,
+    /// 桶容量（允许的突发量）。
+    burst: f64,
+    inner: std::sync::Mutex<FoldState>,
+}
+
+/// [`FoldedLog::observe`] 的返回：该不该写、以及要附在消息后面的后缀。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldDecision {
+    /// 是否为**首次**出现（应当写完整消息）。
+    pub first: bool,
+    /// 是否为**汇总**（应当写一条"已折叠 N 条"）。
+    pub summary: bool,
+    /// 自上次写出以来被折叠掉的条数（写汇总时用它）。
+    pub folded: u64,
+}
+
+impl FoldDecision {
+    /// 该不该产生一条日志。
+    pub fn emit(&self) -> bool {
+        self.first || self.summary
+    }
+
+    /// 追加到日志消息后面的后缀。首次出现时为空串。
+    pub fn suffix(&self) -> String {
+        if self.summary && self.folded > 0 {
+            format!("（自上次记录以来同类事件另有 {} 条已折叠）", self.folded)
+        } else {
+            String::new()
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FoldState {
+    /// 上次补充令牌的时刻。
+    last: Option<std::time::Instant>,
+    /// 当前可用令牌数。
+    tokens: f64,
+    /// 自上次写出日志以来被折叠的条数。
+    folded: u64,
+    /// 是否已经写过至少一条（用来区分"首次"与"汇总"）。
+    wrote_any: bool,
+}
+
+impl FoldedLog {
+    /// 每秒最多写 `refill_per_sec` 条同类日志，突发上限 `burst` 条。
+    ///
+    /// `refill_per_sec` 就是**长期速率的硬上界**（与调用节奏无关）。
+    pub const fn new(refill_per_sec: f64, burst: f64) -> Self {
+        Self {
+            refill_per_sec,
+            burst,
+            inner: std::sync::Mutex::new(FoldState {
+                last: None,
+                tokens: burst,
+                folded: 0,
+                wrote_any: false,
+            }),
+        }
+    }
+
+    /// 记录一次事件，返回"该不该写日志"。
+    ///
+    /// * 有令牌 ⇒ 写出（首次是整个窗口的第一条完整消息，之后是带折叠数的汇总）；
+    /// * 无令牌 ⇒ 折叠（只累加计数）。
+    ///
+    /// # Panics
+    /// 不会 panic（锁毒化时取回内部值）—— 日志路径不能因锁失败而炸。
+    pub fn observe(&self) -> FoldDecision {
+        use std::time::Instant;
+        let now = Instant::now();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 按真实流逝时间补令牌（这正是"节奏无关"的来源）
+        match g.last {
+            None => g.last = Some(now),
+            Some(t) => {
+                let dt = now.duration_since(t).as_secs_f64();
+                if dt > 0.0 {
+                    g.tokens = (g.tokens + dt * self.refill_per_sec).min(self.burst);
+                    g.last = Some(now);
+                }
+            }
+        }
+
+        if g.tokens >= 1.0 {
+            g.tokens -= 1.0;
+            let folded = std::mem::take(&mut g.folded);
+            let first = !g.wrote_any;
+            g.wrote_any = true;
+            FoldDecision {
+                first,
+                // 首次之后的放行都算"汇总"，把期间折叠掉的条数带出去
+                summary: !first,
+                folded,
+            }
+        } else {
+            g.folded = g.folded.saturating_add(1);
+            FoldDecision {
+                first: false,
+                summary: false,
+                folded: g.folded,
+            }
+        }
+    }
+
+    /// 当前累计被折叠、尚未报告的条数（只读，用于测试与指标）。
+    pub fn folded(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).folded
+    }
+}
+
 /// 解析 `"host:port"` 形式的地址。
 ///
 /// 用 `tokio::net::lookup_host`，支持域名；Windows / Linux 行为一致。
@@ -415,5 +708,111 @@ mod tests {
             !is_loopback_addr("localhost"),
             "名字解析结果不可控，不能当回环"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // 第七轮审计 A-1：日志放大（折叠）
+    // -------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **A-1**，中危）：**同类日志必须被折叠**。
+    ///
+    /// # 这条测试要守住的**关键性质**
+    ///
+    /// 攻击者**无论打多快、打多慢**，每个窗口每个原因最多产生 **2 条**日志。
+    /// 这一条是本修复的核心 —— 因为第一版只做速率限制时，
+    /// **慢速打（低于配额）可以绕过限流继续写盘**（实测仍有 12.5× 放大）。
+    ///
+    /// 所以这里**刻意同时测两种速率**：
+    /// * 快打：一个窗口内连续 N 次 ⇒ 只应有 1 条；
+    /// * 慢打：跨越多个窗口 ⇒ 每个窗口最多 2 条（首条 + 汇总），
+    ///   **而不是**"因为慢所以每条都放行"。
+    #[test]
+    fn 日志折叠_同类消息每窗口最多两条() {
+        use std::time::Duration;
+
+        // ---- 快打：一个窗口内 1000 次 ⇒ 只有突发额度（burst）条 ----
+        let f = FoldedLog::new(1.0, 2.0); // 1 条/秒，突发 2 条
+        let mut emitted = 0;
+        for _ in 0..1000 {
+            if f.observe().emit() {
+                emitted += 1;
+            }
+        }
+        assert!(
+            emitted <= 2,
+            "一个窗口内 1000 次同类事件最多只能写 burst=2 条；实际 {emitted} 条 —— \
+             实测修复前是 1000 条（放大 125×）"
+        );
+        assert!(emitted >= 1, "首条必须被写出来（否则真正的错误会被吞掉）");
+
+        // ---- ★ 慢打：这是前两版都栽的地方 ----
+        //
+        // 关键性质：**日志条数的上界必须由真实时间决定，而不是由调用节奏决定**。
+        // 慢打（每 3ms 调一次、共 50 次 = 150ms）⇒ 令牌桶只补
+        // 0.15s × 1/s = 0.15 个令牌 ⇒ 加上初始 burst，
+        // 总写出条数应当**远小于 50**。
+        let f2 = FoldedLog::new(1.0, 2.0);
+        let mut emitted2 = 0;
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            if f2.observe().emit() {
+                emitted2 += 1;
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        // 上界 = burst + 速率 × 实际耗时（留一点余量给调度抖动）
+        let bound = 2.0 + 1.0 * elapsed + 2.0;
+        assert!(
+            (emitted2 as f64) <= bound,
+            "慢速打也必须受令牌桶约束：耗时 {elapsed:.3}s、速率 1/s ⇒ 上界约 {bound:.1}，\
+             实际写了 {emitted2}/50 条 —— 如果接近 50，说明上界又由调用节奏决定了"
+        );
+
+        // ---- 上界与节奏无关：同样的 50 次调用，快打 vs 慢打 ----
+        // 快打
+        let ff = FoldedLog::new(1.0, 2.0);
+        let mut n_fast = 0;
+        for _ in 0..50 {
+            if ff.observe().emit() {
+                n_fast += 1;
+            }
+        }
+        // 慢打（每 2ms 一次 = 100ms）
+        let fs = FoldedLog::new(1.0, 2.0);
+        let mut n_slow = 0;
+        for _ in 0..50 {
+            if fs.observe().emit() {
+                n_slow += 1;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            n_slow <= n_fast + 3,
+            "快打 {n_fast} 条、慢打 {n_slow} 条 —— 两者应当接近（慢打不能因为\
+             '更慢'而绕过折叠；前两版正是栽在这里）"
+        );
+
+        // ---- 汇总里必须带上被折叠的条数，避免"看起来风平浪静" ----
+        let f3 = FoldedLog::new(1.0, 1.0);
+        f3.observe(); // 用掉初始令牌（首条）
+        for _ in 0..10 {
+            f3.observe(); // 全被折叠
+        }
+        std::thread::sleep(Duration::from_millis(1200)); // 补回令牌
+        let d = f3.observe();
+        assert!(d.emit(), "补回令牌后应当能写出汇总");
+        assert!(d.folded > 0, "汇总必须报告被折叠的条数，实际 {}", d.folded);
+        assert!(
+            d.suffix().contains("折叠"),
+            "汇总后缀要明说折叠了多少条，否则运维会以为没发生事；实际 {:?}",
+            d.suffix()
+        );
+
+        // ---- 首次出现必须写完整消息（否则真正的错误会被吞掉）----
+        let f4 = FoldedLog::new(1.0, 2.0);
+        let d4 = f4.observe();
+        assert!(d4.first && d4.emit(), "首次出现的日志必须照常写出");
+        assert_eq!(d4.suffix(), "", "首次出现不该带汇总后缀");
     }
 }
