@@ -294,6 +294,71 @@ impl std::fmt::Debug for AuthProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 凭证新鲜性 —— **所有**凭证校验都必须经过这里
+// ---------------------------------------------------------------------------
+
+/// 时间戳新鲜性校验的**唯一实现**。
+///
+/// 抽成自由函数（而不是只放在 `AuthProvider` 上）是为了让
+/// "基于 token 的凭证" 与 "基于共享密钥的凭证" 走同一份判据 ——
+/// 后者（visitor 签名 / p2p 打洞签名）压根不经过 `AuthProvider`，
+/// 而它们此前**完全没有任何新鲜性校验**。
+///
+/// `what` 只用于错误文案，便于运维分辨是哪条路径出的问题。
+///
+/// `skew` 为 0 表示**显式关闭**（逃生开关，给时钟严重不准的设备用）。
+/// 注意：关闭是"明知故为"的选择，调用方必须显式传 0 —— 没有默认值可以漏。
+pub fn check_freshness(ts: i64, skew: u64, what: &str) -> anyhow::Result<()> {
+    if skew == 0 {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 用 `saturating_sub` + `saturating_abs` 避免 `now - ts` 在 i64::MIN 上溢出
+    // （审计报告实测过：`ts = i64::MIN` 以前是能登录成功的）。
+    let diff = now.saturating_sub(ts).saturating_abs();
+    if diff > skew as i64 {
+        anyhow::bail!(
+            "{what}超出允许偏差（ts={ts}，现在={now}，偏差 {diff} 秒 > {skew} 秒）\
+             —— 请校准两端时钟，或调大 maxClockSkewSecs"
+        );
+    }
+    Ok(())
+}
+
+/// 校验一份**基于共享密钥的凭证证明**：`given` 必须等于 `auth_key(secret, ts)`，
+/// **且 `ts` 必须新鲜**。
+///
+/// ★★ v0.5.7 新增（第六轮审计 G-1，高危）。
+///
+/// # 为什么需要它
+///
+/// visitor 签名（`sign_key`）与 p2p 打洞签名此前各自直接算
+/// `auth_key(secret_key, timestamp)` 再比对，**只看内容不看新鲜性** ⇒
+/// 嗅探到一条报文即可**无限期重放**（实测一年前的仍然被接受）。
+///
+/// 现在"比内容"和"查新鲜性"是**同一件事**：想校验这类凭证就必然要提供
+/// 时间窗口，没有"只比内容"的入口可误用。
+///
+/// `skew` 语义与 [`check_freshness`] 一致（0 = 显式关闭）。
+pub fn verify_shared_secret_proof(
+    secret: &str,
+    given: &str,
+    ts: i64,
+    skew: u64,
+    what: &str,
+) -> anyhow::Result<()> {
+    check_freshness(ts, skew, what)?;
+    let expected = crate::frp::msg::auth_key(secret, ts);
+    if !crate::frp::msg::constant_time_eq(&expected, given) {
+        anyhow::bail!("{what}的密钥证明不匹配");
+    }
+    Ok(())
+}
+
 impl AuthProvider {
     pub fn token(t: impl Into<String>) -> Self {
         Self::Token(t.into())
@@ -347,7 +412,44 @@ impl AuthProvider {
     ///   完整的做法要维护"已用过的 (run_id, ts)"集合，那要引入一张会增长的
     ///   表并处理过期清理 —— 对登录这种低频事件收益不划算。
     ///   窗口已经把攻击面从"永久"压到"5 分钟"，且**零互通代价**。
-    pub fn verify_login(&self, cred: &str, ts: i64, run_id: &str) -> anyhow::Result<String> {
+    ///
+    /// ★★ v0.5.7 修（第六轮审计 G-1，高危）：**把新鲜性校验并进来**。
+    ///
+    /// # 原先为什么错了
+    ///
+    /// M3 把新鲜性做成了**独立的** [`Self::check_timestamp`]，并在注释里解释了
+    /// 理由（"先判时间成本更低 / 让两种失败在日志里分开"）。那个理由本身成立，
+    /// 但**代价是调用方可以忘**——而实际就有 4 处忘了：
+    ///
+    /// | 路径 | 位置 | 当时的状态 |
+    /// |---|---|---|
+    /// | 主登录 | `conn.rs` | ✅ 唯一调了 `check_timestamp` 的地方 |
+    /// | vnet 注册 | `vnet.rs` | ❌ 直接调 `verify_login`，没有时间校验 |
+    /// | 工作连接 | `serve.rs` | ❌ 自己手写 `auth_key` 比对，不知道有新鲜性 |
+    /// | visitor 签名 | `visitor.rs` | ❌ 同上 |
+    /// | p2p 打洞签名 | `p2p.rs` | ❌ 同上 |
+    ///
+    /// 实测危害：**一年前**的报文仍然被接受，并打通了完整双向 MITM
+    /// （`tmp/audit6-g1/mitm_full_poc.py`）。
+    ///
+    /// # 现在的做法
+    ///
+    /// 校验新鲜性**成为 `verify_login` 的一部分**（`skew` 是必需参数）：
+    /// 想校验凭证就**必须**提供时间窗口，没有"只校验凭证"的入口可以误用。
+    /// 两种失败在日志里**仍然分得开**（错误文案不同），所以原设计的收益没丢。
+    ///
+    /// ★ 同一个教训本轮还出现在另外三处（visitor / p2p 走
+    ///   [`verify_shared_secret_proof`]，工作连接改调本函数）——
+    ///   **本项目连续六轮的模式：防线写对了，但没铺满它声称保护的所有路径。**
+    pub fn verify_login(
+        &self,
+        cred: &str,
+        ts: i64,
+        run_id: &str,
+        skew: u64,
+    ) -> anyhow::Result<String> {
+        // 先判时间：成本更低，且让"过期"与"凭证错"在日志里分开
+        self.check_timestamp(ts, skew)?;
         match self {
             Self::Token(secret) => {
                 if secret.is_empty() {
@@ -370,29 +472,14 @@ impl AuthProvider {
 
     /// 登录时间戳的新鲜性校验（v0.5.6，M3）。
     ///
-    /// 单独成函数而不是塞进 `verify_login`：**必须在算 `auth_key` 之前调用**
-    /// ——先判时间成本更低，而且能让"过期"与"凭证错"两种失败在日志里分开，
-    /// 便于运维定位（时钟不准 vs 配置错）。
+    /// ★ v0.5.7：**已经由 [`Self::verify_login`] 内部调用**，
+    ///   不再需要调用方自己记得调。独立保留是为了：
+    ///   * 让 [`verify_shared_secret_proof`] 复用同一份实现；
+    ///   * 错误文案可区分（"过期" vs "凭证错"），运维能一眼看出是时钟问题还是配置问题。
     ///
     /// `skew` 为 0 表示关闭该校验（逃生开关，给时钟严重不准的设备用）。
     pub fn check_timestamp(&self, ts: i64, skew: u64) -> anyhow::Result<()> {
-        if skew == 0 {
-            return Ok(());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        // 用 `abs_diff` 风格的比较避免 `now - ts` 在 i64::MIN 上溢出
-        // （审计报告实测过：`ts = i64::MIN` 以前是能登录成功的）。
-        let diff = now.saturating_sub(ts).saturating_abs();
-        if diff > skew as i64 {
-            anyhow::bail!(
-                "登录时间戳超出允许偏差（ts={ts}，现在={now}，偏差 {diff} 秒 > {skew} 秒）\
-                 —— 请校准两端时钟，或调大 maxClockSkewSecs"
-            );
-        }
-        Ok(())
+        check_freshness(ts, skew, "登录时间戳")
     }
 
     /// 校验登录**之后**的凭证（心跳 / 新工作连接）。
