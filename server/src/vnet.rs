@@ -56,6 +56,52 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 // 转发中枢
 // ---------------------------------------------------------------------------
 
+/// ★★ v0.5.8 新增（第七轮审计 **C-1**）：**VirtualNet 的会话键**。
+///
+/// # 为什么不能直接用 `String`
+///
+/// VNet 里同时存在两种"客户端标识"：
+///
+/// | 概念 | 取值 | 用途 |
+/// |---|---|---|
+/// | **显示名** `reg.client` | 客户端**自报**，可重复（两个客户端都能叫 `laptop`） | 日志 / 审计 |
+/// | **会话键** `SessionKey` | `"{client}-{run_id}"`，服务端生成，**全局唯一** | 路由 / 地址池 / 收发信箱 |
+///
+/// 两者都是字符串。C-1 的成因正是**建立时用会话键、转发时传了显示名** ——
+/// 因为都是 `String`，编译器一点都拦不住，而运行期表现为
+/// "每个包都被判成冒充并丢弃"（`dropped_spoofed` 对合法包也自增）。
+///
+/// ⇒ 用一个**独立类型**把两者在类型层面分开：`route()` 只接受
+/// [`SessionKey`]，想把 `reg.client` 传进去会**直接编译失败**。
+/// 这正是本项目方法论里说的"让漏掉变得不可能"。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey(String);
+
+impl SessionKey {
+    /// 由显示名生成一个**新的**会话键（服务端生成，不与显示名相等）。
+    pub fn new_for(display_name: &str) -> Self {
+        Self(format!(
+            "{display_name}-{}",
+            nfrp_common::util::new_run_id()
+        ))
+    }
+
+    /// 仅供测试与内部查找使用：由已知字符串构造。
+    pub fn from_raw(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// 一台虚拟交换机 + 地址池 + 网关。
 pub struct VnetHub {
     inner: Mutex<HubInner>,
@@ -169,13 +215,17 @@ impl VnetHub {
     }
 
     /// 客户端加入。`want` 为 `None` 表示由服务端分配。
+    ///
+    /// ★ v0.5.8（C-1）：`client` 参数是 [`SessionKey`] 而不是 `&str` ——
+    ///   加入、路由、离开三处**必须用同一个键**，用类型把它锁住。
     pub fn join(
         &self,
-        client: &str,
+        client: &SessionKey,
         want: Option<Ipv4Addr>,
         sink: mpsc::Sender<Vec<u8>>,
     ) -> Result<Joined> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let client = client.as_str();
 
         // 同一个 client_id 重连（上一次的连接可能还没死透）：先把旧的清掉。
         // 不清的话 `routes` 里会留着指向旧连接的条目，包全打进黑洞。
@@ -220,9 +270,9 @@ impl VnetHub {
     }
 
     /// 客户端离开：路由与地址**一起**回收。
-    pub fn leave(&self, client: &str) {
+    pub fn leave(&self, client: &SessionKey) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Self::leave_locked(&mut g, client);
+        Self::leave_locked(&mut g, client.as_str());
     }
 
     fn leave_locked(g: &mut HubInner, client: &str) {
@@ -247,7 +297,33 @@ impl VnetHub {
     /// 源地址就是唯一的"身份"，不校验等于身份可以自由伪造。
     ///
     /// 实弹：`tmp/f4_vnet_spoof.py`（对照组：注册层抢地址是拦住的）。
-    fn route(&self, from: &str, pkt: &[u8]) -> bool {
+    ///
+    /// ★★ v0.5.8 修（第七轮审计 **C-1**）：参数改成 [`SessionKey`]，
+    /// **从类型上杜绝**"把显示名传进来"。
+    ///
+    /// # 为什么需要类型而不只是改对实参
+    ///
+    /// C-1 的成因是：身份建立用 `session_key`（`"{client}-{run_id}"`），
+    /// 而转发时传了 `reg.client`（**显示名**）。
+    /// 两者都是 `String`，**传错了编译器不会拦** —— 实测每一个包都被判成
+    /// "冒充"并丢弃（连客户端自己的地址都判冒充），
+    /// 且 `dropped_spoofed` 这个"有人在冒充"的唯一信号被彻底污染。
+    ///
+    /// 本项目连续多轮的模式是"**防线写对了，但没铺满**"，
+    /// 治本方向一直是"把同一判定收敛成唯一来源，并让漏掉变得**不可能**
+    /// （类型层面的约束，而不是靠调用方记得）"。
+    /// 这里就照这个思路做：**显示名与会话键是两种不同的类型**，
+    /// 想把 `reg.client` 传进来会直接编译失败。
+    ///
+    /// 成员 A 可以发出 `src = 其他成员` 甚至 `src = 网关` 的包，而 B 照收。
+    ///
+    /// 影响：VNet 里**没有任何可信的源身份** —— 可以冒充别人发起连接，
+    /// 也可以让受害者以为流量来自网关。VNet 本来就没有 ACL，
+    /// 源地址就是唯一的"身份"，不校验等于身份可以自由伪造。
+    ///
+    /// 实弹：`tmp/f4_vnet_spoof.py`（对照组：注册层抢地址是拦住的）。
+    fn route(&self, from: &SessionKey, pkt: &[u8]) -> bool {
+        let from = from.as_str();
         let Some(h) = vnet::parse_ipv4(pkt) else {
             // IPv6 或畸形包。**静默丢弃**而不是回 ICMP unreachable：
             // 我们不是路由器，装作会发 ICMP 只会让人以为链路有问题。
@@ -507,7 +583,10 @@ async fn serve_conn(
     //   但那正是漏洞本身，去掉是对的；旧连接会由 `JoinGuard` / 读写超时回收。
     // ★ 会话键用项目自己的随机 ID 生成器（`OsRng` 支撑，16 字节十六进制）。
     //   不引新依赖 —— `util::new_run_id()` 就是为这类场景写的。
-    let session_key = format!("{}-{}", reg.client, nfrp_common::util::new_run_id());
+    // ★★ v0.5.8（第七轮审计 C-1）：改用 [`SessionKey`] 类型。
+    //   以前是裸 `String`，于是转发路径**误传了显示名**而编译器毫无反应
+    //   ⇒ 每个包都被判成冒充。现在两者是不同类型，传错**编译不过**。
+    let session_key = SessionKey::new_for(&reg.client);
     let joined = match hub.join(&session_key, want, tx) {
         Ok(j) => j,
         Err(e) => {
@@ -579,7 +658,50 @@ async fn serve_conn(
                 }
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(pkt) = take_frame(&mut buf)? {
-                    hub.route(&reg.client, &pkt);
+                    // ★★ v0.5.8 修（第七轮审计 **C-1**）：这里原先传的是
+                    //    `&reg.client`（**显示名**），而身份建立时用的是
+                    //    `session_key`（`"{client}-{run_id}"`，见上面 `:510`）。
+                    //
+                    // # 后果（实测，C 组 `tmp/audit7/c/c03_vnet_key.py`）
+                    //
+                    // `route()` 的第一步是**源地址校验**（本文件 `:266`）：
+                    //
+                    // ```ignore
+                    // if !g.routes.ips_of(&g.network, from).contains(&h.src) {
+                    //     g.dropped_spoofed += 1;   // 计入"防冒充"
+                    //     return false;             // 丢弃
+                    // }
+                    // ```
+                    //
+                    // 而 `ips_of` 是**精确匹配**（`common/src/vnet.rs:532`：
+                    // `o.as_str() == client`）—— owner 是 `"laptop-3f2a…"`，
+                    // 传进去的是 `"laptop"` ⇒ 恒不匹配 ⇒ `ips_of` 恒空
+                    // ⇒ **每一个包都被判成冒充并丢弃**。
+                    //
+                    // 实测日志原文（连它**自己**的地址都被判成冒充）：
+                    // ```text
+                    // 虚拟网络源地址不属于发送者，丢弃（防冒充）
+                    //   from=laptop src=100.64.0.254
+                    // ```
+                    //
+                    // # 两重影响
+                    //
+                    // 1. **功能面**：广播 / 网关 ICMP / 单播 A→B **全部不可达**
+                    //    —— VNet 转发整条失效。
+                    // 2. **可观测性面**：`dropped_spoofed` 是第四轮 F4 之后
+                    //    "有人在冒充"的**唯一信号**，现在对**每个合法包**都自增
+                    //    ⇒ 真实的冒充告警被噪音淹没，指标**失去判别力**。
+                    //
+                    // # 为什么前几轮没发现
+                    //
+                    // `session_key` 是第四轮修 F4（同名客户端互相踢掉）时引入的，
+                    // 但**只改了建立侧**，查找侧（这条转发路径）漏改了。
+                    // ⇒ "引入一个新的键"时必须把它**所有**使用点一起改，
+                    //   否则就会出现这种"一半新键、一半旧名"的错配。
+                    //
+                    // ★ 安全姿态：这是 **fail-closed**（拒绝一切），不是放行，
+                    //   所以不构成越权；主要损失是可用性与告警可信度。
+                    hub.route(&session_key, &pkt);
                 }
             }
         }
@@ -588,9 +710,12 @@ async fn serve_conn(
 }
 
 /// 确保客户端离开时一定被注销。
+///
+/// ★ v0.5.8（C-1）：持有的必须是 [`SessionKey`]（而不是裸 `String`）——
+///   这样 `hub.leave()` 才能编译通过，同时保证**离开用的键与加入用的键同源**。
 struct JoinGuard {
     hub: Arc<VnetHub>,
-    client: String,
+    client: SessionKey,
 }
 
 impl Drop for JoinGuard {
@@ -645,6 +770,15 @@ mod tests {
         mpsc::channel(16)
     }
 
+    /// ★ v0.5.8（C-1）：测试里构造会话键。
+    ///
+    /// 用 `from_raw` 而不是 `new_for` —— 测试需要**可预测**的键
+    /// （比如同一个名字要拿到同一个键来验证"重连清旧登记"）。
+    /// 生产代码走 `new_for`（带随机后缀、保证唯一）。
+    fn sk(name: &str) -> SessionKey {
+        SessionKey::from_raw(name)
+    }
+
     #[test]
     fn 默认配置不启用() {
         let cfg = ServerConfig::default();
@@ -679,14 +813,14 @@ mod tests {
     fn 加入后再离开_地址与路由都要回收() {
         let h = hub();
         let (tx, _rx) = sink();
-        let j = h.join("a", None, tx).unwrap();
+        let j = h.join(&sk("a"), None, tx).unwrap();
         assert_eq!(h.address_of("a"), Some(j.ip));
 
-        h.leave("a");
+        h.leave(&sk("a"));
         assert_eq!(h.address_of("a"), None, "路由必须清掉");
         // 释放之后同一个地址必须能被别人拿到，否则地址池会越用越少
         let (tx2, _rx2) = sink();
-        let j2 = h.join("b", Some(j.ip), tx2).unwrap();
+        let j2 = h.join(&sk("b"), Some(j.ip), tx2).unwrap();
         assert_eq!(j2.ip, j.ip, "释放过的地址应当可复用");
     }
 
@@ -694,9 +828,9 @@ mod tests {
     fn 同一客户端重连不会漏掉旧登记() {
         let h = hub();
         let (tx1, _rx1) = sink();
-        let j1 = h.join("a", None, tx1).unwrap();
+        let j1 = h.join(&sk("a"), None, tx1).unwrap();
         let (tx2, mut rx2) = sink();
-        let j2 = h.join("a", None, tx2).unwrap();
+        let j2 = h.join(&sk("a"), None, tx2).unwrap();
         assert_eq!(h.stats().unwrap().peers, 1, "同一个人不该占两个名额");
         assert_eq!(h.address_of("a"), Some(j2.ip));
 
@@ -715,9 +849,9 @@ mod tests {
         //   的客户端 —— 源地址校验上线后，原来那个虚构的 `"someone"` 会被
         //   正确地拒掉（它不拥有 `100.64.0.200`）。这里改成让 s 真加入。
         let (txs, _rxs) = sink();
-        let js = h.join("s", None, txs).unwrap();
+        let js = h.join(&sk("s"), None, txs).unwrap();
         let pkt = fake_udp(js.ip, j2.ip, b"x");
-        assert!(h.route("s", &pkt));
+        assert!(h.route(&sk("s"), &pkt));
         assert_eq!(rx2.try_recv().unwrap(), pkt, "新连接必须能收到");
     }
 
@@ -726,19 +860,19 @@ mod tests {
         let h = hub();
         let (txa, mut rxa) = sink();
         let (txb, mut rxb) = sink();
-        let ja = h.join("a", None, txa).unwrap();
-        let jb = h.join("b", None, txb).unwrap();
+        let ja = h.join(&sk("a"), None, txa).unwrap();
+        let jb = h.join(&sk("b"), None, txb).unwrap();
 
         // a → b
         let pkt = fake_udp(ja.ip, jb.ip, b"hi");
-        assert!(h.route("a", &pkt));
+        assert!(h.route(&sk("a"), &pkt));
         let got = rxb.try_recv().expect("b 应当收到包");
         assert_eq!(got, pkt);
         assert!(rxa.try_recv().is_err(), "不该回给自己");
 
         // b → a
         let pkt2 = fake_udp(jb.ip, ja.ip, b"yo");
-        assert!(h.route("b", &pkt2));
+        assert!(h.route(&sk("b"), &pkt2));
         assert_eq!(rxa.try_recv().unwrap(), pkt2);
     }
 
@@ -746,14 +880,14 @@ mod tests {
     fn 发往网关的_ping_由服务端自己回() {
         let h = hub();
         let (tx, mut rx) = sink();
-        let j = h.join("a", None, tx).unwrap();
+        let j = h.join(&sk("a"), None, tx).unwrap();
         let gw = h.stats().unwrap().gateway.parse::<Ipv4Addr>().unwrap();
 
         let mut pkt = fake_udp(j.ip, gw, b"");
         pkt[9] = 1; // ICMP
         pkt[20] = 8; // echo request
         pkt.resize(28, 0);
-        assert!(h.route("a", &pkt), "网关应当把这个包收下并回包");
+        assert!(h.route(&sk("a"), &pkt), "网关应当把这个包收下并回包");
 
         let reply = rx.try_recv().expect("应当收到网关的应答");
         let hdr = vnet::parse_ipv4(&reply).unwrap();
@@ -766,9 +900,9 @@ mod tests {
     fn 查不到目的地址就丢弃并计数() {
         let h = hub();
         let (tx, _rx) = sink();
-        let j = h.join("a", None, tx).unwrap();
+        let j = h.join(&sk("a"), None, tx).unwrap();
         let pkt = fake_udp(j.ip, Ipv4Addr::new(100, 64, 0, 99), b"x");
-        assert!(!h.route("a", &pkt));
+        assert!(!h.route(&sk("a"), &pkt));
         assert_eq!(h.stats().unwrap().dropped_unroutable, 1);
     }
 
@@ -778,12 +912,12 @@ mod tests {
         let (txa, mut rxa) = sink();
         let (txb, mut rxb) = sink();
         let (txc, mut rxc) = sink();
-        let ja = h.join("a", None, txa).unwrap();
-        h.join("b", None, txb).unwrap();
-        h.join("c", None, txc).unwrap();
+        let ja = h.join(&sk("a"), None, txa).unwrap();
+        h.join(&sk("b"), None, txb).unwrap();
+        h.join(&sk("c"), None, txc).unwrap();
 
         let pkt = fake_udp(ja.ip, Ipv4Addr::BROADCAST, b"who");
-        assert!(h.route("a", &pkt));
+        assert!(h.route(&sk("a"), &pkt));
         assert_eq!(rxb.try_recv().unwrap(), pkt);
         assert_eq!(rxc.try_recv().unwrap(), pkt);
         assert!(rxa.try_recv().is_err(), "广播不该回到发送者");
@@ -793,9 +927,9 @@ mod tests {
     fn 畸形包被安全丢弃() {
         let h = hub();
         let (tx, _rx) = sink();
-        h.join("a", None, tx).unwrap();
+        h.join(&sk("a"), None, tx).unwrap();
         for bad in [&b""[..], &b"\x60"[..], &b"\x45"[..]] {
-            assert!(!h.route("a", bad), "畸形包必须被安全丢弃");
+            assert!(!h.route(&sk("a"), bad), "畸形包必须被安全丢弃");
         }
     }
 
@@ -812,12 +946,12 @@ mod tests {
         let h = hub();
         let (txa, mut rxa) = sink();
         let (txb, mut rxb) = sink();
-        let ja = h.join("a", None, txa).unwrap();
-        let jb = h.join("b", None, txb).unwrap();
+        let ja = h.join(&sk("a"), None, txa).unwrap();
+        let jb = h.join(&sk("b"), None, txb).unwrap();
 
         // A 伪造"源地址 = B"，发给 B
         let spoof = fake_udp(jb.ip, jb.ip, b"i-am-not-b");
-        assert!(!h.route("a", &spoof), "伪造成 B 的源地址必须被丢弃");
+        assert!(!h.route(&sk("a"), &spoof), "伪造成 B 的源地址必须被丢弃");
         assert!(
             rxb.try_recv().is_err(),
             "B 不该收到那条伪造包（这正是修复前会发生的事）"
@@ -830,7 +964,7 @@ mod tests {
 
         // 对照：A 用自己的地址发，必须正常送达
         let ok = fake_udp(ja.ip, jb.ip, b"from-a");
-        assert!(h.route("a", &ok), "用自己的源地址发应当正常转发");
+        assert!(h.route(&sk("a"), &ok), "用自己的源地址发应当正常转发");
         assert_eq!(rxb.try_recv().unwrap(), ok);
 
         // 确认没有误伤：合法那次不该增加 spoofed 计数
@@ -844,12 +978,12 @@ mod tests {
         let h = hub();
         let (txa, _rxa) = sink();
         let (txb, mut rxb) = sink();
-        h.join("a", None, txa).unwrap();
-        let jb = h.join("b", None, txb).unwrap();
+        h.join(&sk("a"), None, txa).unwrap();
+        let jb = h.join(&sk("b"), None, txb).unwrap();
         let gw = h.stats().unwrap().gateway.parse::<Ipv4Addr>().unwrap();
 
         let spoof = fake_udp(gw, jb.ip, b"i-am-gateway");
-        assert!(!h.route("a", &spoof), "冒称网关必须被丢弃");
+        assert!(!h.route(&sk("a"), &spoof), "冒称网关必须被丢弃");
         assert!(rxb.try_recv().is_err(), "B 不该以为这来自网关");
         assert_eq!(h.stats().unwrap().dropped_spoofed, 1);
     }
@@ -860,18 +994,18 @@ mod tests {
         let h = hub();
         let (txa, _rxa) = sink();
         let (txb, mut rxb) = sink();
-        let ja = h.join("a", None, txa).unwrap();
-        let jb = h.join("b", None, txb).unwrap();
+        let ja = h.join(&sk("a"), None, txa).unwrap();
+        let jb = h.join(&sk("b"), None, txb).unwrap();
 
         // 伪造 B 的源地址去广播
         let spoof = fake_udp(jb.ip, Ipv4Addr::BROADCAST, b"spoofed-bcast");
-        assert!(!h.route("a", &spoof));
+        assert!(!h.route(&sk("a"), &spoof));
         assert!(rxb.try_recv().is_err(), "B 不该收到伪造来源的广播");
         assert_eq!(h.stats().unwrap().dropped_spoofed, 1);
 
         // 合法广播照常
         let ok = fake_udp(ja.ip, Ipv4Addr::BROADCAST, b"ok-bcast");
-        assert!(h.route("a", &ok));
+        assert!(h.route(&sk("a"), &ok));
         assert_eq!(rxb.try_recv().unwrap(), ok);
     }
 
@@ -909,8 +1043,8 @@ mod tests {
         let (tx2, _rx2) = sink();
 
         // 模拟两个客户端都自报 "laptop"，但会话键不同（服务端生成）
-        let key1 = format!("laptop-{}", nfrp_common::util::new_run_id());
-        let key2 = format!("laptop-{}", nfrp_common::util::new_run_id());
+        let key1 = SessionKey::new_for("laptop");
+        let key2 = SessionKey::new_for("laptop");
         assert_ne!(key1, key2, "前置：两个会话键必须不同");
 
         let j1 = h.join(&key1, None, tx1).expect("第一个加入");
@@ -919,11 +1053,87 @@ mod tests {
         assert_ne!(j1.ip, j2.ip, "同名但不同会话 ⇒ 必须拿到不同的 IP");
         // ★ 关键：第二个加入**不能**把第一个挤掉 —— 两个会话都还在
         assert_eq!(
-            h.address_of(&key1),
+            h.address_of(key1.as_str()),
             Some(j1.ip),
             "后加入的同名会话不得踢掉先加入者（L12）"
         );
-        assert_eq!(h.address_of(&key2), Some(j2.ip));
+        assert_eq!(h.address_of(key2.as_str()), Some(j2.ip));
+    }
+
+    // ------------------------------------------------------------------
+    // 第七轮审计 C-1：转发路径必须用**会话键**，不能用显示名
+    // ------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **C-1**，中危）：
+    /// **转发路径传的身份键必须与建立时一致（会话键），否则一切包都被判成冒充。**
+    ///
+    /// # 这个 bug 的形态（一行实参传错）
+    ///
+    /// `vnet.rs` 里建立身份用 `session_key = "{client}-{run_id}"`，
+    /// 而转发时传的是 `reg.client`（**显示名**，没有 `-{run_id}` 后缀）。
+    /// `route()` 第一步的源地址校验是**精确匹配**owner ⇒ 恒不匹配
+    /// ⇒ 每个包都计入 `dropped_spoofed` 并丢弃。
+    ///
+    /// 实测（C 组 `c03_vnet_key.py`）：连客户端**自己**的地址都被判成冒充，
+    /// 日志 `虚拟网络源地址不属于发送者，丢弃（防冒充） from=laptop src=100.64.0.254`。
+    ///
+    /// # 这条测试测什么（**两个层面，缺一不可**）
+    ///
+    /// 1. **功能**：用会话键路由时，A→B 的单播必须送达；
+    /// 2. **指标**：**没有冒充流量时 `dropped_spoofed` 必须保持 0** ——
+    ///    这一条才是 C-1 真正的判据。因为"转发通了"可以在指标依然失真的
+    ///    情况下成立，而 `dropped_spoofed` 是"有人在冒充"的唯一信号，
+    ///    它对合法包误增就等于告警失效。
+    ///
+    /// ★ 另外**刻意用显示名反测一次**：证明"用错键确实会导致全部丢弃"，
+    ///   这样如果将来有人把实参改回 `reg.client`，第 2 条断言会立刻变红。
+    #[test]
+    fn 转发必须用会话键而不是显示名() {
+        let h = hub();
+        let (tx_a, mut rx_a) = sink();
+        let (tx_b, mut rx_b) = sink();
+
+        // 两个客户端都自称 "laptop"（显示名相同），会话键不同
+        let key_a = SessionKey::new_for("laptop");
+        let key_b = SessionKey::new_for("laptop");
+        let ja = h.join(&key_a, None, tx_a).expect("A 加入");
+        let jb = h.join(&key_b, None, tx_b).expect("B 加入");
+
+        let before = h.stats().unwrap().dropped_spoofed;
+
+        // ---- ① 用**会话键**路由：A→B 单播必须送达，且不增加防冒充计数 ----
+        let pkt = fake_udp(ja.ip, jb.ip, b"hello-b");
+        let ok = h.route(&key_a, &pkt);
+        assert!(
+            ok,
+            "用会话键路由合法包必须成功 —— 若这里失败，说明身份键又错配了（C-1）"
+        );
+        let got = rx_b.try_recv().ok();
+        assert_eq!(
+            got.as_deref(),
+            Some(pkt.as_slice()),
+            "B 必须收到 A 发来的单播（VNet 转发的核心功能）"
+        );
+
+        assert_eq!(
+            h.stats().unwrap().dropped_spoofed,
+            before,
+            "★ 合法流量**不得**增加 dropped_spoofed —— 这个指标是'有人在冒充'的\
+             唯一信号；对合法包误增会让真实告警淹没在噪音里（C-1 的第二重危害）"
+        );
+
+        // ---- ② 用**显示名**路由：必须失败并计入防冒充（证明判据有区分力）----
+        //
+        // 这一条是"把实参改回 reg.client"时的报警器：
+        // 显示名不是任何 owner ⇒ 精确匹配失败 ⇒ 丢弃 + 计数。
+        let pkt2 = fake_udp(ja.ip, jb.ip, b"hello-b2");
+        let ok2 = h.route(&sk("laptop"), &pkt2);
+        assert!(!ok2, "用**显示名**路由必须被拒 —— 这正是 C-1 修复前的情形");
+        assert!(
+            h.stats().unwrap().dropped_spoofed > before,
+            "用错身份键时应当计入 dropped_spoofed（这正是线上观察到的现象）"
+        );
+        let _ = rx_a.try_recv();
     }
 
     /// 反向：**同一个会话键**重连时，仍然要清掉旧登记（原有行为，防回归）。
@@ -932,15 +1142,15 @@ mod tests {
     #[test]
     fn 同一会话键重连仍然清掉旧登记() {
         let h = hub();
-        let key = "laptop-same-session";
+        let key = SessionKey::from_raw("laptop-same-session");
         let (tx1, _rx1) = sink();
         let (tx2, _rx2) = sink();
 
-        let j1 = h.join(key, None, tx1).expect("首次加入");
-        let j2 = h.join(key, None, tx2).expect("重连");
+        let j1 = h.join(&key, None, tx1).expect("首次加入");
+        let j2 = h.join(&key, None, tx2).expect("重连");
 
         assert_eq!(j1.ip, j2.ip, "同一会话重连应拿回同一个 IP");
-        assert_eq!(h.address_of(key), Some(j2.ip));
+        assert_eq!(h.address_of(key.as_str()), Some(j2.ip));
         // 旧登记必须被清掉：只有一个成员
         assert_eq!(
             h.stats().map(|s| s.peers).unwrap_or(0),
