@@ -1346,6 +1346,15 @@ async fn tcp_proxy_roundtrip_over_quic_transport() {
 ///
 /// 同时钉住第二件事：轮询到的后端必须让**它自己**的客户端去服务，
 /// 也就是 `StartWorkConn` 里带的代理名得是那个成员的 `name`。
+///
+/// ★ v0.5.7（第六轮审计 D-1）：**两个成员改用同一个 `user`**。
+///
+/// 原先这里用 `"alice"` / `"bob"` 两个不同的 `user` 登录 —— 那只是"给两个
+/// 客户端起个名字"的顺手写法，但 D-1 之后它**恰好就是跨租户寄生**的形状，
+/// 会被正确地拒掉。本测试真正要锁的是"**同一个运维**的多个冗余后端
+/// 共享端口 + 轮询"，那才是 group 的正当用法，所以用同一个租户名。
+///
+/// 跨租户必须被拒由 [`跨租户不能用同组名寄生到别人的公网端口`] 单独锁定。
 #[tokio::test]
 async fn group_members_share_one_port_and_round_robin() {
     let (port, registry) = start_server_with_registry(base_cfg()).await;
@@ -1353,7 +1362,8 @@ async fn group_members_share_one_port_and_round_robin() {
     let local_b = tagged_echo_service("bob").await;
     let remote_port = free_port();
 
-    let (mut ctrl_a, run_a) = login(port, TOKEN, "alice").await;
+    // 同一租户的两个后端（一个运维跑了两份 frpc 做冗余）
+    let (mut ctrl_a, run_a) = login(port, TOKEN, "acme").await;
     let resp_a = register_proxy(
         &mut ctrl_a,
         NewProxy {
@@ -1371,7 +1381,7 @@ async fn group_members_share_one_port_and_round_robin() {
         resp_a.error
     );
 
-    let (mut ctrl_b, run_b) = login(port, TOKEN, "bob").await;
+    let (mut ctrl_b, run_b) = login(port, TOKEN, "acme").await;
     let resp_b = register_proxy(
         &mut ctrl_b,
         NewProxy {
@@ -1413,6 +1423,87 @@ async fn group_members_share_one_port_and_round_robin() {
     assert!(
         seen.contains("alice") && seen.contains("bob"),
         "4 条连接必须两个后端都轮到，实际只有 {seen:?} —— 负载均衡没生效"
+    );
+}
+
+/// ★★ v0.5.7 新增（第六轮审计 D-1，**高危**）：**跨租户不能用同组名寄生**。
+///
+/// # 攻击是什么（端到端实测打出来的）
+///
+/// `PortGroup` 原先**没有任何归属租户的概念**，加入判定只看 (组名, group_key)。
+/// 于是只要知道组名，任何客户端都能把自己的工作连接挂到**别人**的公网端口上，
+/// 之后用户连接按轮询分给攻击者 —— 实测 12 条连接里 **6 条**落到了攻击者的
+/// 内网服务上（banner 是攻击者进程发出的），也就是用户的请求、
+/// Cookie、`Authorization` 全被攻击者看走，回包还能被伪造。
+///
+/// **最危险的形态是双方都不配 `group_key`**（官方 frp 里 `groupKey` 可选，
+/// 只配 `group` 做负载均衡是标准写法）：此时 `constant_time_eq("", "")` 为真，
+/// **组名就是唯一凭据，且不需要任何密钥**。
+///
+/// # 为什么这不是"设计如此"
+///
+/// 官方 group 是**同一个运维**给一组冗余后端做负载均衡用的，天然假设组内是自己人。
+/// 而本项目的注释原话就把 `group_key` 称作"**认证凭据**"，并点名了这个攻击 ——
+/// 既然已承认它是跨租户安全边界，就不能只在"双方都配了非空 key"时才成立。
+///
+/// # 这条测试锁两层
+///
+/// 1. **行为**：跨租户（不同 `user`）注册同组名 ⇒ 必须被拒，且不产生后端
+/// 2. **文案**：拒绝文案不得泄露组名或占用者（否则又是组名枚举预言机）
+#[tokio::test]
+async fn 跨租户不能用同组名寄生到别人的公网端口() {
+    let (port, registry) = start_server_with_registry(base_cfg()).await;
+    let remote_port = free_port();
+
+    // 受害者 bob 起了一个负载均衡组（**不配 group_key**，官方常见写法）
+    let (mut ctrl_bob, _run_bob) = login(port, TOKEN, "bob").await;
+    let resp_bob = register_proxy(
+        &mut ctrl_bob,
+        NewProxy {
+            proxy_name: "bob.victim".into(),
+            proxy_type: "tcp".into(),
+            remote_port,
+            group: "web-lb".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        resp_bob.error.is_empty(),
+        "受害者的组应当注册成功：{}",
+        resp_bob.error
+    );
+    assert_eq!(registry.backend_count(remote_port), 1);
+
+    // 攻击者 alice：知道组名 `web-lb`，用**自己真实的身份**（不需要伪造 user）
+    let (mut ctrl_alice, _run_alice) = login(port, TOKEN, "alice").await;
+    let resp_atk = register_proxy(
+        &mut ctrl_alice,
+        NewProxy {
+            proxy_name: "alice.parasite".into(),
+            proxy_type: "tcp".into(),
+            remote_port,
+            group: "web-lb".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        !resp_atk.error.is_empty(),
+        "跨租户靠组名寄生必须被拒，实际却成功了：{:?}",
+        resp_atk
+    );
+    assert_eq!(
+        registry.backend_count(remote_port),
+        1,
+        "被拒之后端口上不能多出后端（多一个就是流量被分走一份）"
+    );
+    // 文案不得泄露"组名猜对了"或占用者是谁
+    assert!(
+        !resp_atk.error.contains("web-lb") && !resp_atk.error.contains("bob"),
+        "拒绝文案泄露了组名或占用者：{}",
+        resp_atk.error
     );
 }
 
