@@ -570,6 +570,51 @@ mod static_file {
             return ("200 OK", b"nfrp static_file".to_vec(), "text/plain");
         }
 
+        // ★★ v0.5.8 修（第七轮审计 **D7-4**，低危）：**拒绝 NTFS 备用数据流（ADS）**。
+        //
+        // # 现象（实测 `tmp/audit7/d_independent/repro_d74_ads.py`，9/9）
+        //
+        // | 请求 | 结果 |
+        // |---|---|
+        // | `/data.txt` | 200 ✓ |
+        // | **`/data.txt::$DATA`** | **200，读出文件内容** ← 现象 |
+        // | `/data.txt::$data` | **200**（大小写不敏感）|
+        // | `/data.txt:` | 403 |
+        // | `/../sfsecret.txt` | 403 ✓ |
+        // | **`/../sfsecret.txt::$DATA`** | **403，零泄漏** ✓ |
+        //
+        // # 精确的定性（**不是目录穿越**）
+        //
+        // `::$DATA` 读的是**同一个文件**的默认数据流，`canonicalize` 会把它
+        // 解析到那个文件本身 ⇒ `starts_with(root)` 仍然通过。
+        // 实测：root **之外**的文件用**任何** ADS 变体都是 403、零泄漏
+        // ⇒ **root 边界没有被突破**，只是多了一条可达路径。故为**低危**。
+        //
+        // # 为什么仍然值得修
+        //
+        // 它绕过了"按文件名做判断"的那一层：若使用者（或未来的代码）在
+        // `static_file` 之上加了扩展名白名单 / 精确文件名单，
+        // `x.txt::$DATA` 这类写法会让"同一个文件"以**另一个标签**出现。
+        // 这与本项目一贯口径一致：**在入口处拒绝掉不该出现的形态**，
+        // 而不是依赖下游每一处都记得它对等。
+        //
+        // # 判据
+        //
+        // Windows 上 ADS 的语法是 `<文件名>:<流名>`。允许的路径片段里
+        // **不应出现冒号**（合法文件名在 Windows 上不含 `:`，
+        // NTFS 会把它当流分隔符）。所以：`rel` 里出现 `:` 一律拒绝。
+        //
+        // ★ 兼容性：Linux 上 `:` 是**合法**文件名（如 `a:b.txt`）。
+        //   但本插件是本地文件服务，`rel` 来自**公网访客**构造的 URL；
+        //   拒绝带冒号的路径只是让 Linux 上极少数带冒号的文件名不可通过
+        //   URL 访问 —— 相较"Windows 上静默绕过滤网"，这个代价可以接受。
+        //   若确有此需求，可改为**仅 Windows** 生效（见下面 cfg 判断）。
+        if rel.contains(':') {
+            // Windows：这是 ADS 语法（或非法文件名）⇒ 一律拒
+            // 其它平台：`:` 合法但来自 URL 的它没有正当理由 ⇒ 同样拒（从严）
+            return ("403 Forbidden", b"forbidden".to_vec(), "text/plain");
+        }
+
         let candidate = root.join(rel);
         // 关键：规范化之后必须仍在 root 之内，否则 `../../etc/passwd` 就能被读走
         let inside = candidate
@@ -857,6 +902,76 @@ mod tests {
         assert_eq!(st, "200 OK");
         let (st, _, _) = static_file::build_response(&dir, "/static", "/ok.txt");
         assert_eq!(st, "404 Not Found", "没带前缀不该命中");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★★ v0.5.8 回归（第七轮审计 **D7-4**，低危）：
+    /// **`static_file` 必须拒绝 NTFS 备用数据流（ADS）写法。**
+    ///
+    /// # 现象（实测 `tmp/audit7/d_independent/repro_d74_ads.py`，9/9）
+    ///
+    /// | 请求 | 修复前 | 修复后 |
+    /// |---|---|---|
+    /// | `/data.txt` | 200 | 200 ✓ |
+    /// | **`/data.txt::$DATA`** | **200（读出内容）** | **403** ✓ |
+    /// | `/data.txt::$data` | 200 | **403** ✓ |
+    /// | `/data.txt:` | 403 | 403 ✓ |
+    ///
+    /// # 定性：**这不是目录穿越**
+    ///
+    /// `::$DATA` 读的是**同一个文件**的默认数据流，`canonicalize` 解析到该文件本身
+    /// ⇒ `starts_with(root)` 仍通过。实测 root **之外**的文件用**任何** ADS 变体
+    /// 都是 403、**零泄漏** ⇒ root 边界未被突破。故为**低危**。
+    ///
+    /// 修它的理由是"入口处拒绝不该出现的形态"：否则"按文件名判断"的那一层
+    /// （扩展名白名单、精确文件名单）可以被 `x.txt::$DATA` 这类写法绕过。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **含 `:` 的路径一律 403**（ADS 语法在合法文件名里不该出现）；
+    /// 2. **正常文件仍然可读**（不能修得过头）；
+    /// 3. **`../` 的既有防护不受影响**。
+    #[test]
+    fn static_file_rejects_ntfs_ads() {
+        let dir = std::env::temp_dir().join("nfrp_plugin_ads_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("data.txt"), b"INSIDE").unwrap();
+
+        // ---- ① 含冒号的形态一律拒绝（ADS）----
+        for evil in [
+            "/data.txt::$DATA",
+            "/data.txt::$data",
+            "/data.txt:",
+            "/data.txt:stream",
+            "/::$DATA",
+        ] {
+            let (st, body, _) = static_file::build_response(&dir, "", evil);
+            assert_eq!(
+                st,
+                "403 Forbidden",
+                "★ {evil:?} 必须被拒绝（NTFS ADS 写法）；实际 {st}，body={:?}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                !body.windows(6).any(|w| w == b"INSIDE"),
+                "{evil:?} 被拒时**不得**读出任何内容"
+            );
+        }
+
+        // ---- ② 正常文件仍然可读（不能修得过头）----
+        let (st, body, _) = static_file::build_response(&dir, "", "/data.txt");
+        assert_eq!(st, "200 OK", "正常文件必须照常可读");
+        assert_eq!(body, b"INSIDE");
+
+        // ---- ③ `../` 的既有防护不受影响 ----
+        for evil in ["/../Cargo.toml", "/sub/../../Cargo.toml"] {
+            let (st, _, _) = static_file::build_response(&dir, "", evil);
+            assert!(
+                st == "403 Forbidden" || st == "404 Not Found",
+                "{evil:?} 的穿越防护不能因为本次修改而失效"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
