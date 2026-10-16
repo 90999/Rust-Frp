@@ -467,6 +467,35 @@ async fn wait_stop(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
 /// 等价原版 `frpc verify -c <配置>`：官方默认 strict 解析、有问题就非 0 退出，
 /// 启动器据此判断"这份配置能不能用"。这里把 `unsupported_fields` 一并报出来 ——
 /// 官方 frpc 对未知字段会**直接报错**，NFrp 只是忽略，得让用户知道差在哪。
+///
+/// ★★ v0.5.7 修（第六轮审计 F-1，中危）：**必须跑完整启动校验，不能只解析配置**。
+///
+/// # 原先为什么错了
+///
+/// 原实现只调 `parse_client` 就报"配置校验通过"，而真正启动还会跑
+/// [`check_web_server_is_safe`] 等启动期检查。实测
+/// （`tmp/audit6-aclverify/verify_client_verify.py`）：
+///
+/// ```toml
+/// [webServer]
+/// addr = "0.0.0.0"    # 绑对外
+/// port = 17300        # 且没配 user/password
+/// ```
+///
+/// * `frpc verify` ⇒ **"配置校验通过"**（退出码 0）
+/// * 真正启动 ⇒ **立刻退出**，报的是"请二选一：① 配 user+password；
+///   ② 把 addr 改回 127.0.0.1；③ 显式写 allowInsecureRemote = true"
+///
+/// ⇒ 与服务端 `frps --check` 是**同一个毛病**（预检只做浅层校验），
+///   属系统性缺陷而非某一处的疏漏。
+///
+/// # 为什么这个方向的假绿灯特别危险
+///
+/// 被漏掉的那条检查恰恰是**安全**检查（对外裸奔的管理界面 = 任何能访问
+/// 该端口的人都能增删隧道、直接停掉客户端）。绿灯会让人**不去检查**它。
+/// 本项目**此前已因"假绿灯"栽过一次**：`reject_unimplemented_plugin` 的注释里
+/// 写着 `frpc verify` 对着未实现的插件回"配置校验通过"，用户拿绿灯上线、
+/// 全量连接才逐个失败。
 fn cmd_verify(a: &VerifyArgs) -> Result<()> {
     let path = a
         .config
@@ -479,6 +508,18 @@ fn cmd_verify(a: &VerifyArgs) -> Result<()> {
         .with_context(|| format!("读取配置 {} 失败", path.display()))?;
     match nfrp_common::config::parse_client(&raw) {
         Ok(cfg) => {
+            // ★ v0.5.7（F-1）：与启动同口径的启动期校验。
+            //
+            // 注意**放在打印"通过"之前** —— 否则会先打"配置校验通过"
+            // 再报错退出，用户（和解析输出的启动器）会被那句"通过"误导。
+            // 这是本节修复的要点：不是"多跑一个检查"，而是
+            // **"通过"这两个字必须只在校验全过之后才出现**。
+            if let Err(e) = check_web_server_is_safe(&cfg) {
+                eprintln!("配置校验失败：{}", path.display());
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+
             println!("配置校验通过：{}", path.display());
             println!("  服务端：{}:{}", cfg.server_addr, cfg.server_port);
             println!(
