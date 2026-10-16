@@ -774,6 +774,48 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     };
     // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
     let tls_on = cfg.tls_enable || cfg.websocket_tls();
+
+    // ★★ v0.5.8 修（第七轮审计 **B-2**，中危）：**`verifyServerCert = true`
+    //    但 TLS 没开时必须显著告警** —— 否则这是"安全配置静默失效"。
+    //
+    // # 原先为什么危险
+    //
+    // `tls::connect_client`（`common/src/frp/tls.rs:312`）第一件事是
+    // `if !enable { return Ok(Box::pin(stream)); }` ——
+    // **`verify` 参数在 `enable == false` 时被完全忽略**，而原先这里
+    // 只在 `tls_on` 为真时才打印"已开启证书校验"。于是：
+    //
+    // 用户配了 `verifyServerCert = true`，看到配置"校验通过"，
+    // 以为**既加密又校验**；实际**两个都没有**，链路是明文。
+    //
+    // # 实测铁证（`tmp/audit7/b_independent/repro_b2_tls.py`，4/4）
+    //
+    // 抓链路首字节：
+    // * 正确开 TLS ⇒ `17 16 03 01 …`（TLS 记录）✓
+    // * 驼峰 `tlsEnable = true` + `verifyServerCert = true` ⇒ **明文**
+    // * 只写 `verifyServerCert = true` ⇒ **明文**
+    //
+    // 明文里**直接可见凭据**：
+    // ```text
+    // {"version":"0.71.0","hostname":"NUO","os":"windows",
+    //  "privilege_key":"35a8601c28fa58a4fdb819c451100ae6", …}
+    // ```
+    // 而 `privilege_key = md5(token + timestamp)` —— 拿到它**可以直接重放登录**。
+    //
+    // ★ 这一条还叠加了第二个坑：**同一结构体里命名风格混用**
+    //   （`config.rs`）：`tls_verify_server_cert` 的 serde 名是驼峰
+    //   `verifyServerCert`，而 `tls_enable` **没有任何 rename**（只能是
+    //   `tls_enable`）。用户照着驼峰风格写 `tlsEnable = true`，
+    //   **serde 静默丢弃**（不报错）⇒ `tls_enable` 保持 false ⇒ 触发本条。
+    if cfg.tls_verify_server_cert && !tls_on {
+        warn!(
+            "配置里写了 `verifyServerCert = true`，但 **TLS 没有开启** —— \
+             证书校验**不会生效**，且链路是**明文**：\
+             登录凭据（privilege_key）可被链路上任何人嗅探并重放。\
+             请同时配上 TLS：`[transport.tls] enable = true`（或 `tls_enable = true`）。"
+        );
+    }
+
     // ★ v0.5.6（L16）：`verifyServerCert = true` 时**真正校验**对端证书。
     //   默认 false ⇒ 与官方 frp 一致（`InsecureSkipVerify = true`），保互通。
     if cfg.tls_verify_server_cert && tls_on {
@@ -1174,7 +1216,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                             warn!(op = %cmd.op, "收到未协商的私有管理命令，忽略");
                             continue;
                         }
-                        let resp = apply_server_cmd(&proxies, &store, &cmd, &mut conn).await;
+                        let resp = apply_server_cmd(&proxies, &cfg.user, &store, &cmd, &mut conn).await;
                         if let Err(e) = &resp {
                             warn!(op = %cmd.op, "回执发送失败：{e:#}");
                         }
@@ -1235,6 +1277,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
 /// 收不到就只能在超时后报「已下发但结果未知」，体验很差。
 async fn apply_server_cmd(
     proxies: &registry::ProxyTable,
+    user: &str,
     store: &store::Store,
     cmd: &msg::ServerCmd,
     conn: &mut FrpConn,
@@ -1242,8 +1285,8 @@ async fn apply_server_cmd(
     let result = match cmd.op.as_str() {
         msg::CMD_ADD_PROXY => add_proxy_cmd(proxies, store, cmd),
         msg::CMD_REMOVE_PROXY => {
-            let name = cmd.proxy_name.clone();
-            if name.is_empty() {
+            let requested = cmd.proxy_name.clone();
+            if requested.is_empty() {
                 Err(anyhow!("remove_proxy 缺少 proxy_name"))
             } else {
                 // ★★ v0.5.5（第四轮 F2）：**只许删动态代理，不许删配置里的**。
@@ -1254,14 +1297,36 @@ async fn apply_server_cmd(
                 // 客户端日志 `按服务端命令移除代理 proxy=victim-ssh total=0`。
                 //
                 // `remove_dynamic` 会对配置来源的条目返回 Err（带人话原因）。
-                match proxies.remove_dynamic(&name) {
+                //
+                // ★ v0.5.8 修（第八轮审计 F8-L2，低危）：**列表名字必须能直接删**。
+                //
+                // 面板列表展示的是线上全名 `{user}.{name}`；v0.5.8 起服务端
+                // 下发的已是本地名，这里再兜一层：原样查不到时，剥掉本客户端
+                // `user` 前缀再查 —— 覆盖"客户端先升级、服务端还是旧版"的
+                // 滚动升级窗口（旧服务端转发的就是面板给的全名）。
+                // 修复前客户端拿全名查本地表 ⇒ 拒删，而服务端侧已经摘干净 ⇒
+                // 两端状态分裂、接口回 502 把"半成功"表达成失败。
+                let mut name = requested.clone();
+                let mut removed = proxies.remove_dynamic(&name);
+                if matches!(removed, Ok(None)) {
+                    let local = util::strip_user_prefix(user, &requested);
+                    if local != requested {
+                        let local = local.to_string();
+                        let again = proxies.remove_dynamic(&local);
+                        if !matches!(again, Ok(None)) {
+                            name = local;
+                            removed = again;
+                        }
+                    }
+                }
+                match removed {
                     Err(e) => Err(anyhow!(e)),
                     Ok(None) => {
                         // 把当前有哪些代理一并报回去 —— 面板上最常见的失败原因
                         // 就是名字打错，光说"没有"用户没法自查
                         let have = proxies.names().join(", ");
                         Err(anyhow!(
-                            "本地没有名为 [{name}] 的代理（当前有：{}）",
+                            "本地没有名为 [{requested}] 的代理（当前有：{}）",
                             if have.is_empty() {
                                 "无".to_string()
                             } else {
@@ -1995,6 +2060,22 @@ bandwidthLimitMode = 'server'
         let p = ProxyConfig {
             name: name.to_string(),
             proxy_type: "tcp".to_string(),
+            // ★ v0.5.8（第七轮审计 E7 附带发现）：**必须给一个合法的 local_addr**。
+            //
+            // 原先这里是 `..Default::default()`（`local_addr` = 空串），
+            // 于是这些用例**意外依赖了"空地址也会被接受"**这个行为。
+            // 而空地址的 tcp 代理**必然连不上任何地方** ——
+            // 面板却回「已生效」（实测见 `tmp/audit7/e/localip_bypass_probe.py`），
+            // 属于"假绿灯"。v0.5.8 起远程下发**拒绝**空 `local_addr`。
+            //
+            // ⇒ 这是**有意的行为收紧**，测试数据跟上被测行为是正确的处置
+            //   （与第六轮"冒烟脚本过时"同一处理原则：先分清是设计变更还是回归，
+            //    确认是前者后再更新测试工件）。
+            //
+            // 给默认值还有个好处：像"不支持的代理类型必须被拒绝"这类用例
+            // 现在能**先过** local_addr 检查，从而确保拒绝的原因真的是**类型**
+            // —— 判据的区分力变强了。
+            local_addr: "127.0.0.1:8080".to_string(),
             remote_port: 7000,
             ..Default::default()
         };
@@ -2017,6 +2098,8 @@ bandwidthLimitMode = 'server'
         let mut p = ProxyConfig {
             name: name.to_string(),
             proxy_type: "tcp".to_string(),
+            // ★ 同上：默认给一个合法回环地址，避免用例意外依赖"空地址被接受"。
+            local_addr: "127.0.0.1:8080".to_string(),
             remote_port: 7000,
             ..Default::default()
         };
@@ -2027,6 +2110,17 @@ bandwidthLimitMode = 'server'
             proxy_name: name.to_string(),
             proxy: Some(serde_json::to_value(&p).expect("序列化")),
             reason: "dashboard".to_string(),
+        }
+    }
+
+    /// 造一条"移除代理"的服务端管理命令。
+    fn remove_cmd(name: &str) -> msg::ServerCmd {
+        msg::ServerCmd {
+            id: "cmd-rm".to_string(),
+            op: msg::CMD_REMOVE_PROXY.to_string(),
+            proxy_name: name.to_string(),
+            reason: "dashboard".to_string(),
+            ..Default::default()
         }
     }
 
@@ -2062,7 +2156,7 @@ bandwidthLimitMode = 'server'
             let (mut me, _peer) = cmd_pair();
             let table = registry::ProxyTable::default();
             let cmd = add_cmd_with("evil", set);
-            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            let err = apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
                 .await
                 .expect_err(&format!("{field} 必须被拒绝"));
             let msg = err.to_string();
@@ -2091,7 +2185,7 @@ bandwidthLimitMode = 'server'
             let (mut me, _peer) = cmd_pair();
             let table = registry::ProxyTable::default();
             let cmd = add_cmd_with("ssrf", |p| p.local_addr = bad.to_string());
-            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            let err = apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
                 .await
                 .expect_err(&format!("{bad} 必须被拒绝"));
             assert!(
@@ -2102,19 +2196,53 @@ bandwidthLimitMode = 'server'
         }
 
         // —— 这些是合法用法，必须放行 ——
-        for ok in [
-            "127.0.0.1:8080",
-            "127.0.0.2:9000",
-            "[::1]:8080",
-            "localhost:3000",
-        ] {
+        //
+        // ★★ v0.5.8（第七轮审计 **E-1**）修正：**`localhost` 从这份白名单里去掉了。**
+        //
+        // 原先这里把 `localhost:3000` 当作"合法的本机地址"放行。E-1 实测证明
+        // 那个假设**不成立**：
+        //
+        // 在 `127.0.0.1:<P>` 与 `[::1]:<P>` 上各起一个诱饵（同端口号），
+        // 远程下发 `local_addr = "localhost:<P>"` ⇒ 被接受，且流量命中
+        // **v6** 诱饵（v4=0 / v6=1）—— 用户配的"本机 v4 服务"被绕到了另一个地址族。
+        // （`tmp/audit7/e_independent/repro_e1_localhost.py`，9/9）
+        //
+        // 根因是**同一语义两套相反实现**：
+        //   * `util::is_loopback_addr` 对 `localhost` 返回 **false**
+        //     （注释写明"解析结果取决于 hosts 与 DNS，不能靠名字赌"）；
+        //   * `config::is_loopback_host` 原先无条件返回 **true**；
+        //   而守卫远程下发路径的是**后者**（弱的那套）。
+        //
+        // ⇒ 现在两边口径统一为"从严"：`localhost` **不再是**合法的远程下发地址。
+        //   要连本机就写 `127.0.0.1` / `::1` —— 明确且不受 hosts/DNS 影响。
+        //   本机配置文件里的 `localhost` 不受影响（这条检查只作用于远程下发）。
+        for ok in ["127.0.0.1:8080", "127.0.0.2:9000", "[::1]:8080"] {
             let (mut me, _peer) = cmd_pair();
             let table = registry::ProxyTable::default();
             let cmd = add_cmd_with("local-ok", |p| p.local_addr = ok.to_string());
-            apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
                 .await
                 .unwrap_or_else(|e| panic!("{ok} 是合法的本机地址，不该被拒：{e}"));
             assert_eq!(table.len(), 1, "{ok} 应当成功加入");
+        }
+
+        // ★ E-1：`localhost` 现在必须被拒（含大小写变体）。
+        //   这是**有意的行为收紧**，不是回归 —— 理由见上面那段注释。
+        for bad_host in ["localhost:3000", "LocalHost:3000", "LOCALHOST:3000"] {
+            let (mut me, _peer) = cmd_pair();
+            let table = registry::ProxyTable::default();
+            let cmd = add_cmd_with("local-bad", |p| p.local_addr = bad_host.to_string());
+            let err = apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
+                .await
+                .expect_err(&format!(
+                    "{bad_host} 必须被拒（E-1）：它的解析结果取决于本机 hosts 与 DNS，\
+                     判据不能靠名字赌"
+                ));
+            assert!(
+                err.to_string().contains("local_addr"),
+                "错误里要点名 local_addr：{err}"
+            );
+            assert_eq!(table.len(), 0, "{bad_host} 被拒时不该留下代理");
         }
     }
 
@@ -2180,7 +2308,7 @@ bandwidthLimitMode = 'server'
                 p.local_addr = String::new();
                 set(p);
             });
-            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            let err = apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
                 .await
                 .expect_err(&format!("{label} 必须被拒绝（哪怕 local_addr 为空）"));
             assert!(
@@ -2202,7 +2330,7 @@ bandwidthLimitMode = 'server'
             p.local_addr = "127.0.0.1:8080".to_string();
             p.remote_port = 6100;
         });
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect("普通的回环代理应当照常放行");
         assert_eq!(table.len(), 1);
@@ -2247,7 +2375,7 @@ bandwidthLimitMode = 'server'
         let (mut me, _peer) = cmd_pair();
         let table = registry::ProxyTable::default();
         let cmd = add_cmd_with("bad-type", |p| p.proxy_type = "not-a-thing".to_string());
-        let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        let err = apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect_err("不支持的代理类型必须被拒绝");
         assert!(
@@ -2262,7 +2390,7 @@ bandwidthLimitMode = 'server'
     async fn 管理命令_新增代理() {
         let (mut me, mut peer) = cmd_pair();
         let table = registry::ProxyTable::default();
-        apply_server_cmd(&table, &no_store(), &add_cmd("panel-web"), &mut me)
+        apply_server_cmd(&table, "", &no_store(), &add_cmd("panel-web"), &mut me)
             .await
             .expect("新增应当成功");
 
@@ -2289,7 +2417,7 @@ bandwidthLimitMode = 'server'
             proxy_name: "nope".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect_err("移除不存在的代理应当失败");
 
@@ -2318,7 +2446,7 @@ bandwidthLimitMode = 'server'
             op: "format_disk".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect_err("未知命令必须失败");
         assert!(expect_cmd_resp(&mut peer).await.error.contains("未知命令"));
@@ -2339,7 +2467,7 @@ bandwidthLimitMode = 'server'
             ..Default::default()
         }]);
 
-        apply_server_cmd(&table, &no_store(), &add_cmd("new"), &mut me)
+        apply_server_cmd(&table, "", &no_store(), &add_cmd("new"), &mut me)
             .await
             .expect("新增");
         let _ = expect_cmd_resp(&mut peer).await;
@@ -2352,7 +2480,7 @@ bandwidthLimitMode = 'server'
             proxy_name: "new".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect("移除动态代理");
         let _ = expect_cmd_resp(&mut peer).await;
@@ -2367,7 +2495,7 @@ bandwidthLimitMode = 'server'
             proxy_name: "old".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect_err("删配置代理必须被拒（F2）");
         let resp = expect_cmd_resp(&mut peer).await;
@@ -2397,7 +2525,7 @@ bandwidthLimitMode = 'server'
             p.remote_port = 9999;
             p.local_addr = "127.0.0.1:9".into();
         });
-        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+        apply_server_cmd(&table, "", &no_store(), &cmd, &mut me)
             .await
             .expect_err("覆盖配置代理必须被拒（F3）");
         let resp = expect_cmd_resp(&mut peer).await;
@@ -2425,5 +2553,59 @@ bandwidthLimitMode = 'server'
             Some(FrpMessage::ServerCmdResp(r)) => r,
             other => panic!("应当是 ServerCmdResp，实际：{other:?}"),
         }
+    }
+
+    /// ★ v0.5.8（第八轮审计 F8-L2，低危）回归：面板列表里的**线上全名**
+    /// 也要能直接删掉。
+    ///
+    /// 服务端 v0.5.8 起下发的已是本地名（`admin.rs` 剥了前缀）；这里覆盖
+    /// "客户端先升级、服务端仍是旧版"的滚动升级窗口 —— 旧服务端转发的就是
+    /// 面板给的全名。修复前客户端拿全名查本地表 ⇒ 拒删 ⇒ 服务端已摘、
+    /// 客户端留条目（两端状态分裂，v2 回 502）。
+    #[tokio::test]
+    async fn 用线上全名也能删除动态代理() {
+        let (mut me, _peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        let user = "probeuser";
+
+        // 动态加两条（`add_proxy_cmd` 会把它们放进"可被远程删除"的表）
+        apply_server_cmd(&table, user, &no_store(), &add_cmd("web"), &mut me)
+            .await
+            .expect("动态添加 web");
+        apply_server_cmd(&table, user, &no_store(), &add_cmd("web2"), &mut me)
+            .await
+            .expect("动态添加 web2");
+        assert_eq!(table.len(), 2);
+
+        // ① 旧服务端行为：下发**全名** `probeuser.web` —— 必须容错到本地名
+        apply_server_cmd(
+            &table,
+            user,
+            &no_store(),
+            &remove_cmd("probeuser.web"),
+            &mut me,
+        )
+        .await
+        .expect("全名删除必须成功（剥本端 user 前缀兜底）");
+        assert!(
+            !table.names().iter().any(|n| n == "web"),
+            "web 应已从本地表删除"
+        );
+
+        // ② 对照：下发本地名（v0.5.8 服务端的正常契约）
+        apply_server_cmd(&table, user, &no_store(), &remove_cmd("web2"), &mut me)
+            .await
+            .expect("本地名删除应成功");
+        assert_eq!(table.len(), 0);
+
+        // ③ 窥探面：不相干的名字不能被"剥前缀"误删
+        //     （user=probeuser，删 "alice.web" 时 strip 是恒等 ⇒ 仍应报"没有"）
+        let err = apply_server_cmd(&table, user, &no_store(), &remove_cmd("alice.web"), &mut me)
+            .await
+            .expect_err("别人的前缀不该被剥");
+        assert!(
+            err.to_string().contains("alice.web"),
+            "错误里保留原名：{err}"
+        );
     }
 }
