@@ -104,6 +104,53 @@ pub async fn serve(cfg: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<()
     serve_with(cfg, registry, ServeExtras::default()).await
 }
 
+/// **启动前的完整校验** —— `frps --check` 应当走这条。
+///
+/// ★★ v0.5.7 修（第六轮审计 F-1，中危）：**预检必须与启动同口径**。
+///
+/// # 原先为什么错了
+///
+/// `--check` 只调用 `main.rs` 里的 `validate(&cfg)` 就返回，而真正启动走的
+/// `serve_with` 还会构造 [`SecurityContext`]（`guard.rs::from_config`），
+/// 那里有一整块**只在启动时**才跑的校验：
+///
+/// | 校验 | 位置 |
+/// |---|---|
+/// | `auth_cfg.validate()` | `guard.rs` |
+/// | `acl.compile()`（CIDR 解析） | `guard.rs` |
+/// | `rbac_config().compile()`（角色 / 端口范围） | `guard.rs` |
+/// | `AuditLog::from_config()`（审计路径可写性） | `guard.rs` |
+///
+/// ⇒ 实测（`tmp/audit6-aclverify/verify_check_gap.py`）：
+/// **`--check` 放过了 5/7 条"启动时必然失败"的配置**，包括
+/// `deny = ["10.0.0.1/33"]`、`portRange = "abc"`、`portRange = "30000-20000"`。
+///
+/// 而 `guard.rs` 的注释原话是：
+/// > 「任何一处配置写错都**在启动时报错**……尤其是 **CIDR / 端口范围这类
+/// >   字符串**，写错了没人会主动去发现。」
+///
+/// —— 这句话描述的**正是** `--check` 应该覆盖的东西，而它恰恰漏了。
+///
+/// # 为什么这不是小事
+///
+/// `--check` 的 help 写着用途是「systemd reload 前的预检 / CI」。
+/// 拿它的绿灯去上线 ⇒ **服务起不来**；更糟的是它**恰好覆盖安全相关配置**
+/// （ACL、RBAC），绿灯会让人**不去检查**这些"写错了没人会主动发现"的部分。
+/// 本项目**此前已因"假绿灯"栽过一次**：`reject_unimplemented_plugin` 的注释里
+/// 写着 `frpc verify` 对着未实现的插件回"配置校验通过"，用户拿绿灯上线、
+/// 全量连接才逐个失败 ⇒ 这是同一类问题的第二次出现。
+///
+/// # 副作用（如实说明）
+///
+/// 与启动一致：配了 `[audit] enable = true` 时**会创建审计日志目录与文件**。
+/// 这是有意的 —— 审计路径不可写属于"启动时才炸"的那一类，预检就该发现它。
+/// 不想要这个副作用就别开审计，或让 `--check` 指向一个可写的临时路径。
+pub fn preflight(cfg: &ServerConfig) -> Result<()> {
+    // 与 `serve_with` 启动路径**同一份**校验，只是不绑端口、不拉 JWKS。
+    crate::guard::SecurityContext::from_config(cfg)?;
+    Ok(())
+}
+
 /// [`serve`] 的完整版本：二进制入口用它把配置文件路径与日志句柄传进来。
 pub async fn serve_with(
     cfg: Arc<ServerConfig>,
@@ -1616,15 +1663,29 @@ async fn handle_work(
         } else if !msg.privilege_key.is_empty() {
             // 带了凭证 ⇒ **必须正确**。这是 NFrp 客户端的路径，
             // 也是攻击者最容易露馅的地方（凭证 = md5(token+ts)，猜不出来）。
-            let expect = nfrp_common::frp::msg::auth_key(&token, msg.timestamp);
-            if !nfrp_common::frp::msg::constant_time_eq(&expect, &msg.privilege_key) {
+            //
+            // ★★ v0.5.7 修（第六轮审计 G-1，高危）：**改调 `verify_login`**。
+            //
+            //   原先这里是就地手写 `auth_key(token, ts)` 比对 —— 内容判对了，
+            //   但**不知道有"新鲜性"这回事**（M3 的时间窗口只加在主登录一处）。
+            //   实测：**一年前**的 `NewWorkConn` 凭证仍被接受，并且打通了
+            //   完整双向 MITM（用户的明文落到攻击者手里、回包由攻击者伪造）。
+            //
+            //   改调 `verify_login` 而不是在这里补一行 `check_freshness`，
+            //   是刻意的：前者的 `skew` 是**必需参数**，想校验凭证就必然
+            //   带上时间窗口 —— 堵掉"下次又有人忘了加"的可能。
+            //   token 模式下 `verify_login` 判的正是同一件事
+            //   （`expected = auth_key(secret, ts)` 再定长比较），语义等价。
+            if let Err(e) = sec.verify_login(&msg.privilege_key, msg.timestamp, &msg.run_id) {
                 registry.audit().record(
                     crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
                         .client(msg.run_id.clone())
                         .ip(peer.ip().to_string())
-                        .detail("工作连接 privilege_key 与 token 不符".to_string()),
+                        .detail(format!("工作连接凭证校验失败：{e:#}")),
                 );
-                anyhow::bail!("工作连接凭证不符（privilege_key 不是本会话 token 派生的）");
+                anyhow::bail!(
+                    "工作连接凭证不符（privilege_key 不是本会话 token 派生的，或已过期）"
+                );
             }
         } else if client.caps().work_conn_cred {
             // ★★ 这条会话**自己声明过**"我的工作连接带凭证"
@@ -1805,7 +1866,31 @@ async fn handle_visitor(
     }
 
     // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
-    if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none() {
+    //
+    // ★★ v0.5.7 修（第六轮审计 D-2，中危）：**空 `run_id` 不再被放行**。
+    //
+    // # 原先为什么错了
+    //
+    // 原判据是 `if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none()`
+    // —— `run_id` 为空时**整条判断被短路**，于是"会话存在性"这一环被整个跳过。
+    // 接着身份推导 `registry.get(&msg.run_id).map(|c| c.user).unwrap_or_default()`
+    // 在空 `run_id` 下退化成**空串**，而 `check_user` 里
+    // `.any(|u| u == "*" || u == visitor_user)` 让空串**命中 `"*"`** ⇒
+    // **一条完全没有登录、没有 token、没有 run_id 的连接**被判定为合法访客。
+    //
+    // 实测（`tmp/audit6-d/_repro_d2_anon.py`）端到端确认：匿名连接发出的
+    // `ANON-PAYLOAD-FROM-NOBODY` **真的到达了 alice 的工作连接**。
+    //
+    // # 为什么可以要求非空
+    //
+    // 官方 frpc 的 visitor **一定**会带自己的 `run_id`
+    // （`common/src/frp/msg.rs` 的 `NewVisitorConn.run_id` 字段注释），
+    // 所以这个收紧对官方客户端**零影响**；而"字段缺失 ⇒ 跳过校验"
+    // 本来就是认证路径上最危险的模式之一。
+    //
+    // 文案与下面所有拒绝路径**完全一致**（不新增可区分信息）——
+    // 否则"空 run_id 被单独拒绝"本身又成了一个可区分信号。
+    let Some(session) = registry.get(&msg.run_id) else {
         // ★★ v0.5.5 修（第四轮 A-3）：**这一条无论如何都只回通用文案**，
         // 不受 `detailed_errors_to_client` 影响。
         //
@@ -1813,13 +1898,18 @@ async fn handle_visitor(
         // 攻击者可以拿任意 run_id 来问"这个会话在线吗"。而
         // `detailed_errors_to_client` 默认是 `true`（与官方一致），
         // 于是默认配置下这个预言机是**敞开的**（实弹 `tmp/a4_t10_state.py`
-        // 打出三条可区分文本）。
+        // 打出三条可区分文本）。现在空 run_id 也走这一条。
         //
         // 为什么可以直接忽略那个开关：`run_id` 是**服务端/客户端内部**生成的，
         // 合法的 visitor 从来不需要"我这条 run_id 在不在线"这个细节 ——
         // 那个开关的存在意义是帮用户排查**自己的配置**（代理名、密钥），
         // 而这条错误里没有任何用户配置信息。所以对它脱敏**不损失可用性**，
         // 只堵掉探测面。详情仍然进服务端日志与审计。
+        warn!(
+            %proxy_name,
+            run_id_empty = msg.run_id.is_empty(),
+            "visitor 的 run_id 为空或找不到对应会话"
+        );
         return reject_with(
             &mut conn,
             &proxy_name,
@@ -1828,41 +1918,64 @@ async fn handle_visitor(
             Some("visitor connection failed".to_string()),
         )
         .await;
-    }
+    };
 
     // 2) 代理必须已注册
     //
-    // ★ 脱敏：不能把"这个代理名到底存不存在"告诉外来者 —— 那是一个
-    //   stcp / sudp 隧道名的枚举接口。短句与"密钥不对"保持同一形态，
-    //   攻击者无法据此区分"名字错"还是"名字对但密钥错"。
+    // ★★ v0.5.7 修（第六轮审计 D-4，中危）：**两条拒绝路径共用同一条文案**。
+    //
+    // # 原先为什么错了
+    //
+    // 原注释写着"短句与『密钥不对』保持同一形态，攻击者无法据此区分
+    // 『名字错』还是『名字对但密钥错』" —— **但代码没有做到**：
+    // 这里回 `custom listener for [X] doesn't exist`，
+    // 下面密钥失败回 `visitor connection of [X] auth failed`，
+    // 两条**结构完全不同**；而且它们都经过 `cfg.error_to_client(...)`，
+    // 受 `detailed_errors_to_client` 控制 —— 那个开关**默认为 `true`**，
+    // 所以注释声称的"无法区分"**在默认配置下完全不成立**。
+    //
+    // 实测（`tmp/audit6-d/d06c_oracle.py`）：4/4 真实隧道名被识别为"存在"、
+    // 3/3 假名被排除，**准确率 100%**，而且**不需要登录 / token / run_id**
+    // （配合上面 D-2 的匿名路径）。
+    //
+    // # 修法：抄同一文件里已经做对的那一处
+    //
+    // 上面 run_id 预言机（A-3）用的是**硬编码固定文案 + 不经过开关** ——
+    // 同一个文件里同类问题的两种处理方式，这次统一成对的那种。
+    // 用户排查自己配置所需的信息（"代理名/密钥配错了"）仍然进服务端日志
+    // 与审计，只是不再回给未认证的对端。
     let Some(entry) = registry.visitors.get(&proxy_name) else {
+        warn!(%proxy_name, "visitor 请求的代理名不存在（细节仅服务端可见）");
         return reject_with(
             &mut conn,
             &proxy_name,
-            format!("custom listener for [{proxy_name}] doesn't exist"),
+            "visitor connection failed".to_string(),
             &registry,
-            Some(cfg.error_to_client(
-                "visitor connection failed",
-                &format!("custom listener for [{proxy_name}] doesn't exist"),
-            )),
+            Some("visitor connection failed".to_string()),
         )
         .await;
     };
 
     // 3) 密钥签名校验：hex(md5(secret_key + timestamp))
-    if !entry.check_sign(&msg.sign_key, msg.timestamp) {
+    //
+    // ★ v0.5.7（第六轮审计 G-1）：把 `registry` 的时钟窗口传进去 ——
+    //   新鲜性校验在 `check_sign` 内部，不是可选项。
+    if !entry.check_sign(
+        &msg.sign_key,
+        msg.timestamp,
+        registry.security().max_clock_skew_secs(),
+    ) {
         warn!(proxy = %proxy_name, "visitor 密钥校验失败");
-        // 这条本身不含敏感信息（只说"认证失败"），但仍统一走开关，
-        // 保证关掉 detailed_errors_to_client 时访客看到的文案形态一致。
+        // ★ v0.5.7（第六轮审计 D-4）：文案与"代理名不存在"那条**逐字一致**，
+        //   且不经过 `detailed_errors_to_client`（那个开关默认 true，
+        //   经过它就等于把"名字对不对"送出去）。
+        //   排查信息进服务端日志，不回给未认证的对端。
         return reject_with(
             &mut conn,
             &proxy_name,
-            format!("visitor connection of [{proxy_name}] auth failed"),
+            "visitor connection failed".to_string(),
             &registry,
-            Some(cfg.error_to_client(
-                "visitor connection failed",
-                &format!("visitor connection of [{proxy_name}] auth failed"),
-            )),
+            Some("visitor connection failed".to_string()),
         )
         .await;
     }
@@ -1871,10 +1984,15 @@ async fn handle_visitor(
     //
     // 与官方 frps 一致：比对的**不是** visitor 的 name，而是发起这条 visitor 连接的那个
     // frpc 在 Login 里声明的顶层 `user`（对应 frpc.toml 的 `user = "alice"`）。
-    let visitor_user = registry
-        .get(&msg.run_id)
-        .map(|c| c.user.clone())
-        .unwrap_or_default();
+    //
+    // ★★ v0.5.7 修（第六轮审计 D-2）：**从上面已经取到的 `session` 直接拿**，
+    //   不再 `registry.get(&msg.run_id).unwrap_or_default()`。
+    //
+    //   后者在 `run_id` 为空（或会话刚好掉线）时退化成**空串**，而
+    //   `check_user` 里 `.any(|u| u == "*" || u == visitor_user)` 会让
+    //   空串**命中 `"*"`** ⇒ 匿名连接被当成合法访客。
+    //   现在第 1 步已经保证会话存在，`user` 必然是真实身份。
+    let visitor_user = session.user.clone();
     if !entry.check_user(&visitor_user) {
         warn!(proxy = %proxy_name, user = %visitor_user, "visitor 用户不在 allow_users 白名单内");
         // ★ 脱敏：**绝不能**把 allow_users 里的真实用户名回显出去 ——
