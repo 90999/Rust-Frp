@@ -168,10 +168,7 @@ pub const ALPN: &[u8] = b"nfrp-xtcp";
 /// 服务端名字：证书是自签且跳过校验的，但 rustls 仍要求它是合法 DNS 名。
 pub const SERVER_NAME: &str = "xtcp.nfrp.local";
 
-/// 应用握手成功时回的字节。
-pub const HANDSHAKE_OK: &[u8] = b"RTNL-OK";
-
-/// P2P 直连建立后的**应用握手口令**。
+/// P2P 直连建立后的**应用握手口令**（visitor → provider）。
 ///
 /// 打洞成功后拿到的是一条裸通道：只要猜中端口，NAT 外的任何人都能连进来。
 /// 所以传输握手之后必须再校验一次口令，把"能连上"和"有权限"这两件事分开。
@@ -180,6 +177,34 @@ pub const HANDSHAKE_OK: &[u8] = b"RTNL-OK";
 pub fn handshake_token(secret_key: &str, sid: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update(secret_key.as_bytes());
+    h.update(b":");
+    h.update(sid.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// P2P 应用握手的**应答口令**（provider → visitor）。
+///
+/// ★ v0.5.8 修（第八轮审计 B-1，高危）：旧协议里 provider 校验完口令后
+/// 只回一个**固定**的 8 字节 `RTNL-OK`，visitor 收到它就认为握手成功。
+/// 而牵线用的 UDP HELLO 既没有鉴权、`sid` 又在报文里明文携带，
+/// 攻击者只要在链路上读到一次 HELLO，就能以 provider 身份抢先登记：
+/// 服务端会把 visitor 的地址发给它，visitor 还会主动连过去并把
+/// **用户的明文流量**交给这个假 provider（会话劫持）。
+///
+/// 修法：应答改成由 `secret_key` + `sid` 派生的口令。攻击者不知道
+/// `secret_key` 就构造不出应答，visitor 会拒绝并回退 stcp 中继
+/// （打洞失败本来就有中继兜底，安全性和可用性不冲突）。
+///
+/// 与 [`handshake_token`] 做**域分离**（哈希前缀不同）：两个值不在
+/// 同一"命名空间"里，避免两端的中间值被互相套用（纵深防御）。
+///
+/// 兼容性：新旧版本混用时会因应答内容不同握手失败，表现为
+/// "P2P 打不通但自动回退中继"，不影响功能正确性（已在 README 说明）。
+pub fn handshake_ack(secret_key: &str, sid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"ack:");
     h.update(secret_key.as_bytes());
     h.update(b":");
     h.update(sid.as_bytes());
@@ -651,6 +676,24 @@ mod tests {
         assert_ne!(a, handshake_token("sk2", "sid1"), "换密钥必须变");
         assert_ne!(a, handshake_token("sk", "sid2"), "换会话必须变（防止重放）");
         // 定长十六进制，方便按字节数读取
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// ★ v0.5.8（第八轮审计 B-1，高危）：应答口令同样绑定 `secret_key`/`sid`，
+    /// 且与请求口令**域分离** —— 两者一旦相等，攻击者把读到的 visitor 口令
+    /// 原样回过去就能过，等于没修。
+    #[test]
+    fn handshake_ack_binds_secret_and_session() {
+        let a = handshake_ack("sk", "sid1");
+        assert_eq!(a, handshake_ack("sk", "sid1"), "同参数必须稳定");
+        assert_ne!(a, handshake_ack("sk2", "sid1"), "换密钥必须变");
+        assert_ne!(a, handshake_ack("sk", "sid2"), "换会话必须变（防止重放）");
+        assert_ne!(
+            a,
+            handshake_token("sk", "sid1"),
+            "请求口令与应答口令必须域分离"
+        );
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
     }
