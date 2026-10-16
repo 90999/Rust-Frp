@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.6-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.5.7-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -196,12 +196,20 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 | **跨租户不得靠 `routeByHTTPUser` 共用域名 + 路径** | 跨租户的多作用域注册会被拒（返回"路径已被占用"） | 服务端分辨不出"合法的多作用域"与"寄生劫持"，而后者能直接收割 Basic 凭据，故收紧。**同租户**的多作用域拓扑（官方 tcpmux 文档的用法）不受影响 |
 | **UDP 回写限"真的发过包的访客 IP"** | 客户端无法让服务端向未通信过的 IP 发 UDP | 防 frps 被当作 UDP 反射跳板。诚实客户端零影响；TFTP 那类"换端口回包"的协议**不受影响**（只限 IP、不限端口） |
 
+**0.5.7 起追加三处**（见 `SECURITY-FIXES-ROUND6.md`）：
+
+| 变更 | 影响 | 处理 |
+|---|---|---|
+| **凭证新鲜性校验铺满全部 6 个入口** | 时间戳超出 `maxClockSkewSecs`（默认 ±300 秒）的登录 / 工作连接 / vnet 注册 / visitor 签名 / p2p 打洞签名**一律拒绝** | **对官方 frpc 无影响**（官方本来就用当前时间，已实测互通）。只有**两端时钟偏差超过 5 分钟**时才会失败 —— 症状是"能连上控制端口但登录被拒"，错误里会写明偏差多少秒。校准时钟，或把 `maxClockSkewSecs` 调大（`0` = 关闭校验） |
+| **跨租户不能用同组名共享公网端口** | 不同 `user` 的客户端即使组名与 `groupKey` 都相同也**不能**共享端口 | 这是堵一个实测打出来的劫持（攻击者能分走一半用户流量）。**同一租户**的多个 frpc（重连、多开、一份配置多条 `[[proxies]]`）照常成组，官方"一个运维跑多个冗余后端"的用法**不受影响** |
+| **visitor 的 `run_id` 不能留空** | 用 `run_id = ""` 的 visitor 连接会被拒 | 官方 frpc 的 visitor **一定**带自己的 `run_id`，所以零影响。原先空值会绕过会话校验（实测匿名连接能把数据送进别人的隧道） |
+
 其余需注意：
 
 - **OIDC 部署必须配 TLS**。OIDC 的 `privilege_key` 是原样的 access token，会明文出现在登录报文里；不加密链路上任何被动抓包的人都能拿走它。
 - **客户端 `transport.tls` 只加密、不校验对端证书**（与官方 frp 行为一致）。它防被动偷看，不防中间人；跨公网直连且需要防 MITM 时请在**外层**再套一层 TLS。
-- **v1 的登录凭据强度完全取决于 token**，而且凭据**可无限期重放**（`md5(token+ts)`，服务端不校验时间戳新鲜性；官方 frp 同样如此）。跨公网部署请用足够随机的 token，并优先 v2 / OIDC。
-- **未配 `[[roles]]` 时，客户端的 `user` 只是自报标签、不是身份**。需要真正的多租户隔离必须配 RBAC。
+- **v1 的登录凭据强度完全取决于 token**。v0.5.7 起服务端**校验时间戳新鲜性**（默认 ±300 秒窗口，见上表），把重放面从"无限期"压到"5 分钟"；但窗口内仍可重放，且**离线枚举 token 的成本与时间窗口无关** ⇒ 跨公网部署请用足够随机的 token，并优先 v2 / OIDC。
+- **`user` 是客户端自报字段，服务端无法验证**。未配 `[[roles]]` 时它只是标签；**配了 `[[roles]]` 之后也一样** —— 任何持有共享 token 的人都能把自己报成别人的 `user` 从而拿到那个人的角色。⇒ `[[roles]]` **不是租户隔离**，只是一层防误操作（v0.5.7 起服务端会就此打启动告警）。需要真正的隔离请用 OIDC（身份来自验签过的 `sub`），或给每租户发独立 token 并分实例部署。
 - **xtcp 的"数据不经服务端"不包含"防服务端"**：服务端持有 `secret_key` 且自行生成 `sid`，理论上能算出 P2P 口令。它防的是**路径上的第三方**，不是服务端本身。
 - 对手不想暴露内部细节时，可设 `detailed_errors_to_client = false`（默认与官方一致为 `true`）：它会把发给客户端的错误换成统一短句，顺带收掉 stcp/xtcp 隧道名的枚举面。
 - **UDP 代理的回写目标受限**（v0.5.6 起）：服务端只向"最近真的给该端口发过包的访客 IP"回写 UDP 报文。这是防 frps 被当成 UDP 反射跳板 —— 正常客户端本来就只回写给刚收到包的地址，**不会感知**。
@@ -220,10 +228,16 @@ cargo test --workspace                    # 699 个测试
 | 目标 | 数量 |
 |---|---|
 | `common` 单元测试 | 332 |
-| `server` 单元测试（lib） | 215 |
-| `server` 单元测试（bin） | 16 |
-| `client` 单元测试 | 106 |
-| `server` 端到端集成测试 | 18 |
+| `server` 单元测试（lib） | 219 |
+| `server` 单元测试（bin） | 17 |
+| `client` 单元测试 | 107 |
+| `server` 端到端集成测试 | 24 |
+| **合计** | **699** |
+
+★ 上表是 **v0.5.7 实测值**（`cargo test --workspace` 逐个 target 数的）。
+v0.5.6 的 README 里这张表是**过时**的（`e2e` 写 18、实际已有 23；
+合计算出来是 692 却被写成 699）。本轮按实测改正 —— 数字对不上时
+以 `cargo test` 的输出为准。
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
 
