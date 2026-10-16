@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use nfrp_common::frp::stream::{BoxStream, PrefixedStream};
@@ -53,6 +54,22 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
 
 use crate::plugin::Ctx;
+
+/// 连接上游 / 与上游做 TLS 握手的超时。
+///
+/// ★ v0.5.8 修（第八轮审计 **F8T-1**，低危）：原先这两个 `await` 都没有
+/// 时限 —— 上游 accept 后保持沉默时，`https2https` 会**永久**卡在上游 TLS
+/// 握手上（实测：后端收了 216B ClientHello 后再无动静，frpc 侧 ESTABLISHED
+/// 永不释放，每轮访问留一条、无上界）。
+///
+/// 注意：**"等响应头"阶段故意不加超时** —— 长轮询 / SSE / WebSocket 的上游
+/// 合法地可能几分钟才出第一个字节，人为上限会伤到正常业务；那一段的收尾由
+/// `wait_upstream` 盯着访问侧负责（访问方撤离 → 立刻放弃）。
+#[cfg(not(test))]
+const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 测试用小值：用例不必真的等 10 秒（超时机制本身照样走同一段代码）。
+#[cfg(test)]
+const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// 5 个桥接插件共用的实现。
 pub struct Bridge {
@@ -186,6 +203,42 @@ impl Bridge {
         r
     }
 
+    /// 等一个"上游侧"的步骤完成，同时盯着访问侧是否撤离。
+    ///
+    /// 返回 `Ok(None)` = 访问侧读到 EOF/出错（访问方走了，别再替它等）；
+    /// 返回 `Ok(Some(t))` = 步骤正常完成；步骤自身的错误照常 `Err` 上抛。
+    ///
+    /// ★ v0.5.8 修（第八轮审计 **F8T-1**，低危）：上游 accept 后保持沉默时，
+    /// 原实现只读上游、不感知访问侧 —— 访问方连上来、把请求发完就撤离
+    /// （TCP FIN + TLS close_notify）也会被无视，插件替一个已经离开的访问者
+    /// 继续等，上游连接**永不释放**；任何能访问该 `remote_port` 的人都可以
+    /// "连接 → 发请求 → 撤离"反复放大（每轮留 1 条 ESTABLISHED，上游永久
+    /// 沉默则无上界）。官方 frpc 基于 Go `http.Server` —— 客户端连接关闭会
+    /// 取消请求上下文、中止上游请求；这里对齐该语义。
+    ///
+    /// 访问侧在此期间读到的字节由 `HttpIo::watch_closed` 存入缓冲，不会丢
+    /// （管道化的下一条请求照常处理）；被 `select!` 取消的那支是取消安全的。
+    async fn wait_upstream<T, S>(
+        io: &mut HttpIo<&mut S>,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<Option<T>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            tokio::select! {
+                r = &mut fut => return Ok(Some(r?)),
+                closed = io.watch_closed() => {
+                    if closed? {
+                        return Ok(None);
+                    }
+                    // 访问侧还有数据（例如管道化请求）：已存进缓冲，继续等。
+                }
+            }
+        }
+    }
+
     /// `tls2raw`：TLS 已经终止，剩下的是明文裸字节，直接和上游对拷。
     async fn serve_raw<S>(&self, stream: &mut S, ctx: &Ctx<'_>) -> Result<()>
     where
@@ -262,12 +315,26 @@ impl Bridge {
             }
 
             let head = self.rewrite_request(&mut req, ctx, upgrading);
-            let mut up = HttpIo::new(self.dial_upstream().await?);
+            // ★ v0.5.8 修（第八轮审计 F8T-1，低危）：连上游、等上游响应这两段
+            //   都**同时盯着访问侧**（见 `wait_upstream` 的说明）——上游悬挂时
+            //   访问方撤离，插件必须立刻收尾，而不是替已经离开的访问者继续等。
+            let Some(up) = Self::wait_upstream(&mut io, self.dial_upstream()).await? else {
+                debug!(proxy = %ctx.proxy_name, "访问方已撤离，放弃连接上游");
+                return Ok(());
+            };
+            let mut up = HttpIo::new(up);
             up.stream.write_all(&head).await?;
             relay_request_body(&mut io, &mut up.stream, &req).await?;
             up.stream.flush().await?;
 
-            let Some(resp_lines) = up.read_head().await? else {
+            let Some(resp_head) = Self::wait_upstream(&mut io, up.read_head()).await? else {
+                debug!(
+                    proxy = %ctx.proxy_name,
+                    "访问方已撤离，释放上游连接（不再替它等响应）"
+                );
+                return Ok(());
+            };
+            let Some(resp_lines) = resp_head else {
                 bail!("上游 {} 在返回任何响应之前就关闭了连接", self.local_addr);
             };
             let mut resp = HeadParts::parse(&resp_lines)?;
@@ -318,10 +385,24 @@ impl Bridge {
     }
 
     /// 连上游：明文或 TLS（不校验证书，对齐官方的 `InsecureSkipVerify: true`）。
+    ///
+    /// ★ v0.5.8 修（第八轮审计 F8T-1，低危）：连接与**上游 TLS 握手**都套
+    /// `UPSTREAM_DIAL_TIMEOUT` —— 悬挂的上游不能把插件永久卡在这里（访问侧
+    /// 撤离的即时收尾另由 `wait_upstream` 负责，两道防线互补）。
     async fn dial_upstream(&self) -> Result<BoxStream> {
-        let tcp = TcpStream::connect(self.local_addr.trim())
-            .await
-            .with_context(|| format!("连接上游 {} 失败（localAddr 配错了？）", self.local_addr))?;
+        let tcp = tokio::time::timeout(
+            UPSTREAM_DIAL_TIMEOUT,
+            TcpStream::connect(self.local_addr.trim()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "连接上游 {} 超时（{:?}）—— 对端不可达或未响应",
+                self.local_addr,
+                UPSTREAM_DIAL_TIMEOUT
+            )
+        })?
+        .with_context(|| format!("连接上游 {} 失败（localAddr 配错了？）", self.local_addr))?;
         tcp.set_nodelay(true).ok();
         if !self.out_tls {
             return Ok(Box::pin(tcp));
@@ -329,10 +410,19 @@ impl Bridge {
         let host = host_part(&self.local_addr);
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| anyhow!("上游地址 {host} 不能用作 TLS 名字：{e}"))?;
-        let conn = TlsConnector::from(client_config()?)
-            .connect(name, tcp)
-            .await
-            .with_context(|| format!("与上游 {} 做 TLS 握手失败", self.local_addr))?;
+        let conn = tokio::time::timeout(
+            UPSTREAM_DIAL_TIMEOUT,
+            TlsConnector::from(client_config()?).connect(name, tcp),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "与上游 {} 做 TLS 握手超时（{:?}）—— 对端 accept 后没有完成握手",
+                self.local_addr,
+                UPSTREAM_DIAL_TIMEOUT
+            )
+        })?
+        .with_context(|| format!("与上游 {} 做 TLS 握手失败", self.local_addr))?;
         Ok(Box::pin(conn))
     }
 
@@ -378,6 +468,53 @@ impl Bridge {
             // http2https：官方是**原样透传**客户端那几行，不做增删。
         } else {
             // http2http：官方不补，等于删掉。
+            //
+            // ★★ v0.5.8 修（第七轮审计 **E-3**，低危）：**补上 `Forwarded`**。
+            //
+            // # 归因校正（我先前的理解与 E 组的说法都过于笼统）
+            //
+            // E 组报的是"只剥离 3 个 `X-Forwarded-*`，另外 9 个客户端 IP 头原样透传"。
+            // 我去查了**本机权威副本** `tmp/frp-0.71.0/pkg/plugin/client/http_common.go:36-51`，
+            // 发现官方 `rewriteHTTPPluginRequest` **自己一个头都没删**：
+            //
+            // ```go
+            // func rewriteHTTPPluginRequest(req *http.Request, scheme string, localAddr string, ...) {
+            //     req.URL.Scheme = scheme
+            //     req.URL.Host = localAddr
+            //     if hostHeaderRewrite != "" { req.Host = hostHeaderRewrite }
+            //     for k, v := range requestHeaders.Set { req.Header.Set(k, v) }
+            // }
+            // ```
+            //
+            // 真正删头的是 Go 的 `httputil.ReverseProxy` —— 它在**调用 `Rewrite` 之前**
+            // 就把这些头从 `Out` 移掉了。Go 官方文档原文（pkg.go.dev/net/http/httputil）：
+            //
+            // > The **Forwarded, X-Forwarded, X-Forwarded-Host, and X-Forwarded-Proto**
+            // > headers are removed from the outbound request before Rewrite is called.
+            //
+            // ⇒ **官方删的是 4 个，不是 3 个**，NFrp 漏的**只有 `Forwarded`**。
+            //
+            // # 实测（`tmp/audit7/e_independent/repro_e3_forwarded.py`，6/6）
+            //
+            // 上游实际收到（其余全被正确删除）：
+            // ```text
+            // forwarded            ← ❌ 未删除（与官方不一致）
+            // x-forwarded-for      ← ✅ 已删除
+            // x-forwarded-host     ← ✅ 已删除
+            // x-forwarded-proto    ← ✅ 已删除
+            // ```
+            //
+            // # 为什么**只**补这一个（不补那 8 个）
+            //
+            // `X-Real-IP` / `X-Client-IP` / `X-Originating-IP` / `X-Remote-IP` /
+            // `X-Remote-Addr` / `True-Client-IP` / `CF-Connecting-IP` / `X-ProxyUser-Ip`
+            // —— 这 8 个**官方也不删**（它们不在 Go 的那份清单里）。
+            // 删它们会**偏离官方语义**：用户的后端/中间件可能正依赖这些头，
+            // 而官方 frp 会把它们透传过去。**那是"修得过头"** ——
+            // 第四轮已经因为"修得过头把合法的也拒了"返工过一次，不再犯。
+            //
+            // ⇒ 判据是"**与官方一致**"，而不是"我觉得该删哪些"。
+            req.remove("forwarded");
             req.remove("x-forwarded-for");
             req.remove("x-forwarded-host");
             req.remove("x-forwarded-proto");
@@ -653,6 +790,69 @@ mod tests {
         assert!(raw.contains("Connection: close"), "{raw}");
     }
 
+    /// ★★ v0.5.8 回归（第七轮审计 **E-3**，低危）：
+    /// **`http2http` 必须删掉官方删除的完整 4 个头 —— 含 `Forwarded`。**
+    ///
+    /// # 判据来自官方，不是"我觉得该删哪些"
+    ///
+    /// 官方 `rewriteHTTPPluginRequest`（`tmp/frp-0.71.0/pkg/plugin/client/http_common.go:36-51`）
+    /// **自己一个头都不删**；真正删头的是 Go 的 `httputil.ReverseProxy`，
+    /// 它在调用 `Rewrite` **之前**就把这些头移掉。Go 官方文档原文：
+    ///
+    /// > The **Forwarded, X-Forwarded, X-Forwarded-Host, and X-Forwarded-Proto**
+    /// > headers are removed from the outbound request before Rewrite is called.
+    ///
+    /// ⇒ 官方删 **4 个**；NFrp 原先只删 3 个，**漏了 `Forwarded`**
+    ///   （实测 `tmp/audit7/e_independent/repro_e3_forwarded.py`，6/6：
+    ///   上游收到了 `forwarded`）。
+    ///
+    /// # 反向也要锁住：**不该删的不能删**
+    ///
+    /// `X-Real-IP` / `X-Client-IP` / `CF-Connecting-IP` 等 8 个"客户端 IP 类"头
+    /// **官方也不删**（不在那份清单里）。删它们会偏离官方语义、
+    /// 破坏依赖这些头的后端 —— 那是"**修得过头**"，
+    /// 第四轮已经因为"修得过头把合法的也拒了"返工过一次。
+    #[test]
+    fn http2http_要删掉官方清单里的全部四个头() {
+        let b = bridge("http2http");
+        let mut req = parts(&[
+            "GET / HTTP/1.1",
+            "Host: h",
+            "Forwarded: for=6.6.6.6",
+            "X-Forwarded-For: 6.6.6.6",
+            "X-Forwarded-Host: evil.example.com",
+            "X-Forwarded-Proto: https",
+            // ★ 官方**不删**的两个代表（用来守住"别修得过头"）
+            "X-Real-IP: 6.6.6.6",
+            "CF-Connecting-IP: 6.6.6.6",
+        ]);
+        let raw = String::from_utf8(b.rewrite_request(&mut req, &ctx(), false)).unwrap();
+        let low = raw.to_ascii_lowercase();
+
+        // ---- ① 官方清单里的 4 个必须全删 ----
+        for h in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+        ] {
+            assert!(
+                !low.contains(&format!("{h}:")),
+                "★ `{h}` 必须被删除（Go Rewrite 在调用前就移除它）—— \
+                 原先漏了 `Forwarded`，与官方语义不一致（E-3）。实际报文：{raw}"
+            );
+        }
+
+        // ---- ② 官方不删的不能被误删（防"修得过头"）----
+        for h in ["x-real-ip", "cf-connecting-ip"] {
+            assert!(
+                low.contains(&format!("{h}:")),
+                "`{h}` **不该**被删 —— 官方也不删它（不在 Go 那份清单里）。\
+                 删掉会偏离官方语义、破坏依赖它的后端。实际报文：{raw}"
+            );
+        }
+    }
+
     #[test]
     fn http2https_要原样透传_x_forwarded() {
         let b = bridge("http2https");
@@ -851,6 +1051,175 @@ mod tests {
             serve_one(s, reply).await
         });
         (addr, h)
+    }
+
+    /// 假上游：accept 后**永远沉默**（不回任何字节）。
+    ///
+    /// - `got`：已经读到对端第一段数据（明文请求 / TLS ClientHello）时汇报
+    ///   —— 用例据此确认"插件真的连上并走到了等待点"再撤离访问方；
+    /// - `closed`：看守到对端关闭（EOF/RST）时汇报 —— 用例据此断言
+    ///   "上游连接真的被释放了"。
+    ///
+    /// 两个通道都只是观测用，mod 里没有超时就靠 300ms 轮询 + 20 次保底收尾。
+    #[allow(clippy::type_complexity)]
+    async fn silent_upstream() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let l = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定假上游失败");
+        let addr = l.local_addr().unwrap();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+        let (cls_tx, cls_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.expect("假上游 accept 失败");
+            let mut b = [0u8; 4096];
+            // 第一段数据（请求 / ClientHello）读到就汇报，之后闭嘴
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), s.read(&mut b)).await {
+                let _ = got_tx.send(());
+            }
+            let mut idle = 0u32;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(300), s.read(&mut b)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(_)) => {}
+                    Err(_) => {
+                        idle += 1;
+                        if idle > 20 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = cls_tx.send(());
+        });
+        (addr, got_rx, cls_rx)
+    }
+
+    /// 假上游：读到请求后**延迟**再回响应（模拟合法的慢上游 / 长轮询）。
+    async fn slow_upstream(reply: &'static [u8], delay: Duration) -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定假上游失败");
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.expect("假上游 accept 失败");
+            let _ = read_request(&mut s).await;
+            tokio::time::sleep(delay).await;
+            let _ = s.write_all(reply).await;
+            let _ = s.flush().await;
+        });
+        addr
+    }
+
+    /// 起一个 `Bridge::plain` 并把访问侧端点交给用例（不读响应、不做断言）。
+    fn spawn_drive(b: Bridge) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<()>>) {
+        let (cli, srv) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            let ctx = real_ctx();
+            b.serve(Box::pin(srv), Vec::new(), &ctx).await
+        });
+        (cli, task)
+    }
+
+    /// ★ v0.5.8（第八轮审计 **F8T-1**，低危）回归：上游 accept 后悬挂、
+    /// 访问方撤离（FIN），插件必须**立刻**释放上游连接 —— 而不是像修复前
+    /// 那样替一个已经离开的访问者一直等响应（每轮访问留 1 条 ESTABLISHED，
+    /// 公开访问方可反复放大）。
+    #[tokio::test]
+    async fn 上游悬挂时访问方撤离必须释放上游连接() {
+        let (addr, got, closed) = silent_upstream().await;
+        let (mut cli, task) = spawn_drive(Bridge::plain(cfg_to(addr), false, false));
+        write_req(&mut cli, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        // 确认插件已经连上并走到"等响应"再撤离（否则断在别处也算过，测不准）
+        tokio::time::timeout(Duration::from_secs(2), got)
+            .await
+            .expect("上游 2s 内应当收到请求")
+            .expect("通道不该丢");
+        drop(cli); // 访问方撤离
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("访问方撤离后 2s 内上游连接必须被释放")
+            .expect("通道不该丢");
+        let r = tokio::time::timeout(TIMEOUT, task)
+            .await
+            .expect("插件应当立即收尾")
+            .expect("插件任务不 panic");
+        assert!(r.is_ok(), "访问方撤离应当安静收尾：{r:?}");
+    }
+
+    /// ★ v0.5.8（第八轮审计 **F8T-1**）回归（上游 TLS 握手悬挂）：`https2https`
+    /// 卡在"与上游握手"时访问方撤离，同样必须**立刻**放弃并释放那条 TCP 连接。
+    #[tokio::test]
+    async fn 上游tls握手悬挂时访问方撤离必须释放连接() {
+        let (addr, got, closed) = silent_upstream().await; // 纯 TCP 沉默，不回应 ClientHello
+        let (mut cli, task) = spawn_drive(Bridge::plain(cfg_to(addr), false, true)); // out_tls = true
+        write_req(&mut cli, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        // 上游收到 ClientHello ⇒ 插件确实卡在握手里
+        tokio::time::timeout(Duration::from_secs(2), got)
+            .await
+            .expect("上游 2s 内应当收到 ClientHello")
+            .expect("通道不该丢");
+        drop(cli);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("访问方撤离后 2s 内上游连接必须被释放")
+            .expect("通道不该丢");
+        let r = tokio::time::timeout(TIMEOUT, task)
+            .await
+            .expect("插件应当立即收尾")
+            .expect("插件任务不 panic");
+        assert!(r.is_ok(), "访问方撤离应当安静收尾：{r:?}");
+    }
+
+    /// ★ v0.5.8（第八轮审计 **F8T-1**）回归（上游 TLS 握手无超时）：访问方
+    /// 还活着、上游 accept 后沉默时，上游 TLS 握手必须**有界**失败 ——
+    /// 修复前会永久卡住（连接永不释放）。测试用缩短的超时（800ms）。
+    #[tokio::test]
+    async fn 上游tls握手沉默时有界失败() {
+        let (addr, _got, _closed) = silent_upstream().await;
+        let (mut cli, task) = spawn_drive(Bridge::plain(cfg_to(addr), false, true));
+        let t0 = std::time::Instant::now();
+        write_req(&mut cli, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let r = tokio::time::timeout(TIMEOUT, task)
+            .await
+            .expect("上游 TLS 握手必须**有界**失败，不能永久挂住")
+            .expect("插件任务不 panic");
+        let e = r.expect_err("沉默上游 + 在线访问方：应当报握手超时");
+        assert!(format!("{e:#}").contains("超时"), "错误要说清是超时：{e:#}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "应当快速失败（test 超时 800ms），实际 {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// 反向回归（F8T-1 的兼容性约束）：上游只是**慢**（2s 才出响应）时不能
+    /// 误伤 —— 访问方在线，响应必须完整送达；"等响应头"阶段故意没有人为
+    /// 超时（长轮询 / SSE 的合法等待不能被砍）。
+    #[tokio::test]
+    async fn 慢响应上游照常送达不误伤() {
+        let addr = slow_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            Duration::from_millis(2000),
+        )
+        .await;
+        let (mut cli, task) = spawn_drive(Bridge::plain(cfg_to(addr), false, false));
+        write_req(&mut cli, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let out = read_resp(&mut cli).await; // TIMEOUT = 5s，2s 的响应在窗口内
+        assert!(
+            out.starts_with(b"HTTP/1.1 200"),
+            "慢上游的响应必须完整送达：{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(out.ends_with(b"ok"));
+        let r = tokio::time::timeout(TIMEOUT, task)
+            .await
+            .expect("插件应正常收尾")
+            .expect("插件任务不 panic");
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// 生成一对自签证书落盘，返回 `(crtPath, keyPath)` —— 给 `https2*` / `tls2raw` 用。
