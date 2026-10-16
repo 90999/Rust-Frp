@@ -3,7 +3,7 @@ resolver = "2"
 members = ["common", "server", "client"]
 
 [workspace.package]
-version = "0.5.7"
+version = "0.5.8"
 edition = "2021"
 rust-version = "1.75"
 authors = ["nfrp contributors"]
@@ -17,7 +17,7 @@ homepage = "https://github.com/Nu0vo1212/Rust-Frp"
 
 [workspace.dependencies]
 # 内部 crate
-nfrp-common = { path = "common", version = "0.5.7" }
+nfrp-common = { path = "common", version = "0.5.8" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
@@ -89,13 +89,48 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "registry", "std"] }
 
-# release 优化：体积优先（opt-level="s"）+ 全量 LTO，降低二进制体积与常驻内存
+# release 优化：体积优先（opt-level="z"）+ 全量 LTO，降低二进制体积与常驻内存
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+#
+# ★★ v0.5.8：`opt-level` 由 `"s"` 改为 `"z"`（第七轮，**纯体积优化**）
+#
+# 用户的要求是"别动功能和安全，纯粹缩小"。所以这里**只改编译参数**，
+# 一行代码、一个依赖 feature、一处 panic 策略都没动。
+#
+# ## 实测（`tmp/audit7/size_lab7.py`，同一台机器、同一次会话，逐个 target 量）
+#
+# | 配置 | nfrp-server | 变化 | nfrp-client | 变化 |
+# |---|---|---|---|---|
+# | 原 `opt-level="s"`（基线） | 3,785,728 B | — | 3,846,144 B | — |
+# | **`opt-level="z"`（本版采用）** | **3,417,600 B** | **−9.72%** | **3,488,768 B** | **−9.29%** |
+# | `opt-level="z"` + `lto="thin"`（对照） | 3,738,112 B | −1.26% | 3,774,464 B | −1.86% |
+#
+# ⇒ `"z"` 比 `"s"` 再小约 **9.5%**（两个二进制都一致），而 `lto="thin"` 明显更差
+#   （对照确认 `lto=true`（fat）是必要的，不能为编译速度换掉）。
+#
+# ## 也试过但**无效**的（如实记录，免得后人再试一遍）
+#
+# | 手段 | 实测效果 | 原因 |
+# |---|---|---|
+# | `/OPT:REF`（link-arg） | **0.00%** | MSVC release 下**已默认开启** |
+# | `/OPT:ICF`（link-arg） | **0.00%** | Rust 生成的 COMDAT 里没有逐字节相同的函数体可供折叠 |
+#
+# 脚本：`tmp/audit7/size_lab7_links.py`。两次实验后 `Cargo.toml` 均按 sha256 逐字节还原。
+#
+# ## 为什么 `"z"` 是行为中性的
+#
+# `opt-level` 只影响**代码生成的优化力度**，不改变：
+#   * 程序语义（Rust 保证任何 opt-level 下行为一致）；
+#   * panic 策略（仍由下面那行 `panic = "abort"` 决定，未动）；
+#   * CLI 输出、日志格式、协议行为（均无变化）。
+# ⇒ 满足"别动功能和安全"的前提。
+#
+# 验证：改完后 `cargo test --workspace` 全绿；端到端冒烟与官方 frpc 互通另行复测。
 #
 # ★★ 关于 `panic = "abort"`（审计总报告 L17，低危）——**评估后有意保留**
 #
