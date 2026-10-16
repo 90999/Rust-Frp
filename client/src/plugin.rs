@@ -226,6 +226,52 @@ pub fn parse_authority(s: &str, default_port: u16) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+/// 从一行 HTTP 头里取出 `Proxy-Authorization` 的值。
+///
+/// ★★ v0.5.7 修（第六轮审计 G-2）：**只按小写比对头名，值保持原样**。
+///
+/// # 原先为什么错了
+///
+/// 原写法是 `l.to_ascii_lowercase().strip_prefix("proxy-authorization:")`
+/// —— `to_ascii_lowercase()` 作用在**整行**上，取出来的值
+/// **已经被小写化**，且没有任何地方还原。
+///
+/// 而下游 [`basic_ok`] 用的是大小写**敏感**的
+/// `v.strip_prefix("Basic ")` ⇒ 小写化后的 `"basic amc6amc="`
+/// **永远比不上** `"Basic "` ⇒ `basic_ok()` 恒返回 false。
+///
+/// # 实际症状（实测复现，`tmp/audit6-g/t11_auth_final.py`）
+///
+/// **只要配了 `pluginUser`/`pluginPassword`，`http_proxy` 插件就恒回
+/// `407 Proxy Authentication Required`，功能完全不可用** ——
+/// 无论客户端发哪种凭证形态（`Basic` / `basic` / `BASIC` / 无关值）都是 407。
+/// 去掉 username 后同一份配置立刻 `200 OK`（证明通道本身是通的）；
+/// 横向对照 `socks5`（另一条代码路径、无小写化）认证正常
+/// ⇒ 这是 `http_proxy` 独有的 bug。
+///
+/// # 修法
+///
+/// 头名本来就**大小写不敏感**（RFC 7230 §3.2），所以拿小写副本去
+/// **匹配头名**是对的；错的是从那个小写副本里**取值**。
+/// 现在按小写副本判断"是不是这个头"，再从**原行**上切出值。
+///
+/// ★ 这与审计总报告 M4（INI 段名/键名大小写）属**同一类**
+///   "大小写处理不一致"：一个把该敏感的弄成不敏感，
+///   一个把该保留原样的弄成了小写。
+///
+/// 单独成函数（而不是留在 async 处理函数里内联）是为了**让它可被单测覆盖** ——
+/// 原先的 `basic_auth_rules` 测试直接调 `basic_ok`，**绕过了**出 bug 的
+/// 头部解析，所以那个 bug 一直没被测出来。
+fn proxy_auth_from_line(l: &str) -> Option<String> {
+    // 头名大小写不敏感 ⇒ 用副本判断
+    if !l.to_ascii_lowercase().starts_with("proxy-authorization:") {
+        return None;
+    }
+    // 值必须从**原行**取，保留 `Basic ` 的原始大小写
+    let raw = l.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+    Some(raw.trim().to_string())
+}
+
 /// 校验 HTTP 代理的 Basic 认证；不需要认证时直接放行。
 fn basic_ok(header_value: Option<&str>, user: &str, passwd: &str) -> bool {
     if user.is_empty() {
@@ -276,8 +322,8 @@ mod http_proxy {
             if l.is_empty() {
                 break;
             }
-            if let Some(v) = l.to_ascii_lowercase().strip_prefix("proxy-authorization:") {
-                proxy_auth = Some(v.trim().to_string());
+            if let Some(v) = proxy_auth_from_line(&l) {
+                proxy_auth = Some(v);
             }
         }
 
@@ -700,6 +746,77 @@ mod tests {
         assert!(
             !basic_ok(Some("Basic !!!"), "a", "b"),
             "非法 base64 不能 panic"
+        );
+    }
+
+    /// ★★ v0.5.7 新增（第六轮审计 G-2）：**头部解析 + 认证必须端到端串起来测**。
+    ///
+    /// # 为什么原来的测试没抓住这个 bug
+    ///
+    /// 上面的 `basic_auth_rules` 直接调 `basic_ok`，**绕过了**真正出错的
+    /// 头部解析那一步。而 bug 恰恰在解析里：`to_ascii_lowercase()` 作用在
+    /// **整行**上，把 `Basic ` 也小写成了 `basic `，而 `basic_ok` 的大小写
+    /// 敏感匹配 `strip_prefix("Basic ")` 就永远比不中。
+    ///
+    /// ⇒ **只测了一半的链路 = 没测**。这与审计里"防线写对了但只铺了一半"
+    ///   是同一个教训，只不过发生在测试上。
+    ///
+    /// # 实测症状（`tmp/audit6-g/t11_auth_final.py`）
+    ///
+    /// 配了 `pluginUser` 的 `http_proxy` **恒回 407**，功能完全不可用；
+    /// 去掉 username 立刻 `200 OK`。socks5 不受影响（另一条路径）。
+    #[test]
+    fn 代理认证的头部解析必须保留大小写() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let b64 = STANDARD.encode(b"alice:pw");
+        let expect = format!("Basic {b64}");
+
+        // ① 头名大小写不敏感：三种写法都要能认出来
+        for name in [
+            "Proxy-Authorization:",
+            "proxy-authorization:",
+            "PROXY-AUTHORIZATION:",
+        ] {
+            let line = format!("{name} {expect}");
+            let got =
+                proxy_auth_from_line(&line).unwrap_or_else(|| panic!("头名 {name:?} 应当被识别"));
+            assert_eq!(
+                got, expect,
+                "取出来的值必须**原样保留** `Basic ` 的大小写（{name:?}）\
+                 —— 被小写化就会让 basic_ok 恒返回 false，插件配了用户名就完全不可用"
+            );
+        }
+
+        // ② 端到端串起来：解析出的值必须能通过认证
+        //   （这是真正锁住 bug 的断言 —— 单测 ① 只保证取值对，
+        //     这一条保证"取值对"确实能让认证通过）
+        for name in ["Proxy-Authorization:", "proxy-authorization:"] {
+            let line = format!("{name} {expect}");
+            let parsed = proxy_auth_from_line(&line).expect("应当解析出值");
+            assert!(
+                basic_ok(Some(&parsed), "alice", "pw"),
+                "配了正确凭据必须通过（{name:?}）—— 原先这里恒为 false，恒回 407"
+            );
+        }
+
+        // ③ 不是这个头就返回 None（别把别的头误当成凭据）
+        assert!(proxy_auth_from_line("Authorization: Basic xxx").is_none());
+        assert!(proxy_auth_from_line("X-Proxy-Authorization: Basic xxx").is_none());
+        assert!(proxy_auth_from_line("").is_none());
+
+        // ④ 冒号后带前导空格（HTTP 的常见形态）要能正确 trim
+        let line = format!("Proxy-Authorization:   Basic {b64}");
+        let parsed = proxy_auth_from_line(&line).expect("应当解析出值");
+        assert_eq!(parsed, format!("Basic {b64}"));
+        assert!(basic_ok(Some(&parsed), "alice", "pw"));
+
+        // ⑤ 大小写不同的 scheme：RFC 里 scheme 也是大小写不敏感，但
+        //    **本插件的既有行为**只认 `Basic `（官方 frpc 也只认这个）。
+        //    这里把现状钉住，避免"顺手改成不敏感"引入行为漂移 ——
+        //    真要不敏感请连同这条测试一起改，并说明理由。
+        assert!(
+            !basic_ok(Some(&format!("basic {b64}")), "alice", "pw"),
+            "scheme 大小写：保持既有行为（只认 `Basic `），改动需同步改这条测试"
         );
     }
 
