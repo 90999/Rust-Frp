@@ -58,8 +58,30 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 与 OIDC 首次验签（JWKS 已在启动时预热），超时即断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// WebSocket 升级请求的前缀：`"GET " + FrpWebsocketPath`。
+/// ★★ v0.5.8（第七轮审计 A-1）：**认证前连接失败日志的折叠器**。
 ///
+/// # 为什么是"折叠"而不是"限速"—— 这是实测踩出来的
+///
+/// 第一版只做了速率限制（20 条/秒）。复现时发现：**攻击者只要把速率压到
+/// 配额以下就能继续写盘** ——
+///
+/// | 版本 | 慢速打（100 条/1.2s，低于配额）的日志增长 |
+/// |---|---|
+/// | 修复前 | 12500 B/轮（放大 **125×**） |
+/// | 速率限制版 | 2549 B/轮（放大 **12.5×**，**仍然在涨**） |
+///
+/// ⇒ 速率限制对"慢速打"**结构性无效**。
+///
+/// 真正有界的是折叠：同一失败原因在一个窗口内只写**首条**，
+/// 其余只累加计数，下个窗口写一条"已折叠 N 条"的汇总。
+/// ⇒ 无论攻击者打多快多慢，**每窗口最多两条日志**，磁盘增长有**上界**。
+///
+/// 取 1 条/秒、突发 2 条：正常部署里"每秒一条同类连接失败"本身就值得注意，
+/// 而汇总信息保证运维不会误以为风平浪静。
+/// ⇒ 磁盘增长上界 ≈ 1 条/秒 × 125 B ≈ **0.4 MiB/小时**（修复前是 274 MiB/小时）。
+static CONN_END_LOG: nfrp_common::util::FoldedLog = nfrp_common::util::FoldedLog::new(1.0, 2.0);
+
+/// WebSocket 升级请求的前缀：`"GET " + FrpWebsocketPath`。///
 /// **与官方 frps 的判定完全一致**（`server/service.go`）：
 ///
 /// ```ignore
@@ -471,7 +493,39 @@ pub async fn serve_on_with(
                 let registry = registry.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(stream, peer, cfg, registry).await {
-                        warn!(%peer, "连接结束：{e:#}");
+                        // ★★ v0.5.8 修（第七轮审计 **A-1**，中危）：**限流这条 WARN**。
+                        //
+                        // # 原先为什么错了
+                        //
+                        // 这是**认证之前**的连接失败日志，而每一条连接失败都会
+                        // 走这里。触发成本极低：连上 `bind_port` 后发**一个非法字节**
+                        // （或直接连接后关闭）即可。
+                        //
+                        // 实测（`tmp/audit7/a/a22_final_log_amplification.py`）：
+                        //
+                        // | 指标 | 实测值 |
+                        // |---|---|
+                        // | 放大比 | **125×**（1 字节上行 ⇒ 125 字节日志） |
+                        // | 速率 | **77.9 KiB/s ≈ 274 MiB/小时** |
+                        // | 对照组（合法登录） | **0.99×**（无放大） |
+                        // | 轮转 | 按天，**无大小上限** ⇒ 当天写入不受约束 |
+                        //
+                        // ⇒ **未认证的对手可以用极小带宽把日志盘打满**。
+                        //   而服务端**不会崩溃**（RSS 稳定、进程存活），所以极易被忽视。
+                        //
+                        // # 修法（第二版，折叠而非限速）
+                        //
+                        // 只**折叠日志**，不改任何行为：连接照常拒绝、审计照常记录。
+                        // 同一失败原因每 5 秒窗口最多写两条（首条 + 汇总），
+                        // ⇒ 磁盘增长有**上界**，与攻击速率无关。
+                        //
+                        // ★ 第一版只做速率限制（20 条/秒），实测**对慢速打无效**
+                        //   —— 攻击者把速率压到配额以下就绕过了（仍有 12.5× 放大）。
+                        //   详见 `CONN_END_LOG` 的文档注释。
+                        let d = CONN_END_LOG.observe();
+                        if d.emit() {
+                            warn!(%peer, "连接结束：{e:#}{}", d.suffix());
+                        }
                     }
                 });
             }
@@ -1485,6 +1539,45 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // ★★ v0.5.8 修（第七轮审计 F7-1，中危）：**数据面也要过 ACL**。
+                //
+                // # 原先为什么错了
+                //
+                // `[acl]`（IP 白/黑名单）的唯一判定入口是
+                // `SecurityContext::check_ip`，而它全仓只有 2 处调用：
+                // 控制连接握手（`handle_frp_stream`）与 VirtualNet 注册。
+                // **公网代理端口这条承载用户流量的路径上完全没有它。**
+                //
+                // 实测（`tmp/audit7/f/acl_dataplane_v3.py`，9/9 判据通过）：
+                // 同一个服务端、同一份配置 `deny = ["127.0.0.1"]`，
+                // 只改源地址 ——
+                //
+                // | 路径 | 源地址 | 结果 |
+                // |---|---|---|
+                // | 控制面 | 127.0.0.1（被 deny） | 被拒 ✓ |
+                // | 控制面 | 192.168.3.15（放行） | 登录成功 ✓ |
+                // | 数据面 | 192.168.3.15（正对照） | 转发成功 ✓ |
+                // | **数据面** | **127.0.0.1（被 deny）** | **照常转发** ✗ |
+                //
+                // ⇒ 管理员用 ACL 表达"只允许某些来源访问"，实际只挡住了管理面，
+                //   业务端口对全网开放。用**白名单**模式时更糟 —— 白名单形同虚设。
+                //
+                // 这与本项目连续六轮的模式一致："防线写对了，但没铺满它声称
+                // 保护的所有路径"。修法就是把它铺到数据面的 accept 点上。
+                //
+                // 顺序与 `handle_frp_stream` 一致：ACL 是位运算，放在最前面最便宜。
+                // 拒绝时**静默关连接**（不回任何数据）：这条路径上面对的是
+                // 陌生访客，不该泄露"你被 ACL 拒了"这类可区分信息。
+                let sec = registry.security();
+                if let Err(reason) = sec.check_ip(peer.ip()) {
+                    registry.audit().record(
+                        crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                            .ip(peer.ip().to_string())
+                            .detail(format!("{reason}（公网端口 {remote_port} 数据面）")),
+                    );
+                    debug!(%peer, port = remote_port, "数据面 IP 访问控制拒绝：{reason}");
+                    continue;
+                }
                 // group 负载均衡：这个端口背后可能挂着多个客户端（同组代理），
                 // 每条新连接轮询挑一个；挑不到说明后端全掉了，直接关掉。
                 // 选**在途连接最少**的后端，并立刻给它记一条 ——
@@ -1791,10 +1884,7 @@ async fn handle_work(
     }
     // 工作连接继承控制连接协商出的 UDP 报文编码
     conn.set_udp_codec(client.udp_codec_is_binary());
-    let work = WorkItem {
-        conn,
-        at: Instant::now(),
-    };
+    let work = WorkItem::new(conn);
     match client.submit_work(work) {
         Some(p) => {
             debug!(proxy = %p.user.proxy, "工作连接与排队用户配对");
