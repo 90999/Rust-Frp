@@ -30,9 +30,34 @@ pub struct VisitorEntry {
 
 impl VisitorEntry {
     /// 校验 visitor 的签名：`hex(md5(secret_key + timestamp))`。
-    pub fn check_sign(&self, sign_key: &str, timestamp: i64) -> bool {
-        let expected = nfrp_common::frp::msg::auth_key(&self.secret_key, timestamp);
-        nfrp_common::frp::msg::constant_time_eq(&expected, sign_key)
+    ///
+    /// ★★ v0.5.7 修（第六轮审计 G-1，高危）：**`skew` 是必需参数，
+    ///    新鲜性校验就嵌在函数体里**。
+    ///
+    /// # 原先为什么错了
+    ///
+    /// 旧签名是 `check_sign(&self, sign_key, timestamp)`，只比内容、
+    /// **完全不看 `timestamp` 有多旧** ⇒ 嗅探到一条 `NewVisitorConn`
+    /// 即可**无限期重放**加入他人的私密隧道。实测**一年前**的报文仍被接受。
+    ///
+    /// 这与 M3 修过的"登录凭证重放"是**同一个洞的另一条路径** ——
+    /// M3 只铺了主登录一处，而凭证入口一共有 6 个
+    /// （见第六轮审计报告 G-1 的覆盖面表）。
+    ///
+    /// # 为什么把 skew 做成必需参数
+    ///
+    /// 只要"只校验内容"这个入口存在，调用方就可能忘了查新鲜性 ——
+    /// 这正是本轮的成因。现在**没有只比内容的入口**：想校验签名就必须
+    /// 提供时间窗口（`skew = 0` 是显式的"我要关掉它"，不是默认值）。
+    pub fn check_sign(&self, sign_key: &str, timestamp: i64, skew: u64) -> bool {
+        nfrp_common::security::verify_shared_secret_proof(
+            &self.secret_key,
+            sign_key,
+            timestamp,
+            skew,
+            "visitor 签名",
+        )
+        .is_ok()
     }
 
     /// 校验访客用户是否被允许，语义与官方 frps 完全一致：
@@ -43,7 +68,26 @@ impl VisitorEntry {
     /// ```
     ///
     /// 注意比对的是**访问方 frpc 顶层的 `user`**（`Login.User`），不是 `[[visitors]]` 的 `name`。
+    ///
+    /// ★★ v0.5.7 修（第六轮审计 D-2，中危）：**空串显式判 false**（纵深防御）。
+    ///
+    /// # 为什么
+    ///
+    /// 官方语义里 `"*"` 是"任意**已登录的 frpc 用户**可访问"，
+    /// **不是**"任意 TCP 连接可访问"。而 `.any(|u| u == "*" || u == visitor_user)`
+    /// 在 `visitor_user` 为空串时会让 `u == "*"` **直接命中** ⇒
+    /// 一个"没有身份"的连接被当成合法访客。
+    ///
+    /// 调用点（`serve.rs` 的 `handle_visitor`）本轮已经改成
+    /// "空 `run_id` 一律拒绝 + 身份从会话反查"，所以这里**正常情况下
+    /// 不会再收到空串**。但认证路径上"字段缺失 ⇒ 跳过校验"是危险模式，
+    /// 所以在**判据本身**里再堵一层：即使将来某个调用点又传了空串，
+    /// 它也不会被当成"匹配任意"。
     pub fn check_user(&self, visitor_user: &str) -> bool {
+        // ★ 没有身份 ≠ 匹配任意
+        if visitor_user.is_empty() {
+            return false;
+        }
         if self.allow_users.is_empty() {
             return self.provider_user == visitor_user;
         }
@@ -164,6 +208,60 @@ mod tests {
 
         assert!(t.remove(&me, "u.sec1").is_some(), "持有者应当能摘掉");
         assert!(t.get("u.sec1").is_none(), "摘掉之后查不到了");
+    }
+
+    /// ★★ v0.5.7 新增（第六轮审计 D-2，中危）：**空串身份不是"匹配任意"**。
+    ///
+    /// # 锁的是什么
+    ///
+    /// 官方语义里 `allow_users = ["*"]` 是"任意**已登录的 frpc 用户**可访问"，
+    /// **不是**"任意 TCP 连接可访问"。而 `.any(|u| u == "*" || u == visitor_user)`
+    /// 在 `visitor_user` 为空串时会让 `u == "*"` **直接命中**
+    /// ⇒ 一个"没有身份"的连接被当成合法访客。
+    ///
+    /// 实测（`tmp/audit6-d/_repro_d2_anon.py`）端到端确认过：匿名连接发出的
+    /// payload **真的到达了 alice 的工作连接**。
+    ///
+    /// # 为什么这条测试必须单独存在（退回验证发现的）
+    ///
+    /// D-2 有**两层**修复：
+    /// 1. `serve.rs`：空 `run_id` 一律拒绝 + 身份从会话反查
+    /// 2. `visitor.rs`（本函数）：空串显式判 false（**纵深防御**）
+    ///
+    /// 第 1 层已经让空串**走不到**这里，所以把第 2 层退掉时**原有测试仍全绿** ——
+    /// 退回验证（`tmp/verify_round6_revert.py`）就是这样发现"这一层没有测试"的。
+    /// 纵深防御层**必须有独立的测试**，否则它只是个没人验证的注释。
+    #[test]
+    fn 空身份不能匹配星号白名单() {
+        // 空 allow_users：退化成"只允许 provider 自己的 user"
+        let mut e = entry("u.sec1", &dummy_client("me"));
+        e.allow_users = Vec::new();
+        e.provider_user = "bob".into();
+        assert!(
+            !e.check_user(""),
+            "空身份不能等同于 provider_user（除非 provider_user 本身是空）"
+        );
+        assert!(e.check_user("bob"), "provider 自己的 user 应当放行");
+        assert!(!e.check_user("alice"), "别的 user 应当拒绝");
+
+        // ★ 被测的那条：`["*"]`（"对所有人开放"）也不能被空身份命中
+        e.allow_users = vec!["*".into()];
+        assert!(
+            !e.check_user(""),
+            "`allow_users = [\"*\"]` 的语义是『任意**已登录用户**』，\
+             不是『任意 TCP 连接』—— 空身份必须被拒，否则匿名连接会被当成合法访客"
+        );
+        assert!(
+            e.check_user("anyone"),
+            "有身份的任意用户应当放行（* 的本意）"
+        );
+
+        // 具名白名单同样不能被空身份命中
+        e.allow_users = vec!["bob".into(), "carol".into()];
+        assert!(!e.check_user(""), "空身份不得命中具名白名单");
+        assert!(e.check_user("bob"));
+        assert!(e.check_user("carol"));
+        assert!(!e.check_user("dave"));
     }
 
     /// ★★ B-1 核心回归：**别的租户不能按名字摘掉我的记录**。
