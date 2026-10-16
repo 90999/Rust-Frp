@@ -198,12 +198,26 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
 
     // 客户端那侧：失败也只是它表里多留一条（服务端已经不放流量进来了），
     // 所以这里只告警、不回滚
+    //
+    // ★ v0.5.8 修（第八轮审计 F8-L2，低危）：下发给客户端的是**本地名**。
+    //
+    // 面板列表（`/api/status`、`/api/v2/proxies`）展示的是线上全名
+    // `{user}.{name}`，管理员照抄列表里的全名来删是最自然的用法。原先这里
+    // 原样转发面板给的名字 ⇒ 客户端拿全名去查**本地表**（键是无前缀的原始名）
+    // 必然查不到 ⇒ 拒删、回执失败。而此时服务端侧已经摘干净了（上面
+    // `canonical_wire_name` 生效）—— 结果是**两端状态分裂**：服务端已摘、
+    // 客户端本地表仍保留，接口却用 502/400 把"半成功"表达成失败
+    // （自动化按返回码判断会得出错误结论：重试/放弃都不对）。
+    //
+    // `wire_name` 既然已是 canonical 全名，剥掉前缀就是客户端契约里的名字；
+    // 客户端侧另有兜底（兼容"客户端先升级、服务端还是旧版"的滚动升级窗口）。
+    let local_name = nfrp_common::util::strip_user_prefix(&client.user, &wire_name).to_string();
     match ask(
         &client,
         ServerCmd {
             id: new_cmd_id(),
             op: msg::CMD_REMOVE_PROXY.to_string(),
-            proxy_name: name.to_string(),
+            proxy_name: local_name,
             reason: "dashboard".to_string(),
             ..Default::default()
         },
@@ -422,5 +436,74 @@ maxProxies = 1
             .await
             .expect_err("端口越界必须被角色拒绝");
         assert!(!e.is_empty(), "应当给出拒绝理由：{e}");
+    }
+
+    /// ★ v0.5.8（第八轮审计 F8-L2，低危）回归：面板传**线上全名**时，
+    /// 下发给客户端的必须剥成**本地名**。
+    ///
+    /// 客户端按本地表（键 = 配置/动态添加时的原始名）查名字，收到
+    /// `alice.web` 这种全名必然查不到 ⇒ 拒删；而服务端侧已经摘干净了 ⇒
+    /// 两端状态分裂 + 接口回 502。这里直接截获下发的 `CtrlCmd::ServerCmd`
+    /// 断言名字契约，避免整机启动客户端的重量级集成。
+    #[tokio::test]
+    async fn 面板传全名时下发给客户端的是本地名() {
+        let r = Arc::new(Registry::unlimited());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
+        let (conn, backlog, proxy) = ServerLimits::default().per_client();
+        let c = Arc::new(ClientState::new(
+            "c1".to_string(),
+            "c1".to_string(),
+            "alice".to_string(), // 线上全名 = alice.{name}
+            tx,
+            Duration::from_secs(60),
+            Default::default(),
+            false,
+            nfrp_common::frp::WireVersion::V1,
+            conn,
+            backlog,
+            proxy,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        ));
+        r.insert(c.clone()).expect("插入");
+
+        // 管理员从列表复制的全名
+        let runner = tokio::spawn({
+            let r = r.clone();
+            async move { remove_proxy(&r, "c1", "alice.web").await }
+        });
+
+        match rx.recv().await.expect("必须向客户端下发删除命令") {
+            CtrlCmd::ServerCmd { cmd, ack } => {
+                assert_eq!(cmd.op, msg::CMD_REMOVE_PROXY);
+                assert_eq!(
+                    cmd.proxy_name, "web",
+                    "客户端侧的名字契约是本地名（无 alice. 前缀）"
+                );
+                let _ = ack.send(Ok(()));
+            }
+            _ => panic!("下发的应当是 ServerCmd"),
+        }
+        let msg = runner
+            .await
+            .expect("任务不 panic")
+            .expect("回执成功后应返回 Ok");
+        assert!(
+            msg.contains("alice.web"),
+            "返回文案保留面板给的名字，便于对照：{msg}"
+        );
+
+        // 传本地名时同样下发本地名（幂等，不能把正常路径弄坏）
+        let runner = tokio::spawn({
+            let r = r.clone();
+            async move { remove_proxy(&r, "c1", "web").await }
+        });
+        match rx.recv().await.expect("第二次删除命令") {
+            CtrlCmd::ServerCmd { cmd, ack } => {
+                assert_eq!(cmd.proxy_name, "web");
+                let _ = ack.send(Ok(()));
+            }
+            _ => panic!("下发的应当是 ServerCmd"),
+        }
+        runner.await.expect("任务不 panic").expect("成功");
     }
 }
