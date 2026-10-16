@@ -15,7 +15,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -54,16 +54,39 @@ const MAX_SAMPLES: usize = 8;
 struct Session {
     /// 会话创建时间：刚 create 出来、两端都还没到的时候全靠它保命。
     created: Instant,
+    /// ★ v0.5.8 修（第八轮审计 B-1，高危）：两个角色在**控制连接**上的源 IP。
+    ///
+    /// 牵线用的 UDP HELLO 是零鉴权的：谁先发到谁就是这个角色，`sid` 又在
+    /// 报文里明文携带。攻击者只要在链路上读到一次 HELLO，就能抢先以
+    /// provider 身份登记，把 visitor 的直连引到自己的地址上（随后用固定
+    /// 应答骗过 visitor —— 见 `nfrp_common::p2p::handshake_ack` 的注释）。
+    ///
+    /// 控制连接是过了 token 鉴权的，所以这里把角色的来源钉死在控制连接
+    /// 的 IP 上：**不同主机的 HELLO 一律拒收**。同一 NAT 后的攻击者
+    /// （公网 IP 相同）穿得过这一层也没关系 —— 那一层由派生应答口令兜底，
+    /// 两层是独立的纵深防御。
+    visitor_ip: IpAddr,
+    provider_ip: IpAddr,
     visitor: Option<PeerSlot>,
     provider: Option<PeerSlot>,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(visitor_ip: IpAddr, provider_ip: IpAddr) -> Self {
         Self {
             created: Instant::now(),
+            visitor_ip,
+            provider_ip,
             visitor: None,
             provider: None,
+        }
+    }
+
+    /// 该角色**允许**的 HELLO 来源 IP。
+    fn expected_ip(&self, role: Role) -> IpAddr {
+        match role {
+            Role::Visitor => self.visitor_ip,
+            Role::Provider => self.provider_ip,
         }
     }
 
@@ -107,6 +130,40 @@ impl Session {
     }
 }
 
+/// 两个 IP 是否同一个主机。
+///
+/// 双栈监听时同一台主机可能出现两种写法：控制连接报 `::ffff:127.0.0.1`
+/// （IPv4-mapped IPv6）而 UDP 牵线 socket 报裸 `127.0.0.1`。不折算直接比
+/// 会把合法 peer 误判成"IP 不符"，让 P2P 全部退化到中继 —— 那属于安全
+/// 修复引入的可用性回归，必须在比较层就消掉。
+fn same_host(a: &IpAddr, b: &IpAddr) -> bool {
+    fn norm(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 => v4,
+        }
+    }
+    norm(*a) == norm(*b)
+}
+
+/// `register` 的结果。
+///
+/// 单独拆出 `IpMismatch` 是为了让调用方能明确区分"对端还没到"和
+/// "有人从错误的地址冒充 peer"（后者要打 warn，方便事后排查）。
+pub enum RegisterOutcome {
+    /// sid 不存在：从未创建 / 已过期 / 已被消费。
+    NoSession,
+    /// HELLO 来源 IP 与该角色控制连接的 IP 不符 —— 拒绝登记。
+    IpMismatch,
+    /// 已记下地址，但对端还没到。
+    Waiting,
+    /// 两端到齐：返回对端全部观测地址与协商出的传输。
+    Ready(Vec<SocketAddr>, p2p::Transport),
+}
+
 /// 全部进行中的打洞会话。
 #[derive(Default)]
 pub struct P2PHub {
@@ -119,10 +176,14 @@ impl P2PHub {
     }
 
     /// 预建一条会话（visitor 发起 NatHoleVisitor 时建立）。
-    pub fn create(&self, sid: &str) {
+    ///
+    /// `visitor_ip` / `provider_ip` 是两端**控制连接**的源 IP：之后该角色
+    /// 的 HELLO 必须来自这个 IP（见 [`Session`] 的字段注释）。
+    pub fn create(&self, sid: &str, visitor_ip: IpAddr, provider_ip: IpAddr) {
         let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_locked(&mut g);
-        g.entry(sid.to_string()).or_insert_with(Session::new);
+        g.entry(sid.to_string())
+            .or_insert_with(|| Session::new(visitor_ip, provider_ip));
     }
 
     /// 记下某个角色的一个观测地址。
@@ -135,10 +196,18 @@ impl P2PHub {
         role: Role,
         addr: SocketAddr,
         transport: p2p::Transport,
-    ) -> Option<(Vec<SocketAddr>, p2p::Transport)> {
+    ) -> RegisterOutcome {
         let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_locked(&mut g);
-        let session = g.get_mut(sid)?;
+        let Some(session) = g.get_mut(sid) else {
+            return RegisterOutcome::NoSession;
+        };
+        // ★ v0.5.8 修（第八轮审计 B-1，高危）：角色来源必须与控制连接同主机。
+        //   注册在会话上的 IP 来自过了 token 鉴权的 TCP 控制连接，攻击者
+        //   伪造不了 —— 于是"随便谁先发 HELLO 谁就是这个角色"的窗口关死。
+        if !same_host(&addr.ip(), &session.expected_ip(role)) {
+            return RegisterOutcome::IpMismatch;
+        }
         session.observe(role, addr, transport);
         // 传输由 **visitor** 说了算：它是主动发起的一方，也只有它知道自己
         // 那条链路是弱网（该走 KCP）还是普通宽带（QUIC 更省事）。
@@ -147,8 +216,10 @@ impl P2PHub {
             .get(Role::Visitor)
             .map(|s| s.transport)
             .unwrap_or(transport);
-        let other = session.get(role.peer())?;
-        Some((other.addrs.clone(), chosen))
+        match session.get(role.peer()) {
+            Some(other) => RegisterOutcome::Ready(other.addrs.clone(), chosen),
+            None => RegisterOutcome::Waiting,
+        }
     }
 
     /// 回收超时会话，避免一个永不过期的 sid 把内存慢慢吃满。
@@ -210,9 +281,23 @@ pub async fn run_rendezvous(sock: Arc<UdpSocket>, hub: Arc<P2PHub>) {
             continue;
         };
         debug!(%peer, ?role, %sid, ?transport, "收到 HELLO");
-        let Some((peer_addrs, chosen)) = hub.register(&sid, role, peer, transport) else {
-            debug!(%peer, %sid, "对端还没到，先记下地址");
-            continue;
+        let (peer_addrs, chosen) = match hub.register(&sid, role, peer, transport) {
+            RegisterOutcome::NoSession => {
+                debug!(%peer, %sid, "未知或已过期的 sid，忽略");
+                continue;
+            }
+            RegisterOutcome::Waiting => {
+                debug!(%peer, %sid, "对端还没到，先记下地址");
+                continue;
+            }
+            RegisterOutcome::IpMismatch => {
+                // ★ v0.5.8 修（第八轮审计 B-1）：可能有人在冒名登记，
+                //   也可能只是多宿主 / 双栈解析差异 —— 两种都拒绝，
+                //   由客户端按既有逻辑回退中继（打洞失败本来就有兜底）。
+                warn!(%peer, %sid, ?role, "HELLO 来源 IP 与控制连接不符，拒绝登记");
+                continue;
+            }
+            RegisterOutcome::Ready(addrs, chosen) => (addrs, chosen),
         };
         // 关键动作：把对方的地址分别发给两端，双方同时开打才能穿过 NAT。
         // 用 PEERS（多个地址）而不是 PEER：对称 NAT 下 peer 要靠这一串端口
@@ -331,7 +416,9 @@ pub async fn handle_nat_hole_visitor(
     };
 
     let sid = nfrp_common::util::new_run_id();
-    hub.create(&sid);
+    // ★ v0.5.8 修（第八轮审计 B-1）：把两个角色的 HELLO 来源钉在各自的
+    //   控制连接 IP 上（控制连接过了 token 鉴权，伪造不了）。
+    hub.create(&sid, visitor_client.peer_ip(), entry.client.peer_ip());
 
     // 5) 回给 visitor：拿到 sid 后去 UDP 端口发 HELLO
     visitor_client.forward_to_client(FrpMessage::NatHoleResp(NatHoleResp {
@@ -417,33 +504,97 @@ mod tests {
     fn hub_pairs_two_peers_and_reaps_stale() {
         let hub = P2PHub::new();
         let sid = format!("{:032x}", 7u64);
-        hub.create(&sid);
+        // 控制连接 IP：visitor 1.2.3.4 / provider 5.6.7.8（HELLO 只认这两个 IP）
+        hub.create(&sid, "1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap());
         assert_eq!(hub.len(), 1);
 
         let a: SocketAddr = "1.2.3.4:100".parse().unwrap();
         let b: SocketAddr = "5.6.7.8:200".parse().unwrap();
         // 只有一端到：拿不到对端地址
-        assert!(hub
-            .register(&sid, Role::Visitor, a, p2p::Transport::Quic)
-            .is_none());
+        assert!(matches!(
+            hub.register(&sid, Role::Visitor, a, p2p::Transport::Quic),
+            RegisterOutcome::Waiting
+        ));
         // 另一端到：双方互推
-        let (addrs, chosen) = hub
-            .register(&sid, Role::Provider, b, p2p::Transport::Quic)
-            .expect("两端到齐");
+        let (addrs, chosen) = match hub.register(&sid, Role::Provider, b, p2p::Transport::Quic) {
+            RegisterOutcome::Ready(addrs, chosen) => (addrs, chosen),
+            _ => panic!("两端到齐必须返回 Ready"),
+        };
         assert_eq!(addrs, vec![a]);
         assert_eq!(chosen, p2p::Transport::Quic);
         hub.finish(&sid);
         assert_eq!(hub.len(), 0, "会话结束必须清理，避免 sid 复用串会话");
 
-        // 未 create 过的 sid 直接 register 应当安全返回 None
-        assert!(hub
-            .register(
+        // 未 create 过的 sid 直接 register 应当安全返回 NoSession
+        assert!(matches!(
+            hub.register(
                 &format!("{:032x}", 9u64),
                 Role::Visitor,
                 a,
                 p2p::Transport::Quic
-            )
-            .is_none());
+            ),
+            RegisterOutcome::NoSession
+        ));
+    }
+
+    /// ★ v0.5.8（第八轮审计 B-1，高危）回归：HELLO 的来源 IP 必须与该角色
+    /// **控制连接**的 IP 一致。修复前牵线端口对 HELLO 零鉴权 —— 攻击者从
+    /// 任意地址抢先登记为 provider，就能把 visitor 引到自己的地址上。
+    #[test]
+    fn hello_from_wrong_ip_is_rejected() {
+        let hub = P2PHub::new();
+        let sid = format!("{:032x}", 11u64);
+        hub.create(
+            &sid,
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+        );
+
+        // 攻击者（不同主机）冒充任一角色，都必须在登记这一步被拒
+        let evil: SocketAddr = "203.0.113.66:40000".parse().unwrap();
+        assert!(matches!(
+            hub.register(&sid, Role::Provider, evil, p2p::Transport::Quic),
+            RegisterOutcome::IpMismatch
+        ));
+        assert!(matches!(
+            hub.register(&sid, Role::Visitor, evil, p2p::Transport::Quic),
+            RegisterOutcome::IpMismatch
+        ));
+
+        // 被拒的地址不能被记进任何槽位：合法两端仍然正常配对
+        let v: SocketAddr = "10.0.0.1:100".parse().unwrap();
+        let p: SocketAddr = "10.0.0.2:200".parse().unwrap();
+        assert!(matches!(
+            hub.register(&sid, Role::Visitor, v, p2p::Transport::Quic),
+            RegisterOutcome::Waiting
+        ));
+        match hub.register(&sid, Role::Provider, p, p2p::Transport::Quic) {
+            RegisterOutcome::Ready(addrs, _) => assert_eq!(addrs, vec![v]),
+            _ => panic!("合法 provider 应当能配对"),
+        }
+    }
+
+    /// 双栈下同一主机的 IPv4-mapped 表示必须被当成"同一个 IP"，
+    /// 否则安全修复会误杀合法 P2P（全量退化中继）。
+    #[test]
+    fn v4_mapped_ip_counts_as_same_host() {
+        let hub = P2PHub::new();
+        let sid = format!("{:032x}", 12u64);
+        hub.create(
+            &sid,
+            "127.0.0.1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+        );
+        let v: SocketAddr = "127.0.0.1:100".parse().unwrap();
+        let p: SocketAddr = "127.0.0.1:200".parse().unwrap();
+        assert!(matches!(
+            hub.register(&sid, Role::Visitor, v, p2p::Transport::Quic),
+            RegisterOutcome::Waiting
+        ));
+        assert!(matches!(
+            hub.register(&sid, Role::Provider, p, p2p::Transport::Quic),
+            RegisterOutcome::Ready(..)
+        ));
     }
 
     #[tokio::test]
