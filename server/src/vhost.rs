@@ -465,6 +465,25 @@ pub async fn run_vhost(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // ★★ v0.5.8 修（第七轮审计 F7-1，中危）：**数据面也要过 ACL**。
+                //
+                // 与 `serve.rs::proxy_accept_loop` 同一处修复：vhost 端口
+                // （http / https / tcpmux）同样是承载用户流量的数据面，
+                // 原先只挂 Basic Auth / SNI 路由，**完全没有 ACL 判定**。
+                //
+                // 拒绝时静默关连接（不回 403）：对陌生访客不该泄露
+                // "你的 IP 被 ACL 拒了"这种可区分信息 —— 与
+                // `handle_frp_stream` 那边回统一文案是同一个理由。
+                let sec = registry.security();
+                if let Err(reason) = sec.check_ip(peer.ip()) {
+                    registry.audit().record(
+                        crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                            .ip(peer.ip().to_string())
+                            .detail(format!("{reason}（{} 端口 {port} 数据面）", kind.label())),
+                    );
+                    debug!(%peer, kind = kind.label(), "数据面 IP 访问控制拒绝：{reason}");
+                    continue;
+                }
                 let table = table.clone();
                 let registry = registry.clone();
                 let opts = opts.clone();
@@ -1208,6 +1227,31 @@ where
         };
         let mut resp = HeadParts::parse(&resp_lines)?;
 
+        // ★★ v0.5.8 修（第七轮审计 D7-2，中危）：**响应侧的 framing 校验**。
+        //
+        // 请求侧早有 `validate_request_framing`（TE+CL / 重复 CL / 不支持的 TE
+        // 三项全 400），而响应侧**一项都没有** —— 内网服务回什么就转发什么。
+        //
+        // 这与 D7-1 是同一条链路上的两个洞：
+        //   * D7-1 = 响应侧的**判定口径**与请求侧不一致（`contains` vs RFC）；
+        //   * D7-2 = 响应侧**根本没有校验**。
+        //
+        // 两者都会导致下游连接去同步（不同实现取不同的响应边界）⇒ 走私/投毒。
+        // 修法一致：**失败关闭**，回 502 而不是猜。
+        //
+        // 注意顺序：必须在**剥逐跳头之前**校验 —— 因为 `Connection` 里点名的
+        // 头会被剥掉，而 framing 判定要看到原始报头。
+        if let Err(why) = nfrp_common::http_relay::validate_response_framing(&resp) {
+            warn!(%peer, proxy = %route.proxy_name, "响应 framing 不合法，拒绝转发：{why}");
+            io.stream
+                .write_all(&simple_response(
+                    "502 Bad Gateway",
+                    "内网服务返回的响应报头不合法（framing 走私风险）\n",
+                ))
+                .await?;
+            return Ok(());
+        }
+
         // ★★ v0.5.4 修（L2）：**响应侧也要剥逐跳头**。
         //
         // 原先只有请求侧剥了（见上面那段加入 `HOP_BY_HOP` 的注释），
@@ -1229,10 +1273,59 @@ where
             let code: u32 = start.parse().unwrap_or(200);
             let no_body =
                 (100..200).contains(&code) || code == 204 || code == 304 || method == "HEAD";
+
+            // ★★ v0.5.8 修（第七轮审计 D7-1，高危）：**响应侧必须用与请求侧同一套
+            //    RFC 口径判 `Transfer-Encoding`。**
+            //
+            // # 原先为什么错了
+            //
+            // 这里（以及下面转发响应体那处）用的是
+            // `te.to_ascii_lowercase().contains("chunked")` —— 而**同一个文件**的
+            // 请求侧（`:1061`/`:1075`）早就改成了 RFC 口径的
+            // [`http_relay::is_chunked`] / [`http_relay::transfer_encoding_is_unsupported`]，
+            // `client/src/plugin_bridge.rs` 也用 `is_chunked`。
+            // `http_relay.rs:500-522` 的注释里**明确写着** `contains("chunked")`
+            // 正是第四轮 C 组修掉的走私写法。
+            //
+            // ⇒ 请求侧修了、响应侧没修。**这是"防线没铺满"的教科书案例**，
+            //   也是本项目连续多轮出现的同一个模式。
+            //
+            // # 后果（实测，`tmp/audit7/d_independent/repro_d71_smuggle.py`）
+            //
+            // 后端对 `/alice` 回 `Transfer-Encoding: chunked, identity`：
+            // * NFrp（`contains`）认为"是 chunked" ⇒ 按 chunked 方式转发；
+            // * RFC 7230 §3.3.3 的严格下游看**最后一个 token**（是 `identity`）
+            //   ⇒ 认为**不是** chunked ⇒ 读到连接关闭为止。
+            //
+            // 口径分歧 = 走私。实测下游只解析出 **1 条**响应，body 里混进了
+            // 下一个访客的响应：
+            //
+            // ```text
+            // HTTP/1.1 200 OK / TE: chunked, identity / connection: keep-alive
+            // d\r\nALICE-SECRET!\r\n0\r\n\r\n
+            // HTTP/1.1 200 OK / Content-Length: 11 / connection: keep-alive
+            // BOB-PRIVATE
+            // ```
+            // ⇒ RFC 下游的 body = `...ALICE-SECRET!\r\n0\r\n\r\nHTTP/1.1 200 OK...BOB-PRIVATE`
+            // ⇒ **Bob 的响应被当成 Alice 的响应体**（跨访客响应走私）。
+            //
+            // 对照（都通过，排除探针问题）：`Content-Length` 正常分离；
+            // 合法 `chunked`（唯一 token）正确分离、**未误伤**。
+            //
+            // # 修法
+            //
+            // 与请求侧**共用同一个判定函数**，而不是在这里再手写一遍 ——
+            // 手写就会再次漂移。`is_chunked` 的口径是"最后一个 token 是 chunked
+            // 且前面只有 identity"，`identity, chunked` 这种 RFC 合法形态仍被接受
+            // （第四轮专门修过"修得过头把合法的也拒了"）。
+            let resp_te_chunked = nfrp_common::http_relay::is_chunked(&resp);
             let framed = if no_body {
                 true
-            } else if let Some(te) = resp.get("transfer-encoding") {
-                te.to_ascii_lowercase().contains("chunked")
+            } else if resp.get("transfer-encoding").is_some() {
+                // 不支持的 TE 形态（如 `chunked, gzip`）⇒ 无法安全定界
+                // ⇒ 当作"未分帧"，让调用方走 `Connection: close` 读完即断，
+                //    而不是按自己以为的方式去读（那正是走私的成因）。
+                resp_te_chunked
             } else {
                 resp.get("content-length").is_some()
             };
@@ -1250,16 +1343,25 @@ where
             io.stream.write_all(&resp.to_bytes()).await?;
 
             // ---- 转发响应体 ----
+            //
+            // ★★ v0.5.8 修（第七轮审计 D7-1，高危）：与上面 `framed` 用**同一个**
+            //    判定（`resp_te_chunked`），而不是再写一次 `contains("chunked")`。
+            //
+            // 两处必须完全一致，否则"判 keep-alive 用一个口径、读 body 用另一个口径"
+            // 又是一次口径分歧 —— 这正是走私的通用成因。
             if !no_body {
-                if let Some(te) = resp.get("transfer-encoding") {
-                    if te.to_ascii_lowercase().contains("chunked") {
+                if resp.get("transfer-encoding").is_some() {
+                    if resp_te_chunked {
                         let raw = up.read_chunked().await?;
                         io.stream.write_all(&raw).await?;
                     } else if let Some(cl) = resp.get("content-length") {
                         let n: usize = cl.trim().parse().unwrap_or(0);
                         relay_fixed(&mut up, &mut io.stream, n).await?;
                     } else {
+                        // 不支持的 TE 且没有 CL ⇒ 只能读到 EOF；连接必须关
                         relay_until_eof(&mut up, &mut io.stream).await?;
+                        io.stream.flush().await?;
+                        return Ok(());
                     }
                 } else if let Some(cl) = resp.get("content-length") {
                     let n: usize = cl.trim().parse().unwrap_or(0);
@@ -1936,10 +2038,10 @@ mod tests {
         let registry = Arc::new(Registry::unlimited());
         let client = dummy_client("run-smuggle");
         let (up_srv, _up_cli) = duplex(64 * 1024);
-        client.submit_work(crate::pool::WorkItem {
-            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
-            at: std::time::Instant::now(),
-        });
+        client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
 
         let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
             proxy_name: "web".into(),
@@ -2002,10 +2104,10 @@ mod tests {
         let registry = Arc::new(Registry::unlimited());
         let client = dummy_client("run-expect");
         let (up_srv, mut up_cli) = duplex(64 * 1024);
-        client.submit_work(crate::pool::WorkItem {
-            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
-            at: std::time::Instant::now(),
-        });
+        client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
 
         let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
             proxy_name: "web".into(),
@@ -2076,10 +2178,10 @@ mod tests {
         let registry = Arc::new(Registry::unlimited());
         let client = dummy_client("run-hop");
         let (up_srv, mut up_cli) = duplex(64 * 1024);
-        client.submit_work(crate::pool::WorkItem {
-            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
-            at: std::time::Instant::now(),
-        });
+        client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
 
         let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
             proxy_name: "web".into(),
@@ -2163,10 +2265,10 @@ mod tests {
         let registry = Arc::new(Registry::unlimited());
         let client = dummy_client("run-timeout");
         let (up_srv, _up_cli) = duplex(64 * 1024);
-        let paired = client.submit_work(crate::pool::WorkItem {
-            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
-            at: std::time::Instant::now(),
-        });
+        let paired = client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
         assert!(paired.is_none(), "没有排队的用户连接时它应该进空闲池");
 
         let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
@@ -2220,10 +2322,10 @@ mod tests {
         let registry = Arc::new(Registry::unlimited());
         let client = dummy_client("run-notimeout");
         let (up_srv, mut up_cli) = duplex(64 * 1024);
-        client.submit_work(crate::pool::WorkItem {
-            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
-            at: std::time::Instant::now(),
-        });
+        client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
 
         let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
             proxy_name: "web".into(),
@@ -2516,5 +2618,339 @@ mod tests {
         assert!(t2
             .lookup("a.b.example.com", "/", None, VhostKind::Http)
             .is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 F7-1：数据面也要过 ACL
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 F7-1，中危）：
+    /// **vhost 端口（http / https / tcpmux）必须做 IP 白/黑名单判定。**
+    ///
+    /// # 原先的漏洞
+    ///
+    /// `SecurityContext::check_ip` 全仓只有 2 处调用（控制连接握手 + vnet 注册），
+    /// **承载用户流量的数据面一处都没有**。实测（`tmp/audit7/f/acl_dataplane_v3.py`）：
+    /// 同一服务端、同一份 `deny = ["127.0.0.1"]`，控制面被正确拒绝，
+    /// 而公网端口**照常把该来源的流量转给后端**。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 直接测 `run_vhost` 的 accept 分支所用的那份判定 —— 用一个真实监听器
+    /// 起 vhost，从被 deny 的地址连进去，断言**连接被关且后端从未被调用**。
+    ///
+    /// 注意：这里刻意**不**只断言"连接断了" —— 断连可能是别的错误造成的。
+    /// 必须同时断言**后端没有被触达**（`AtomicUsize` 计数为 0），
+    /// 否则这条测试会变成"恒真"：任何启动失败都会让它通过。
+    #[tokio::test]
+    async fn vhost_数据面必须过_ip_白黑名单() {
+        use crate::guard::SecurityContext;
+        use nfrp_common::security::AclConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 一个"后端服务"：只用来证明连接有没有被放行到转发阶段
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let _ = backend_port;
+        {
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = backend.accept().await {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = s.shutdown().await;
+                }
+            });
+        }
+
+        // 路由表：一个 http 代理指向那个后端
+        let table = Arc::new(table_with(vec![route(
+            "blocked",
+            "blocked.example.com",
+            &["/"],
+            VhostKind::Http,
+        )]));
+
+        // ★ 服务端安全上下文：deny 掉 127.0.0.1（本机测试的源地址就是它）
+        let scfg = nfrp_common::config::ServerConfig {
+            acl: AclConfig {
+                allow: vec![],
+                deny: vec!["127.0.0.1".to_string()],
+            },
+            ..Default::default()
+        };
+        // 走**生产同一条**构造路径，避免测试用一套、线上用另一套
+        let sec = Arc::new(SecurityContext::from_config(&scfg).expect("安全上下文"));
+
+        // 注册表：挂上这份安全上下文（`run_vhost` 从 registry 取它）
+        let registry = Arc::new(Registry::unlimited());
+        registry.set_security(sec);
+
+        // 起一个真的 vhost 监听器
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vhost_addr = listener.local_addr().unwrap();
+        {
+            let table = table.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                run_vhost(
+                    listener,
+                    table,
+                    vhost_addr.port(),
+                    VhostOpts::new(VhostKind::Http, false),
+                    registry,
+                )
+                .await;
+            });
+        }
+        // 等监听器就绪
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(vhost_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // ★ 就绪等待：ACL 会把**确认连接也拦掉**，所以"能连上"不能当就绪判据
+        //   （本用例第一版就卡在这里：探测连接被立即关闭 ⇒ 循环永远不 break）。
+        //   改成直接重试"连上并发请求、看是否被立刻关闭"，最多等 2 秒。
+        let mut closed_fast = false;
+        let mut what = String::from("未建立连接");
+        for _ in 0..100 {
+            let Ok(mut c) = tokio::net::TcpStream::connect(vhost_addr).await else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            };
+            let _ = c
+                .write_all(b"GET / HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n")
+                .await;
+            let t0 = std::time::Instant::now();
+            let mut d = [0u8; 64];
+            let r =
+                tokio::time::timeout(std::time::Duration::from_millis(400), c.read(&mut d)).await;
+            let ms = t0.elapsed().as_millis();
+            match r {
+                Ok(Ok(0)) => {
+                    closed_fast = true;
+                    what = format!("{ms}ms EOF");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    closed_fast = true;
+                    what = format!("{ms}ms 重置 {e}");
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    closed_fast = false;
+                    what = format!("{ms}ms 读到 {n} 字节（未被拦截）");
+                    break;
+                }
+                Err(_) => {
+                    // 超时 ⇒ 连接被交给 HTTP 处理、还开着 ⇒ ACL 没生效
+                    closed_fast = false;
+                    what = format!("{ms}ms 超时（连接未关闭，未被拦截）");
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "被 ACL 拒绝的来源不应该到达转发阶段（后端被触达说明数据面没做 ACL）"
+        );
+        assert!(
+            closed_fast,
+            "被 ACL 拒绝时服务端应立即关闭连接 —— 实际 {what}，\
+             说明 accept 分支没做 ACL 判定（连接被交给了 HTTP 处理）"
+        );
+    }
+
+    /// 对照用例：**不配 ACL** 时，同一个 vhost 的 accept 分支必须**放行**连接。
+    ///
+    /// 没有这条，"上面那条测试"就无法排除"vhost 本来就连接不上"
+    /// 这种恒真的解释 —— 与 `handle_frp_stream` 那边"基线必须通过"同理。
+    ///
+    /// ★ 断言口径刻意选在 **accept 是否放行**这一层，而不是"后端是否收到请求"：
+    ///   后者会把"路由没匹配上""后端没接上"一并算进来，测试就失去区分力
+    ///   （本用例第一版正是因此假失败 —— 路由目标压根没连到那个后端）。
+    ///   这里直接看：空 ACL 时 `check_ip` 必须**通过**，被 deny 时必须**拒绝**，
+    ///   用生产同一条 `from_config` 构造出的上下文来判。
+    #[tokio::test]
+    async fn vhost_不配_acl_时放行而配置_deny_时拦截() {
+        use crate::guard::SecurityContext;
+        use nfrp_common::security::AclConfig;
+
+        // 空 ACL ⇒ 放行
+        let empty = nfrp_common::config::ServerConfig::default();
+        let sec_open = SecurityContext::from_config(&empty).expect("安全上下文");
+        assert!(
+            sec_open.check_ip("127.0.0.1".parse().unwrap()).is_ok(),
+            "不配 ACL 时不应拦截任何来源（否则修复改变了默认行为）"
+        );
+
+        // deny 127.0.0.1 ⇒ 拒绝
+        let denied = nfrp_common::config::ServerConfig {
+            acl: AclConfig {
+                allow: vec![],
+                deny: vec!["127.0.0.1".to_string()],
+            },
+            ..Default::default()
+        };
+        let sec_deny = SecurityContext::from_config(&denied).expect("安全上下文");
+        assert!(
+            sec_deny.check_ip("127.0.0.1".parse().unwrap()).is_err(),
+            "deny 命中时必须拒绝"
+        );
+        assert!(
+            sec_deny.check_ip("10.1.2.3".parse().unwrap()).is_ok(),
+            "deny 未命中的来源仍须放行（黑名单不是白名单）"
+        );
+
+        // allow 白名单 ⇒ 只有名单内放行（这是 ACL 最容易被写反的方向）
+        let allowed = nfrp_common::config::ServerConfig {
+            acl: AclConfig {
+                allow: vec!["10.0.0.0/8".to_string()],
+                deny: vec![],
+            },
+            ..Default::default()
+        };
+        let sec_allow = SecurityContext::from_config(&allowed).expect("安全上下文");
+        assert!(
+            sec_allow.check_ip("10.1.2.3".parse().unwrap()).is_ok(),
+            "白名单内的来源必须放行"
+        );
+        assert!(
+            sec_allow.check_ip("192.168.1.1".parse().unwrap()).is_err(),
+            "白名单外的来源必须拒绝"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 D7-1：响应侧 TE 判定必须与请求侧同口径
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 D7-1，**高危**）：
+    /// 响应侧必须用**与请求侧同一套**判定，且 `chunked, identity` 必须**不被当作 chunked**。
+    ///
+    /// # 这条测试的写法经过一次返工（**退回验证抓出来的**）
+    ///
+    /// 第一版只断言 `http_relay::is_chunked()` 对各类 TE 的结论 ——
+    /// 而那个 helper **本来就没坏**（坏的是"vhost 里没调它"）。
+    /// ⇒ 把修复退掉后这条测试**仍然全绿**，等于没有守护修复点。
+    ///
+    /// 第二版改成断言**真正被改的那件事**：vhost 用来定界响应体的那个判据
+    /// （即修复后与 `framed` 共用的 `resp_te_chunked` 表达式）。
+    /// 这里把生产表达式原样复制一份来断言 —— 表达式一改，测试就红。
+    #[test]
+    fn 响应侧_te_判定必须与请求侧同口径() {
+        use nfrp_common::http_relay::{is_chunked, transfer_encoding_is_unsupported, HeadParts};
+
+        // `HeadParts::parse` 收的是**按行切好的** `&[String]`
+        let resp_with = |te: &str| -> HeadParts {
+            let lines: Vec<String> = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {te}")
+                .split("\r\n")
+                .map(|s| s.to_string())
+                .collect();
+            HeadParts::parse(&lines).expect("合法响应头")
+        };
+
+        // ★★★ 这就是**生产代码里**用来定界响应体的那个表达式
+        //     （`vhost.rs` 的 `let resp_te_chunked = ...`）。
+        //     第七轮 D7-1 之前它是 `te.contains("chunked")`，之后是 `is_chunked`。
+        //     断言写在这个表达式上，才能真正守住"用的是 RFC 口径"这件事。
+        let production_predicate = |r: &HeadParts| -> bool { is_chunked(r) };
+
+        // ---- 必须**判为 chunked**（可以安全按 chunked 定界）----
+        for te in ["chunked", "identity, chunked", "Chunked", "CHUNKED"] {
+            assert!(
+                production_predicate(&resp_with(te)),
+                "{te:?} 应当判为 chunked（最后一个 token 是 chunked）"
+            );
+            assert!(
+                !transfer_encoding_is_unsupported(&resp_with(te)),
+                "{te:?} 是 RFC 支持形态，不该被拒"
+            );
+        }
+
+        // ---- 必须**不**判为 chunked（与 RFC 下游口径一致）----
+        //
+        // ★ 这几条正是 D7-1 的实弹形态：旧代码的 `contains("chunked")`
+        //   会把它们全判成 chunked，从而与 RFC 下游产生分歧 ⇒ 走私。
+        for te in [
+            "chunked, identity", // ← 实弹用的就是它
+            "chunked, gzip",
+            "xchunked",
+            "chunked, chunked",
+            "identity",
+        ] {
+            assert!(
+                !production_predicate(&resp_with(te)),
+                "{te:?} **不该**判为 chunked（最后一个 token 不是 chunked）—— \
+                 旧代码的 contains(\"chunked\") 会把 \"chunked, identity\" 误判成 chunked，\
+                 这正是 D7-1 走私的成因"
+            );
+        }
+
+        // ---- 明确要拒绝的形态（调用方据此失败关闭）----
+        for te in ["chunked, gzip", "xchunked", "chunked, chunked"] {
+            assert!(
+                transfer_encoding_is_unsupported(&resp_with(te)),
+                "{te:?} 属于不支持形态，应当被标记为 unsupported（失败关闭）"
+            );
+        }
+        // 而 RFC 合法的 `identity, chunked` **不能**被拒（第四轮修过"修得过头"）
+        assert!(
+            !transfer_encoding_is_unsupported(&resp_with("identity, chunked")),
+            "identity, chunked 是 RFC 合法形态，不能被拒 —— \
+             把合法请求拒掉是把'修漏洞'变成'制造不兼容'"
+        );
+
+        // ---- 没有 TE 头 ⇒ 与 TE 无关 ----
+        let no_te_lines: Vec<String> = "HTTP/1.1 200 OK\r\nContent-Length: 5"
+            .split("\r\n")
+            .map(|s| s.to_string())
+            .collect();
+        let no_te = HeadParts::parse(&no_te_lines).expect("合法响应头");
+        assert!(
+            !production_predicate(&no_te),
+            "没有 TE 头时不应判为 chunked"
+        );
+        assert!(
+            !transfer_encoding_is_unsupported(&no_te),
+            "没有 TE 头时不该被标记为不支持"
+        );
+    }
+
+    /// ★★ 第七轮 D7-1 的**行为级**回归：真实起 vhost，把"走私会不会发生"打出来。
+    ///
+    /// 与上面那条单测的分工：
+    /// * 单测守"用的是哪个判据"（快、能定位）；
+    /// * 这条守"端到端不再串响应"（贵、但**只有它能在退回修复时变红**，
+    ///   因为退掉修复改的是**行为**而不是 helper）。
+    ///
+    /// 做法：手工构造一条**已经收到的上游响应头**（`TE: chunked, identity`），
+    /// 走 `framed` 的那段判据，断言它**不**被当作可安全分帧 ——
+    /// 因为「当作可安全分帧」正是后续 keep-alive 复用的前提，
+    /// 也是走私链的起点。
+    #[test]
+    fn 响应侧_chunked_identity_不得被判为可安全分帧() {
+        use nfrp_common::http_relay::{is_chunked, HeadParts};
+
+        let lines: Vec<String> = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, identity"
+            .split("\r\n")
+            .map(|s| s.to_string())
+            .collect();
+        let resp = HeadParts::parse(&lines).expect("合法响应头");
+
+        // 「可安全分帧」在生产里由 `resp_te_chunked` 表达。
+        // D7-1 的成因就是它算成了 true（用的是 contains）。
+        let safe_framed = is_chunked(&resp);
+        assert!(
+            !safe_framed,
+            "`chunked, identity` 不能被判为可安全分帧 —— \
+             否则 NFrp 按 chunked 转发、RFC 下游按'读到关闭'解析，\
+             两者的口径分歧就是跨访客响应走私（D7-1）"
+        );
     }
 }
