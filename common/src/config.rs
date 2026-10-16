@@ -794,10 +794,16 @@ impl ServerConfig {
 /// ⇒ 判定散在多处就一定会漂移 —— 这正是本项目反复出现的那个模式
 ///   （"防线写对了，但没有铺满它声称保护的所有字段 / 路径"）。
 ///
-/// # 只 trim 用户名，不 trim 密码
+/// # trim 只用于"有没有配凭据"，凭据本身**逐字比对**
 ///
 /// 密码里的空格是**合法字符**（`dashboard_pwd = " a "` 是三个字符的密码），
-/// 把它 trim 掉会让用户配的密码与期望值对不上。用户名则惯例允许两侧空白。
+/// 把它 trim 掉会让用户配的密码与期望值对不上。用户名同理：`user.trim()`
+/// 在这里只参与**非空判定**（全空白的用户名 = 没配上），真正的比对在
+/// `dashboard.rs` —— 用配置里的**原样**字符串拼 `user:password` 再定长比较。
+///
+/// ⇒ `dashboard_user = " admin "` 的部署**不能**用 `admin` 登录，必须发
+///   字面量 `" admin "`（第八轮审计 F8-L3 实测确认）。原先这里的注释写成
+///   "用户名惯例允许两侧空白"，与实现不符，会给排障指错方向。
 pub fn has_dashboard_creds(user: &str, pwd: &str) -> bool {
     !user.trim().is_empty() && !pwd.is_empty()
 }
@@ -1500,7 +1506,43 @@ pub struct ClientConfig {
     /// 是否启用 TLS（对应 frp `transport.tls.enable`）。
     ///
     /// 与 frp 一致：默认不校验服务端证书（自签名即可）。
-    #[serde(default)]
+    ///
+    /// ★★ v0.5.8 修（第七轮审计 **B-2**，中危）：**加 `tlsEnable` 别名。**
+    ///
+    /// # 原先为什么是个陷阱
+    ///
+    /// 这个字段**没有** `rename`，所以 TOML 里只能写 `tls_enable`；
+    /// 而**同一个结构体**里紧挨着的两个字段用的是**驼峰**：
+    /// `verifyServerCert`（`:1529`）与 `trustedCaFile`（`:1535`）。
+    ///
+    /// ⇒ 用户照着同一段配置里的风格写 `tlsEnable = true`，
+    ///   **serde 静默丢弃**（`deny_unknown_fields` 没开）⇒ `tls_enable` 保持 false
+    ///   ⇒ TLS 压根没开。更糟的是它还会让 `verifyServerCert = true` **一起失效**：
+    ///   `tls::connect_client` 在 `enable == false` 时**第一行就返回**，
+    ///   `verify` 参数被完全忽略。
+    ///
+    /// # 实测（`tmp/audit7/b_independent/repro_b2_tls.py`，4/4）
+    ///
+    /// 抓链路首字节：
+    ///
+    /// | 配置 | 首字节 | 结论 |
+    /// |---|---|---|
+    /// | `[transport.tls] enable = true` | `17 16 03 01 …` | TLS ✓ |
+    /// | **`tlsEnable = true` + `verifyServerCert = true`** | `00 02 …` | **明文** ✗ |
+    /// | **只写 `verifyServerCert = true`** | `00 02 …` | **明文** ✗ |
+    ///
+    /// 明文里直接可见：
+    /// ```text
+    /// "privilege_key":"35a8601c28fa58a4fdb819c451100ae6"
+    /// ```
+    /// 而 `privilege_key = md5(token + timestamp)` ⇒ **可直接重放登录**。
+    ///
+    /// # 修法
+    ///
+    /// 加 `alias = "tlsEnable"` —— **只放宽、不收紧**：
+    /// 原来正确的 `tls_enable` 照常工作，写驼峰的也能生效（并因此真正开启 TLS）。
+    /// 这是纯增量的兼容改进，不改变任何既有配置的含义。
+    #[serde(default, alias = "tlsEnable")]
     pub tls_enable: bool,
 
     /// TLS 的 SNI / 证书校验用的主机名，留空则用 `server_addr`。
@@ -2483,6 +2525,50 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
                 caps.join(" / ")
             )));
         }
+
+        // ★★ v0.5.8 修（第七轮审计 **E7 附带发现**，低危）：**非插件代理的
+        //    `local_addr` 不能为空**。
+        //
+        // # 原先为什么是个"假绿灯"
+        //
+        // 上面那段回环检查有个前提 —— `if !p.local_addr.trim().is_empty()`。
+        // 而 `ProxyConfig` 里**没有** `localIP` / `localPort` 字段
+        // （只有合并式的 `local_addr`），所以两段式写法会被 serde **静默丢弃**。
+        // ⇒ 下发 `{"local_addr":"", "localIP":"10.0.0.5", "localPort":80}`
+        //   可以通过回环检查（因为 `local_addr` 是空串），
+        //   面板回 **200「代理已生效」**、公网端口**真的被占上**、
+        //   `/api/status` 里也显示"已生效"……
+        //   **但 `local_addr` 为空 ⇒ 这条代理连不上任何地方，每条连接必然失败。**
+        //
+        // 实测（`tmp/audit7/e/localip_bypass_probe.py`）：
+        // * `localIP`+`localPort`（**无** `local_addr`）⇒ 400「missing field local_addr」
+        //   （serde 的 required 检查挡住了）
+        // * **`local_addr:""` + `localIP`+`localPort`** ⇒ **200 已生效**，但代理不可用
+        //
+        // 而且我用**诱饵服务**做过决定性判定（`tmp/audit7/e/e71_verify_bypass.py`）：
+        // 两段式字段确实被丢弃、**没有**真的去连 `10.0.0.5` ——
+        // 所以这**不是 SSRF**，只是"**假绿灯**"：面板说成功，实际拿到的是一条
+        // 必然失败的隧道。
+        //
+        // ★ 与第六轮 F-1 的「`--check` / `frpc verify` 假绿灯」是**同一族问题**，
+        //   只是这次发生在**运行期**（面板写接口返回成功）而不是预检期。
+        //
+        // # 为什么现在才补
+        //
+        // 插件代理**不看** `local_addr`（工作连接交给插件），所以不能一刀切
+        // —— 那会把正当的插件用法（虽然远程下发已禁插件，但本机配置仍需放行）
+        // 一起拒掉。这里显式排除插件情形。
+        if p.plugin.trim().is_empty() && p.local_addr.trim().is_empty() {
+            return Err(crate::error::Error::Protocol(format!(
+                "代理 [{}] 来自远程下发，但 `local_addr` 是空的 —— \
+                 这条代理连不上任何地方，客户端会把它注册上去（面板显示「已生效」）\
+                 然后每条连接都失败。请填上内网服务地址（如 `127.0.0.1:8080`）。\
+                 ★ 注意字段名是**合并式**的 `local_addr`（`ip:port`）：\
+                 官方的 `localIP` + `localPort` 两段式在**远程下发**里不被接受，\
+                 写了也会被静默丢弃。",
+                p.name
+            )));
+        }
     }
     reject_bad_proxy(p)
 }
@@ -2495,8 +2581,55 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
 fn local_addr_host(addr: &str) -> &str {
     let a = addr.trim();
     if let Some(rest) = a.strip_prefix('[') {
-        // `[::1]:80` -> `::1`
-        return rest.split(']').next().unwrap_or(rest);
+        // ★★ v0.5.8 修（第七轮审计 **E-2**，中危）：**方括号必须紧跟着 port 冒号**，
+        //    不能"取第一个 `]` 之前就算主机"。
+        //
+        // # 原先为什么错了（check-vs-use）
+        //
+        // 原先写的是 `rest.split(']').next()` —— 对 `[::1].evil.com:PORT`
+        // 会取到 `::1`，于是：
+        //   * **判据**看到 `::1` ⇒ `is_loopback_host` 为真 ⇒ **放行**；
+        //   * **实际连接**（`client/src/main.rs:1472`）用的却是**原始串**
+        //     `resolve_addr("[::1].evil.com:PORT")` ⇒ **走 DNS**。
+        //
+        // ⇒ 校验器看的是 A 串、实际连的是 B 串。域名一旦可解析，
+        //   连到哪里就由**域名持有者**决定 —— 这正是 H4 要封的服务端可控 SSRF。
+        //
+        // # 实测（`tmp/audit7/e_independent/repro_e2_decisive.py`，7/7）
+        //
+        // 用 v6 诱饵 + 一个 DNS 查不到的名字做区分：
+        //
+        // | 下发值 | 判据 | 实际转发 |
+        // |---|---|---|
+        // | `[::1]:<P>` | 接受 | **成功**（收到 `V6-DECOY`）|
+        // | **`[::1].nonexistent-….local:<P>`** | **接受** | **失败**（v6 命中 0）|
+        //
+        // 若连接用的也是切片后的 `::1`，第二条**必应成功** —— 差异即是铁证。
+        // 客户端日志同时给出直接证据：
+        // `解析内网地址 [::1].nonexistent-nfrp-e2-probe.local:50458 失败`。
+        //
+        // # 修法
+        //
+        // **方括号形式必须整段就是 `[host]:port`**：`]` 之后只能是
+        // 「空」或「:数字端口」。否则**不认这种写法**，整串当主机
+        // ⇒ 解析不出 IP ⇒ `is_loopback_host` 从严判 `false` ⇒ 拒绝。
+        //
+        // 这样"判据看到的主机"与"连接用的主机"**强制一致**：
+        // 要么整串被认作 `[host]:port`（那就连 host），要么整串当主机（那就拒）。
+        let (host, after) = match rest.split_once(']') {
+            Some(v) => v,
+            // 有 `[` 没有 `]` ⇒ 不是合法的 `[host]:port` ⇒ 整串当主机（从严）
+            None => return a,
+        };
+        let tail_ok = after.is_empty()
+            || (after.starts_with(':')
+                && after[1..].bytes().all(|b| b.is_ascii_digit())
+                && !after[1..].is_empty());
+        if tail_ok {
+            return host;
+        }
+        // `]` 之后还有别的东西（如 `[::1].evil.com:80`）⇒ 不是回环写法，从严
+        return a;
     }
     // ★ 无方括号时的关键判断：冒号**只有一个**才可能是 `host:port`。
     //
@@ -2514,18 +2647,63 @@ fn local_addr_host(addr: &str) -> &str {
 
 /// 这个主机名/地址是不是"只有本机"。
 ///
-/// 接受 `127.0.0.0/8`、`::1`、`localhost`。**不接受** `0.0.0.0`（那是"监听全部"，
-/// 不是"连本机"），也不接受任何解析不出 IP 的域名 —— 域名可能解析到任意地址，
-/// 而且解析结果在连接时才确定，判据不能靠它。
+/// 接受 `127.0.0.0/8`、`::1`。**不接受** `0.0.0.0`（那是"监听全部"，
+/// 不是"连本机"），也不接受任何解析不出 IP 的名字 —— 名字解析到哪个地址
+/// 取决于本机 hosts 与 DNS，而且解析结果在连接时才确定，判据不能靠它。
+///
+/// ★★ v0.5.8 修（第七轮审计 **E-1**，高危）：**不再无条件放行 `localhost`**。
+///
+/// # 原先为什么错了
+///
+/// 这个函数原先在 IP 解析**之前**无条件返回 true：
+///
+/// ```ignore
+/// if h.eq_ignore_ascii_case("localhost") {
+///     return true;          // ← 先于 IP 解析，无条件放行
+/// }
+/// ```
+///
+/// 而**同一个仓库**里 `common/src/util.rs:535` 的 `is_loopback_addr()`
+/// 对 `localhost` 的结论**正好相反**，注释还写明了理由：
+///
+/// > `localhost` 也按**非回环**处理：它解析到哪个地址取决于本机 hosts 与 DNS，
+/// > 解析到非回环地址时就是一个对外端口，**不能靠名字赌**。
+///
+/// ⇒ **同一语义、两套结论相反的实现**，而守卫**远程下发白名单**
+/// （见本文件 `validate_remote_proxy` 里的 H4 检查）的是**弱的那套**。
+///
+/// # 实测后果（`tmp/audit7/e_independent/repro_e1_localhost.py`，9/9）
+///
+/// 在 `127.0.0.1:<P>` 与 `[::1]:<P>` 上各起一个 banner 诱饵（同端口号），
+/// 再远程下发三种 `local_addr`：
+///
+/// | 下发值 | 面板响应 | 实际命中 |
+/// |---|---|---|
+/// | `127.0.0.1:<P>` | 200 接受 | **v4** 诱饵 ✓（正对照） |
+/// | `10.0.0.5:<P>` | **400 拒绝** | —（H4 生效） |
+/// | **`localhost:<P>`** | **200 接受** | **v4=0 / v6=1** ⇒ 命中了 **v6** 端点 |
+///
+/// ⇒ 用户配的是"连本机 v4 服务"，实际流量送到了**另一个地址族**的端点。
+/// 这证明判据**放行了一个它无法保证指向的名字** —— 只要本机 hosts 或 DNS
+/// 把 `localhost` 指到别处，流量就跟着去别处。这正是 H4 要封的
+/// 「服务端可控 SSRF」：`local_addr` 决定客户端**往哪里连**。
+///
+/// # 修法
+///
+/// 与 `util.rs` 的口径**统一**：`localhost` 一律当作**非回环**（从严）。
+/// 想连本机就写 `127.0.0.1` 或 `::1` —— 那是**明确的、不受 hosts/DNS 影响**的写法。
+///
+/// ★ 兼容性：远程下发（面板"添加代理"）的正常用法本来就是填 `127.0.0.1:xxxx`；
+///   写 `localhost` 的人需要改成 `127.0.0.1`。本机配置文件里的 `localhost`
+///   **不受影响**（这条检查只作用于远程下发路径）。
 fn is_loopback_host(host: &str) -> bool {
     let h = host.trim();
-    if h.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
+    // ★ E-1：`localhost` 从严处理 —— 解析结果不受控，不能靠名字赌。
+    //   （原先这里无条件 return true，与 `util::is_loopback_addr` 的结论相反。）
     match h.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
         Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
-        // 解析不出（域名等）⇒ 从严当作"非本机"
+        // 解析不出（域名，含 `localhost`）⇒ 从严当作"非本机"
         Err(_) => false,
     }
 }
@@ -3119,5 +3297,372 @@ tcpmuxPassthrough = true
         let d = ServerConfig::default();
         assert!(d.tcpmux_http_connect_port.is_none());
         assert!(!d.tcpmux_passthrough);
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 E-1：远程下发的回环白名单不得接受 `localhost`
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **E-1**，高危）：
+    /// **远程下发的 `local_addr` 回环白名单不得接受 `localhost`。**
+    ///
+    /// # 原先的漏洞
+    ///
+    /// `is_loopback_host()` 在 IP 解析**之前**无条件放行 `localhost`，
+    /// 而**同仓库** `util::is_loopback_addr()` 的结论**正好相反**
+    /// （注释写明"解析结果取决于 hosts 与 DNS，不能靠名字赌"）。
+    /// 守卫远程下发路径的是**弱的那套**。
+    ///
+    /// 实测（`tmp/audit7/e_independent/repro_e1_localhost.py`，9/9）：
+    /// 在 `127.0.0.1:<P>` 与 `[::1]:<P>` 各起一个诱饵，下发 `localhost:<P>`
+    /// ⇒ **被接受**（200），且流量命中 **v6** 诱饵（v4=0 / v6=1）
+    /// ⇒ 用户配的"本机 v4 服务"被绕过，送到了另一个地址族。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **`localhost` 必须被拒**（核心）；
+    /// 2. **明确的回环写法必须仍然放行**（`127.0.0.1` / `::1` / `127.x.x.x`）
+    ///    —— 不能"修得过头把合法的也拒了"（第四轮犯过这个错）；
+    /// 3. **非回环必须仍然被拒**（H4 的原有意图不能丢）。
+    ///
+    /// ★ 另外锁住一条**跨模块一致性**：`config::is_loopback_host` 与
+    ///   `util::is_loopback_addr` 对 `localhost` 的结论**必须一致** ——
+    ///   E-1 的根因就是"同一语义两套相反实现"，这条断言防它再漂移。
+    #[test]
+    fn 远程下发不得接受_localhost_作回环地址() {
+        let with_addr = |addr: &str| ProxyConfig {
+            name: "p".into(),
+            proxy_type: "tcp".into(),
+            local_addr: addr.into(),
+            remote_port: 6000,
+            ..Default::default()
+        };
+
+        // ---- ① 核心：localhost 必须被拒 ----
+        for addr in ["localhost:8000", "LocalHost:8000", "LOCALHOST:8000"] {
+            assert!(
+                validate_remote_proxy(&with_addr(addr), true).is_err(),
+                "远程下发的 {addr:?} **必须被拒** —— \
+                 `localhost` 的解析结果取决于本机 hosts 与 DNS，判据不能靠名字赌（E-1）"
+            );
+        }
+
+        // ---- ② 明确的回环写法必须仍然放行（不能修得过头）----
+        for addr in [
+            "127.0.0.1:8000",
+            "127.1.2.3:8000", // 整个 127/8 都是回环
+            "[::1]:8000",     // ★ IPv6 必须带方括号（无括号的 `::1:8000` 有二义性）
+        ] {
+            assert!(
+                validate_remote_proxy(&with_addr(addr), true).is_ok(),
+                "{addr:?} 是明确的回环地址，**必须放行** —— \
+                 把合法的也拒掉是把'修漏洞'变成'制造不兼容'"
+            );
+        }
+
+        // ★ 顺带锁住一条**已知且有意**的解析行为：无方括号的 `::1:8000` 有二义性
+        //   （`::1` 自己就带冒号），`local_addr_host` 会整串当主机 ⇒ 解析不出 IP
+        //   ⇒ 从严拒绝。这是**正确**的（宁可拒也不猜），写在这里免得后人误当 bug。
+        assert!(
+            validate_remote_proxy(&with_addr("::1:8000"), true).is_err(),
+            "无方括号的 IPv6 + 端口有二义性，从严拒绝是**有意行为**；\
+             要写 IPv6 请用 [::1]:8000"
+        );
+        // 而裸的 `::1`（不带端口）本身是合法主机 ⇒ 应当放行
+        assert!(
+            is_loopback_host("::1"),
+            "裸 ::1 是明确回环（`local_addr_host` 对多冒号串整串当主机）"
+        );
+
+        // ---- ③ 非回环必须仍然被拒（H4 的原意）----
+        for addr in [
+            "169.254.169.254:80", // 云元数据服务（H4 的原始动机）
+            "10.0.0.5:6379",
+            "0.0.0.0:8000",
+            "evil.example.com:80", // 域名同样不可信
+        ] {
+            assert!(
+                validate_remote_proxy(&with_addr(addr), true).is_err(),
+                "远程下发的 {addr:?} 必须被拒（H4）"
+            );
+        }
+
+        // ---- ④ 本机配置文件路径不受这条限制（只作用于远程下发）----
+        assert!(
+            validate_remote_proxy(&with_addr("localhost:8000"), false).is_ok(),
+            "本机配置文件里的 localhost 不受影响 —— 这条检查只针对远程下发"
+        );
+
+        // ---- ⑤ 跨模块一致性：两个 is_loopback 实现对 localhost 必须同结论 ----
+        for name in ["localhost", "LocalHost", "LOCALHOST"] {
+            assert_eq!(
+                is_loopback_host(name),
+                crate::util::is_loopback_addr(name),
+                "{name:?} 在两个实现里的结论必须一致 —— \
+                 E-1 的根因正是『同一语义两套相反实现』，这条防它再次漂移"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 E7（附带发现）：远程下发不得接受空 `local_addr`（假绿灯）
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **E7 附带发现**，低危）：
+    /// **远程下发的非插件代理，`local_addr` 不能为空。**
+    ///
+    /// # 原先的"假绿灯"
+    ///
+    /// 回环检查写的是 `if !p.local_addr.trim().is_empty()` ——
+    /// 空串**整个跳过**检查。而 `ProxyConfig` 里**没有** `localIP`/`localPort`
+    /// 字段，所以两段式写法被 serde **静默丢弃** ⇒ `local_addr` 保持空。
+    ///
+    /// 净效果：面板回 **200「已生效」**、公网端口**真的被占上**、
+    /// `/api/status` 显示"已生效"，**但每条连接必然失败**
+    /// （客户端拿空地址去 `resolve_addr`）。
+    ///
+    /// 实测（`tmp/audit7/e/localip_bypass_probe.py`）：
+    /// * `localIP`+`localPort`（无 local_addr）⇒ 400（serde required 挡住）
+    /// * **`local_addr:""` + 两段式** ⇒ **修复前 200 / 修复后 400**
+    ///
+    /// ★ 用**诱饵服务**做过决定性判定（`tmp/audit7/e/e71_verify_bypass.py`）：
+    ///   两段式字段确实被丢弃、**没有**去连 `10.0.0.5`
+    ///   ⇒ 这**不是 SSRF**，只是"面板说成功、实际不可用"的**假绿灯**。
+    ///   与第六轮 F-1（`--check`/`verify` 假绿灯）同族，只是发生在**运行期**。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **空 `local_addr` + 非插件 ⇒ 拒绝**（核心）；
+    /// 2. **填了合法回环地址 ⇒ 仍然放行**（不能修得过头）；
+    /// 3. **本机配置文件路径不受影响**（这条检查只针对远程下发）；
+    /// 4. 插件代理的空 `local_addr` **不因这条而报"空地址"错**
+    ///    （插件路径本来就不看 `local_addr`；远程下发里它会被**插件检查**先拒）。
+    #[test]
+    fn 远程下发不得接受空_local_addr() {
+        let mk = |addr: &str, plugin: &str| ProxyConfig {
+            name: "p".into(),
+            proxy_type: "tcp".into(),
+            local_addr: addr.into(),
+            plugin: plugin.into(),
+            remote_port: 6000,
+            ..Default::default()
+        };
+
+        // ---- ① 核心：空 local_addr + 非插件 ⇒ 必须拒 ----
+        for empty in ["", "   ", "\t"] {
+            let e = validate_remote_proxy(&mk(empty, ""), true).expect_err(&format!(
+                "空 local_addr（{empty:?}）必须被拒 —— 它是条必然失败的代理"
+            ));
+            let msg = e.to_string();
+            assert!(
+                msg.contains("local_addr"),
+                "错误里要点名 local_addr，便于排障：{msg}"
+            );
+            assert!(
+                msg.contains("两段式") || msg.contains("localIP"),
+                "★ 错误里应当提醒『两段式在远程下发里不被接受』—— \
+                 这正是使用者踩坑的地方（写了 localIP/localPort 却被静默丢弃）：{msg}"
+            );
+        }
+
+        // ---- ② 填了合法回环 ⇒ 仍然放行（不能修得过头）----
+        for ok in ["127.0.0.1:8080", "[::1]:8080", "127.0.0.2:9000"] {
+            assert!(
+                validate_remote_proxy(&mk(ok, ""), true).is_ok(),
+                "{ok:?} 是合法的远程下发地址，必须放行"
+            );
+        }
+
+        // ---- ③ 本机配置路径不受这条影响 ----
+        //
+        // （本机配置的空 local_addr 是用户自己配错，且 `reject_bad_proxy`
+        //   那一侧有自己的口径；这条检查**只针对远程下发**。）
+        assert!(
+            validate_remote_proxy(&mk("", ""), false).is_ok(),
+            "本机配置文件路径不该被这条远程检查影响"
+        );
+
+        // ---- ④ 插件代理不因这条报"空地址"（它有自己的一道闸）----
+        let e2 = validate_remote_proxy(&mk("", "static_file"), true)
+            .expect_err("远程下发带插件本来就该被拒");
+        let msg2 = e2.to_string();
+        assert!(
+            msg2.contains("插件"),
+            "★ 插件代理应当被**插件检查**拒掉（而不是被新的空地址检查拒）—— \
+             否则错误信息会误导使用者去填 local_addr，而真正的问题是插件。实际：{msg2}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 B-2：`tlsEnable` 驼峰写法必须生效
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **E-2**，中危）：
+    /// **方括号形式必须整段就是 `[host]:port`** —— 否则"判据看到的主机"
+    /// 与"实际连接用的主机"会不一致（check-vs-use）。
+    ///
+    /// # 原先的洞
+    ///
+    /// `local_addr_host` 用 `rest.split(']').next()` 取**第一个** `]` 之前的内容。
+    /// 对 `[::1].evil.com:PORT` 它取到 `::1` ⇒ 判为回环 ⇒ **放行**；
+    /// 而实际连接用的是**原始串**（`main.rs:1472` 的 `resolve_addr`）⇒ **走 DNS**。
+    ///
+    /// # 实测（`tmp/audit7/e_independent/repro_e2_decisive.py`，7/7）
+    ///
+    /// | 下发值 | 判据 | 实际转发 |
+    /// |---|---|---|
+    /// | `[::1]:<P>` | 接受 | **成功**（v6 诱饵命中）|
+    /// | **`[::1].nonexistent-….local:<P>`** | **接受** | **失败** |
+    ///
+    /// 若连接用的也是切片后的 `::1`，第二条必应成功 —— 差异即铁证。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **`[host]` 后面还有内容的必须被拒**（核心）；
+    /// 2. **合法的 `[::1]:port` 必须仍然放行**（不能修得过头）；
+    /// 3. 无方括号的形式不受影响（既有行为）。
+    #[test]
+    fn 方括号写法必须整段合法否则从严拒绝() {
+        // ---- ① 核心：`]` 之后还有内容 ⇒ 必须被拒 ----
+        //
+        // 这些的"切片结果"都是回环（`::1`），但**整串不是**合法的 `[host]:port`。
+        // 修复前它们会被放行，而连接时走 DNS ⇒ SSRF 面。
+        for bad in [
+            "[::1].evil.com:8000",
+            "[::1].evil.com",
+            "[127.0.0.1].evil.com:8000",
+            "[::1]extra:8000",
+            "[::1]x",
+        ] {
+            assert!(
+                !is_loopback_host(local_addr_host(bad)),
+                "★ {bad:?} 必须被判为**非回环** —— \
+                 修复前 `split(']').next()` 会取到 `::1` 而放行，\
+                 但实际连接用的是整个串（走 DNS）⇒ 判据与连接不一致（E-2）"
+            );
+        }
+
+        // ---- ② 合法的 `[host]:port` 必须仍然放行 ----
+        for ok in [
+            "[::1]:8000",
+            "[::1]",
+            "[127.0.0.1]:8000",
+            "[0:0:0:0:0:0:0:1]:80",
+        ] {
+            assert!(
+                is_loopback_host(local_addr_host(ok)),
+                "{ok:?} 是合法的回环写法，必须放行（不能修得过头）"
+            );
+        }
+
+        // ---- ③ `]` 后跟非数字端口同样从严 ----
+        for bad in ["[::1]:abc", "[::1]:", "[::1]:80x"] {
+            let h = local_addr_host(bad);
+            assert!(
+                !is_loopback_host(h) || h == "[::1]:abc",
+                "{bad:?} 不是合法的 `[host]:port`，不应当被当成回环而放行"
+            );
+        }
+
+        // ---- ④ 无方括号的形式不受影响（既有行为保持不变）----
+        for ok in ["127.0.0.1:8000", "127.1.2.3:8000"] {
+            assert!(
+                is_loopback_host(local_addr_host(ok)),
+                "{ok:?} 的既有行为不能变"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 B-2：`tlsEnable` 驼峰写法必须生效
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **B-2**，中危）：
+    /// **`tlsEnable`（驼峰）与 `tls_enable`（下划线）必须都能开启 TLS。**
+    ///
+    /// # 原先的陷阱
+    ///
+    /// `ClientConfig` 里**命名风格混用**：
+    /// * `tls_verify_server_cert` → serde 名是驼峰 `verifyServerCert`
+    /// * `tls_trusted_ca_file` → 驼峰 `trustedCaFile`
+    /// * 而 `tls_enable` → **没有 rename**（只能是 `tls_enable`）
+    ///
+    /// ⇒ 用户照同一段配置里的风格写 `tlsEnable = true`，**serde 静默丢弃**
+    /// ⇒ TLS 没开。更糟的是它会让 `verifyServerCert = true` **一起失效**：
+    /// `tls::connect_client` 在 `enable == false` 时**第一行就返回**，
+    /// `verify` 参数被完全忽略 ⇒ **既不加密也不校验，且无告警**。
+    ///
+    /// 实测（`tmp/audit7/b_independent/repro_b2_tls.py`）：明文链路里
+    /// 直接可见 `"privilege_key":"35a8601c…"` —— 它等于 `md5(token+ts)`，
+    /// **可以直接重放登录**。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **驼峰 `tlsEnable = true` 必须真的把 `tls_enable` 置为 true**（核心）；
+    /// 2. **下划线写法照常工作**（纯增量，不能破坏既有配置）；
+    /// 3. 官方 `[transport.tls] enable = true` 写法也仍然工作。
+    #[test]
+    fn tls_开关的驼峰写法必须生效() {
+        let parse = |body: &str| {
+            parse_client(&format!(
+                "server_addr = \"127.0.0.1\"\nserver_port = 7000\n{body}"
+            ))
+            .expect("配置应能解析")
+        };
+
+        // ---- ① 驼峰写法（B-2 的核心）----
+        let c = parse("tlsEnable = true\nverifyServerCert = true\n");
+        assert!(
+            c.tls_enable,
+            "★ 驼峰 `tlsEnable = true` 必须真的开启 TLS —— \
+             原先 serde 静默丢弃它，导致 TLS 与证书校验**双双失效**且无告警（B-2）"
+        );
+        assert!(c.tls_verify_server_cert, "verifyServerCert 也应生效");
+
+        // ---- ② 下划线写法照常工作（不能破坏既有配置）----
+        let c2 = parse("tls_enable = true\nverifyServerCert = true\n");
+        assert!(c2.tls_enable, "下划线 `tls_enable` 必须继续有效");
+        assert!(c2.tls_verify_server_cert);
+
+        // ---- ③ 官方段落写法（`[transport.tls] enable`）----
+        //
+        // ★ 注意：官方 schema 里 `[transport.tls]` 段**只有** `enable` 与
+        //   `serverName`（见 `frp_config.rs:585` 的 hoist 表），
+        //   `verifyServerCert` / `trustedCaFile` 是**顶层**键。
+        //   所以这里分开断言 —— 免得把"官方 schema 就是这样"误当成 bug。
+        let c3 = parse("[transport.tls]\nenable = true\n");
+        assert!(c3.tls_enable, "官方 `[transport.tls] enable` 写法必须有效");
+
+        // 顶层的 `verifyServerCert` 与段内的 `enable` 组合是最常见的写法
+        let c3b = parse("verifyServerCert = true\n[transport.tls]\nenable = true\n");
+        assert!(c3b.tls_enable, "段内 enable 应生效");
+        assert!(
+            c3b.tls_verify_server_cert,
+            "顶层 verifyServerCert 应生效（官方 schema 里它就是顶层键）"
+        );
+
+        // ---- ④ 不配就是不开（默认值不变，保持互通）----
+        let c4 = parse("token = \"t\"\n");
+        assert!(
+            !c4.tls_enable,
+            "默认必须是不开 TLS（与官方 frp 一致，保互通）"
+        );
+        assert!(
+            !c4.tls_verify_server_cert,
+            "默认必须是不校验（改默认会破坏『官方 frpc 零配置直连』）"
+        );
+
+        // ---- ⑤ 只写 verifyServerCert（漏 enable）⇒ 两个字段状态要如实反映 ----
+        //
+        // 这种情况**仍然是不安全的**（客户端会打显著 WARN，见 `main.rs`），
+        // 这里只锁住"解析结果如实" —— 修复是**告警**而不是替用户开 TLS
+        // （替用户开 TLS 会改变他配置的语义，那是另一种越界）。
+        let c5 = parse("verifyServerCert = true\n");
+        assert!(
+            !c5.tls_enable,
+            "只写 verifyServerCert 不该被推断成开了 TLS —— \
+             我们只**告警**，不替用户改语义"
+        );
+        assert!(c5.tls_verify_server_cert, "该字段本身要如实解析");
     }
 }
