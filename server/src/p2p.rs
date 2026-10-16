@@ -292,7 +292,15 @@ pub async fn handle_nat_hole_visitor(
         return Ok(());
     }
     // 带了签名就必须对（NFrp↔NFrp 的保证一点没放松）
-    if !entry.check_sign(&m.sign_key, m.timestamp) {
+    //
+    // ★ v0.5.7（第六轮审计 G-1，高危）：把时钟窗口传进去 ——
+    //   新鲜性校验在 `check_sign` 内部，不是可选项。
+    //   原先这里只比内容不看新旧 ⇒ 嗅探到一条 `NatHoleVisitor` 即可无限期重放。
+    if !entry.check_sign(
+        &m.sign_key,
+        m.timestamp,
+        registry.security().max_clock_skew_secs(),
+    ) {
         refuse(
             visitor_client,
             &m.transaction_id,
@@ -382,7 +390,20 @@ mod tests {
         ))
     }
 
-    fn nat_hole_visitor(proxy_name: &str, sk: &str, ts: i64) -> NatHoleVisitor {
+    /// 构造一条 **时间戳新鲜** 的 `NatHoleVisitor`（签名由 `sk` 算出）。
+    ///
+    /// ★ v0.5.7（第六轮审计 G-1）：原先这里要调用方传一个**写死的** `ts`
+    ///   （1 / 123 / 456 / 9 / 11…）。`check_sign` 现在自带新鲜性校验之后，
+    ///   那些写死的时间戳全都会**因为过期**而被拒 —— 测试会"因为时间错"而失败，
+    ///   而不是因为它本来要测的那件事。所以默认用当前时间。
+    ///
+    ///   要测"过期"请用 [`nat_hole_visitor_at`] 显式传时间。
+    fn nat_hole_visitor(proxy_name: &str, sk: &str) -> NatHoleVisitor {
+        nat_hole_visitor_at(proxy_name, sk, nfrp_common::util::now_unix_secs() as i64)
+    }
+
+    /// 指定时间戳的版本（用于测**过期必须被拒**）。
+    fn nat_hole_visitor_at(proxy_name: &str, sk: &str, ts: i64) -> NatHoleVisitor {
         NatHoleVisitor {
             transaction_id: "txn-1".into(),
             proxy_name: proxy_name.into(),
@@ -429,7 +450,7 @@ mod tests {
     async fn unknown_proxy_is_refused_with_error() {
         let registry = Arc::new(Registry::unlimited());
         let c = client("alice");
-        let m = nat_hole_visitor("missing", "sk", 1);
+        let m = nat_hole_visitor("missing", "sk");
         handle_nat_hole_visitor(&registry, &c, &m)
             .await
             .expect("应安全返回");
@@ -461,11 +482,66 @@ mod tests {
 
         let visitor = client("bob");
         let before = hub.len();
-        let m = nat_hole_visitor("p2p", "wrong-key", 123);
+        let m = nat_hole_visitor("p2p", "wrong-key");
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .expect("处理过程不应返回 IO 错误");
         assert_eq!(hub.len(), before, "密钥不对时不能创建会话");
+    }
+
+    /// ★★ v0.5.7 新增（第六轮审计 G-1，高危）：**过期的签名必须被拒**。
+    ///
+    /// # 锁的是什么
+    ///
+    /// `check_sign` 原先只比 `md5(secret_key + timestamp)` 的内容、
+    /// **完全不看 `timestamp` 有多旧** ⇒ 嗅探到一条 `NatHoleVisitor`
+    /// 即可**无限期重放**（实测一年前的仍然被接受）。
+    ///
+    /// 现在新鲜性校验嵌在 `check_sign` 内部（`skew` 是必需参数）。
+    /// 这条测试盯住"过期 ⇒ 拒绝"，并且加一条**对照**（同一密钥、新鲜时间 ⇒ 通过）
+    /// 来证明它拒的是**时间**而不是别的东西 ——
+    /// 否则"反正都被拒"会让测试失去判别力。
+    #[tokio::test]
+    async fn 过期的打洞签名必须被拒而新鲜的通过() {
+        let registry = Arc::new(Registry::unlimited());
+        let provider = client("bob");
+        registry
+            .visitors
+            .register(VisitorEntry {
+                proxy_name: "p2p".into(),
+                secret_key: "real-key".into(),
+                allow_users: vec!["bob".into()],
+                provider_user: "bob".into(),
+                client: provider.clone(),
+                proxy_type: "xtcp".into(),
+            })
+            .expect("注册 visitor 应当成功");
+
+        let hub = P2PHub::new();
+        registry.attach_p2p(hub.clone());
+
+        let visitor = client("bob");
+        let now = nfrp_common::util::now_unix_secs() as i64;
+
+        // 对照组：**新鲜**时间戳 + 正确密钥 ⇒ 必须创建会话。
+        // 没有这一条，"过期被拒"可能只是因为别的原因（比如密钥没对上）。
+        let fresh = nat_hole_visitor_at("p2p", "real-key", now);
+        handle_nat_hole_visitor(&registry, &visitor, &fresh)
+            .await
+            .expect("处理过程不应返回 IO 错误");
+        assert_eq!(hub.len(), 1, "新鲜签名 + 正确密钥应当创建打洞会话");
+
+        // 实验组：**一年前**的时间戳 + 同样正确的密钥 ⇒ 必须被拒。
+        let before = hub.len();
+        let stale = nat_hole_visitor_at("p2p", "real-key", now - 365 * 24 * 3600);
+        handle_nat_hole_visitor(&registry, &visitor, &stale)
+            .await
+            .expect("处理过程不应返回 IO 错误");
+        assert_eq!(
+            hub.len(),
+            before,
+            "一年前的正确签名必须被拒（否则就是无限期重放，可干扰他人打洞）"
+        );
     }
 
     /// ★ **官方 frpc 的 `NatHoleVisitor` 不带 `sign_key` / `timestamp`。**
@@ -566,7 +642,7 @@ mod tests {
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));
 
-        let m = nat_hole_visitor("p2p", "real-key", 456);
+        let m = nat_hole_visitor("p2p", "real-key");
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .expect("处理不应失败");
@@ -612,7 +688,7 @@ mod tests {
         registry.attach_p2p(hub.clone());
 
         let visitor = client("bob");
-        let m = nat_hole_visitor("p2p", "key", 9);
+        let m = nat_hole_visitor("p2p", "key");
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .unwrap();
@@ -653,7 +729,7 @@ mod tests {
             vproxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));
-        let m = nat_hole_visitor("p2p", "key", 11);
+        let m = nat_hole_visitor("p2p", "key");
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .unwrap();
