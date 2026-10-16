@@ -300,6 +300,18 @@ impl Registry {
                     "被另一个代理独占"
                 } else if group.is_empty() {
                     "未指定 group 的代理不能共享"
+                } else if pg.owner_user != client.user {
+                    // ★★ v0.5.7 修（第六轮审计 D-1，高危）：**跨租户一律拒绝**。
+                    //
+                    // 原先这里没有这一条：判定只看 (组名, group_key)，
+                    // 于是"知道组名"就能把工作连接挂到别人的公网端口上，
+                    // 用户流量按轮询分给攻击者 —— 实测 6/12 条被劫持，
+                    // 攻击者的内网服务收到了用户的请求（凭证收割 + 响应伪造）。
+                    //
+                    // 放在 `name != group` **之前**：这是更根本的理由
+                    // （"这不是你的组"比"组名不同"更准确），
+                    // 且与其它分支共用同一条对外文案，不新增可区分信息。
+                    "跨租户不能共享端口"
                 } else if pg.name != group {
                     "与占用方的 group 不同"
                 } else if !nfrp_common::frp::msg::constant_time_eq(&pg.key, group_key) {
@@ -307,7 +319,7 @@ impl Registry {
                     // 用常量时间比较，避免按字节泄露密钥前缀。
                     "group_key 校验失败"
                 } else {
-                    debug!(port, group = %group, "端口共享成功（同组且密钥正确）");
+                    debug!(port, group = %group, "端口共享成功（同组、同租户且密钥正确）");
                     pg.push(client, proxy_name);
                     return Ok(PortClaim::Joined);
                 };
@@ -563,6 +575,37 @@ struct PortGroup {
     ///
     /// 只有 `name` 非空时才有意义：独占端口的 `key` 恒为空串。
     key: String,
+    /// ★★ 建立这个组的**租户**（`ClientState.user`），后续成员必须同租户。
+    ///
+    /// v0.5.7 新增（第六轮审计 D-1，高危）。
+    ///
+    /// # 为什么必须有这个字段
+    ///
+    /// 原先 `PortGroup` 只有 `name` / `key` / `members` / `cursor` / `handle`，
+    /// **没有任何"归属租户"的概念**，加入判定只看 (组名, group_key) ——
+    /// 于是"知道组名"就能把自己的工作连接挂到**别人**的公网端口上，
+    /// 之后用户流量按轮询分给攻击者（实测 6/12 条连接被劫持）。
+    ///
+    /// **最危险的形态是双方都不配 `group_key`**（官方 frp 的常见写法，
+    /// `groupKey` 在官方是可选的）：此时 `constant_time_eq("", "")` 为真，
+    /// **组名就是唯一凭据且不需要任何密钥**。
+    ///
+    /// 本结构体上方的注释原话就把 `group_key` 称作"认证凭据"，并点名了
+    /// 这个攻击 —— 既然已承认它是跨租户安全边界，就不能只在
+    /// "双方都配了非空 key"时才成立。
+    ///
+    /// # 为什么按 `user` 判而不是按 `run_id`
+    ///
+    /// 同一租户的多个 frpc（重连、多开、一份配置里多条 `[[proxies]]`）
+    /// **共用同一个 `user`**，而 `run_id` **每次重连都变** ——
+    /// 用 `run_id` 判会把合法的负载均衡打成不通。
+    ///
+    /// # 诚实说明残留风险
+    ///
+    /// `user` 是客户端自报字段（D-5），所以**伪造 `user` 仍可混入**。
+    /// 本字段挡住的是"用自己真实身份 + 知道组名"这条路径（即审计实测的那条），
+    /// 要彻底解决需要**每租户独立凭据**（见 D-5 的修法）。
+    owner_user: String,
     members: Vec<Backend>,
     /// 轮询游标。用 `fetch_add` 取模，天然无锁。
     cursor: std::sync::atomic::AtomicUsize,
@@ -578,6 +621,7 @@ impl PortGroup {
         Self {
             name: name.to_string(),
             key: key.to_string(),
+            owner_user: client.user.clone(),
             members: vec![Backend {
                 client,
                 proxy_name: proxy_name.to_string(),
@@ -701,13 +745,23 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn client(run_id: &str) -> Arc<ClientState> {
+        client_with_user("", run_id)
+    }
+
+    /// 指定 `user`（租户）的客户端。
+    ///
+    /// ★ v0.5.7（第六轮审计 D-1）：`PortGroup` 现在带 `owner_user`，
+    /// 跨租户共享端口会被拒 —— 测这条边界需要一个能设 `user` 的构造器。
+    /// 注意上面的 [`client`] 传的是**空 user**，所以既有的组测试
+    /// （都视为同一租户）行为不变。
+    fn client_with_user(user: &str, run_id: &str) -> Arc<ClientState> {
         let (tx, rx) = mpsc::unbounded_channel::<CtrlCmd>();
         std::mem::forget(rx);
         let (conn, backlog, proxy) = ServerLimits::default().per_client();
         Arc::new(ClientState::new(
             run_id.into(),
             run_id.into(),
-            String::new(),
+            user.into(),
             tx,
             Duration::from_secs(60),
             Default::default(),
@@ -946,6 +1000,16 @@ mod tests {
     ///
     /// 这是兼容性回归：官方 frp 里 `groupKey` 是可选字段，两个成员都不写
     /// 就都是空串，空 == 空，照常成组。
+    ///
+    /// ★ v0.5.7（第六轮审计 D-1）：**这条兼容性仍然保留，但多了"同租户"前提**。
+    ///   两个成员都不写 `group_key` 时**照常成组**（本测试锁定这一点），
+    ///   但它们必须属于**同一租户**（同 `user`）—— 跨租户见
+    ///   [`跨租户不能靠组名寄生到别人的公网端口`]。
+    ///
+    ///   理由：`group_key` 为空时它是**唯一**凭据，而"空密钥"本身
+    ///   不构成任何凭据；把同租户作为额外的必要条件，既不破坏
+    ///   "一个运维的多个冗余后端做负载均衡"这个真实用法，
+    ///   又堵掉了"知道组名就能寄生"。
     #[test]
     fn same_group_with_both_keys_empty_still_joins() {
         let r = Registry::unlimited();
@@ -959,6 +1023,107 @@ mod tests {
             "双方都未配 group_key 时应照常成组（不能破坏既有部署）"
         );
         assert_eq!(r.backend_count(6002), 2);
+    }
+
+    /// ★★ v0.5.7 新增（第六轮审计 D-1，高危）：**跨租户不得靠组名寄生**。
+    ///
+    /// # 锁的是什么
+    ///
+    /// 原先 `PortGroup` 没有归属租户的概念，加入只看 (组名, group_key) ⇒
+    /// 攻击者知道组名就能成为**别人公网端口**的后端，用户流量按轮询分给他
+    /// （实测 6/12 条连接落到攻击者的内网服务上）。
+    ///
+    /// **最危险的形态是双方都不配 `group_key`**（官方常见写法）：
+    /// 此时组名是唯一凭据、**不需要任何密钥**。
+    ///
+    /// # 三条断言各自的作用
+    ///
+    /// 1. 跨租户 + **空密钥** ⇒ 拒（这是实测打出来的那条攻击）
+    /// 2. 跨租户 + **密钥正确** ⇒ 也拒（知道密钥也不行，租户边界先于密钥）
+    /// 3. **同租户** + 空密钥 ⇒ 放行（对照，证明不是把负载均衡一起打死了）
+    #[test]
+    fn 跨租户不能靠组名寄生到别人的公网端口() {
+        let r = Registry::unlimited();
+
+        // 受害者 bob 起了一个负载均衡组（**不配 group_key**，官方常见写法）
+        assert_eq!(
+            r.reserve_port(
+                6500,
+                "web-lb",
+                "",
+                "bob.victim",
+                client_with_user("bob", "run-b")
+            )
+            .unwrap(),
+            PortClaim::Fresh
+        );
+
+        // ① 攻击者用**自己的真实身份** + 猜到的组名 ⇒ 必须被拒
+        let e = r
+            .reserve_port(
+                6500,
+                "web-lb",
+                "",
+                "alice.parasite",
+                client_with_user("alice", "run-a"),
+            )
+            .expect_err("跨租户 + 空 group_key 必须被拒（组名不是凭据）");
+        // 文案必须与其它占用失败**完全一致**，不泄露"组名猜对了"这个信息
+        assert!(
+            !e.contains("web-lb") && !e.contains("bob"),
+            "错误文案不得泄露组名或占用者：{e}"
+        );
+        assert_eq!(r.backend_count(6500), 1, "被拒后不能多出后端");
+
+        // ② 就算攻击者**知道 group_key**，跨租户一样拒 ——
+        //    租户边界先于密钥，否则"密钥泄露 = 可寄生"
+        assert!(
+            r.reserve_port(
+                6500,
+                "web-lb",
+                "",
+                "alice.guess",
+                client_with_user("alice", "run-a2"),
+            )
+            .is_err(),
+            "跨租户即使密钥正确也必须被拒"
+        );
+
+        // ③ 对照：**同租户**的第二个后端照常加入（合法的负载均衡拓扑）
+        assert_eq!(
+            r.reserve_port(
+                6500,
+                "web-lb",
+                "",
+                "bob.victim-2",
+                client_with_user("bob", "run-b2")
+            )
+            .unwrap(),
+            PortClaim::Joined,
+            "同租户的多个后端必须照常成组（否则就把负载均衡打死了）"
+        );
+        assert_eq!(r.backend_count(6500), 2);
+    }
+
+    /// 同一租户的多个 frpc **重连之后**仍要能加入 —— 用 `run_id` 判会打成不通。
+    ///
+    /// `run_id` 每次重连都变，而 `user` 不变；负载均衡组的合法性
+    /// 必须按租户判。这条锁住"别改成用 run_id"。
+    #[test]
+    fn 同租户重连后仍能加入负载均衡组() {
+        let r = Registry::unlimited();
+        assert_eq!(
+            r.reserve_port(6600, "lb", "k", "bob.a", client_with_user("bob", "run-1"))
+                .unwrap(),
+            PortClaim::Fresh
+        );
+        // 重连：run_id 变了、user 没变 ⇒ 必须仍能加入
+        assert_eq!(
+            r.reserve_port(6600, "lb", "k", "bob.b", client_with_user("bob", "run-2"))
+                .unwrap(),
+            PortClaim::Joined,
+            "同一租户重连后 run_id 会变，不能因此拒绝它加入自己的组"
+        );
     }
 
     #[test]
