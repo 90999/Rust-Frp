@@ -211,11 +211,38 @@ async fn main() -> Result<()> {
         );
     }
 
+    // ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）：**配了 [[roles]] 但用共享 token
+    //   ⇒ 整套分权可以被伪造**。
+    //
+    // 判据与完整说明见 [`rbac_identity_is_unverifiable`]。
+    if rbac_identity_is_unverifiable(&cfg) {
+        tracing::warn!(
+            "配置了 {} 个 [[roles]] 角色，但认证方式是**共享 token** —— \
+             `user` 是客户端**自报**字段、服务端无法验证，所以**任何持有 token 的人 \
+             都可以把自己报成别人的 `user`，从而拿到那个人的全部角色**\
+             （端口范围 / 代理类型 / 代理数 / allowManage / allow_users 白名单）。\
+             也就是说：这里的角色划分**不是**租户隔离，只是一层防误操作。\
+             需要真正的隔离请改用 [auth] method = \"oidc\"（身份来自验签过的 sub），\
+             或给每个租户发独立 token 并分实例部署。",
+            cfg.roles.len()
+        );
+    }
+
     nfrp_server::serve::ensure_protocol(&cfg)?;
 
     if cli.check {
-        // 配置能被解析 + 通过静态合法性校验就够格了，不需要真的绑端口
+        // ★★ v0.5.7 修（第六轮审计 F-1，中危）：**预检必须与启动同口径**。
+        //
+        // 原先这里只调 `validate(&cfg)` 就返回，而真正启动还会构造
+        // `SecurityContext`（ACL / RBAC / 认证 / 审计一整块校验）。
+        // ⇒ 实测 `--check` 放过了 5/7 条"启动时必然失败"的配置
+        //   （`deny = ["10.0.0.1/33"]`、`portRange = "abc"`、
+        //     `portRange = "30000-20000"` …）。
+        //
+        // `--check` 的用途是「systemd reload 前预检 / CI」，放过这些
+        // 等于给了一个**假绿灯** —— 而它恰好在安全相关配置上最容易被信。
         validate(&cfg)?;
+        nfrp_server::serve::preflight(&cfg)?;
         println!("配置 {} 合法", path.display());
         return Ok(());
     }
@@ -230,12 +257,63 @@ async fn main() -> Result<()> {
     nfrp_server::serve_with(cfg, registry, extras).await
 }
 
-/// 弱 token 检测（v0.5.3）。
+/// **配了 `[[roles]]` 但身份不可验证** —— 即"角色划分看起来是租户隔离、
+/// 实际只是防误操作"。
 ///
+/// ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）。
+///
+/// # 为什么这是个真问题（而不是"已知设计"）
+///
+/// 角色解析的输入是登录报文里的 `Login.user`，由客户端**自报**、
+/// 服务端不验任何东西 ⇒ 任何**持有 token** 的人把 `user` 写成 `"bob"`，
+/// 就拿到 bob 的全部角色：`portRange`、`allowProxyTypes`、`maxProxies`、
+/// `allowManage`，以及 `allow_users` 白名单里的身份。
+///
+/// 实测（`tmp/audit6-d/d05_identity.py`）：
+/// * 冒充者(user=bob) 登录成功并**拿到 bob 的端口段**（占 alice 段被正确拒绝）
+/// * 能注册进 `bob.*` 命名空间，并以 bob 身份穿过 `allow_users=["bob"]` 白名单
+/// * 面板上同时出现两个 `user=bob`，管理员**无法区分**
+///
+/// 审计任务书里提示"默认无 RBAC 时 `user` 只是自报标签是已知设计" ——
+/// **这一条不是那个**：管理员写了 `[[roles]]`，已经**明确表达**了
+/// "alice 只能占 A 段 / bob 只能占 B 段"的意图，而 `user` 不可验证
+/// 让这个意图**完全无法落地**。frp 的 token 是**服务端级共享凭据**，
+/// 而 `[[roles]]` 存在的理由**恰恰就是在共享 token 之上用 user 再分权**。
+///
+/// ⇒ **假安全比不配更危险**：配了角色表会让人以为已经隔离了。
+///
+/// # 判据
+///
+/// * 有角色表（`roles` 非空），**且**
+/// * 认证方式是 token 且 token 非空（共享凭据）
+///
+/// 配 OIDC 时身份来自**验签过的** `sub`（见 `remember_subject`），
+/// `user` 不再是唯一判据，所以不告警；token 为空时压根没认证，
+/// 另有更严重的告警。
+///
+/// # 为什么不在这个版本里直接改成"按 token 指纹匹配角色"
+///
+/// 那会**改变 `[[roles]]` 的语义**：既有配置里 `users = ["alice"]` 是按
+/// 用户名匹配的，改成按凭据指纹匹配会让所有既有部署**静默失效**
+/// （所有人都匹配不上角色）。正确做法是新增一种角色匹配方式并让
+/// 两者共存、文档说明迁移路径 —— 那是独立的架构改动，不该塞进一个
+/// 安全修复版本里。本版先做**诚实告警**，把"你以为的"和"实际的"对齐。
+fn rbac_identity_is_unverifiable(cfg: &ServerConfig) -> bool {
+    !cfg.roles.is_empty() && !cfg.effective_auth().token.is_empty()
+}
+
+/// 弱 token 检测（v0.5.3）。
 /// 为什么值得单独做一件事：v1 的登录凭证是 `md5(token + timestamp)`，
-/// 服务端对 `timestamp` **没有新鲜性校验**，所以抓到一条 Login 之后
-/// 离线枚举一条候选只要 1 次 MD5。token 的强度**完全取决于它自身的随机性**，
-/// 协议层面没有补救空间（PBKDF2 的 64 次迭代是官方 golib 的硬编码值）。
+/// 抓到一条 Login 之后离线枚举一条候选只要 1 次 MD5。token 的强度
+/// **完全取决于它自身的随机性**，协议层面没有补救空间
+/// （PBKDF2 的 64 次迭代是官方 golib 的硬编码值）。
+///
+/// ★ v0.5.7 更正：本注释原先写"服务端对 `timestamp` **没有新鲜性校验**"，
+///   那句已经**过时** —— M3（v0.5.6）给主登录加了 ±300 秒窗口，
+///   G-1（v0.5.7）把它铺到了全部 6 个凭证入口。
+///   但**弱 token 依然是问题**：窗口只把重放面从"永久"压到 5 分钟，
+///   攻击者在窗口内抓到一条 Login 仍然能离线枚举 token
+///   （枚举成本与时间窗口无关）。所以这条检测继续保留。
 ///
 /// 这里只告警、不拒绝启动 —— 既有部署可能正在用短 token，
 /// 直接拦下来会比风险本身造成更大的破坏。但要把"为什么危险"说清楚。
@@ -575,7 +653,53 @@ mod tests {
         assert!(validate(&c).is_ok());
     }
 
-    /// ★ v0.5.3：弱 token 只告警不拦启动（不能破坏既有部署）。
+    /// ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）：`[[roles]]` + 共享 token
+    /// ⇒ 身份不可验证，必须告警。
+    ///
+    /// 锁三件事：
+    /// 1. 有角色表 + 非空 token ⇒ **告警**（这是被测的那条）
+    /// 2. 没有角色表 ⇒ 不告警（"user 只是标签"在那个场景下是已知设计）
+    /// 3. token 为空 ⇒ 不告警（另有"根本没认证"的告警，不该重复刷屏）
+    #[test]
+    fn 配了角色表又用共享token时必须告警() {
+        // ① 被测：有角色表 + 共享 token
+        let mut c = cfg();
+        c.token = "s3cret".into();
+        c.roles = vec![nfrp_common::security::RoleConfig {
+            name: "dev".into(),
+            users: vec!["alice".into()],
+            ..Default::default()
+        }];
+        assert!(
+            rbac_identity_is_unverifiable(&c),
+            "配了 [[roles]] 且认证是共享 token 时必须告警 —— \
+             否则管理员会以为角色表就是租户隔离"
+        );
+
+        // ② 没有角色表：不告警（此时 user 只是标签，是已知设计）
+        let mut c = cfg();
+        c.token = "s3cret".into();
+        c.roles = vec![];
+        assert!(
+            !rbac_identity_is_unverifiable(&c),
+            "没配角色表时不该告警（那是已知设计，不是缺陷）"
+        );
+
+        // ③ token 为空：不告警（另有更严重的"没有认证"告警）
+        let mut c = cfg();
+        c.token = String::new();
+        c.roles = vec![nfrp_common::security::RoleConfig {
+            name: "dev".into(),
+            users: vec!["alice".into()],
+            ..Default::default()
+        }];
+        assert!(
+            !rbac_identity_is_unverifiable(&c),
+            "空 token 时不该走这条告警（已有『没有认证』的告警）"
+        );
+    }
+
+    /// 弱 token 不阻止启动。
     #[test]
     fn 弱token不阻止启动() {
         for weak in [
