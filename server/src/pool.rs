@@ -50,10 +50,42 @@ pub enum CtrlCmd {
     },
 }
 
+use tracing::debug;
+
 /// 一条已握手完成、等待分配代理的工作连接。
 pub struct WorkItem {
     pub conn: FrpConn,
     pub at: Instant,
+    /// ★★ v0.5.8（第七轮审计 **C-2**）：这条空闲工作连接占的配额凭证。
+    ///
+    /// 它与其它配额一样靠 **drop 归还** —— 被配对取走、被 `reap` 超时清掉、
+    /// 或连接本身断开时，`WorkItem` 一 drop，名额就回到池子里。
+    /// 这样"池子满了"不会变成"池子永久卡死"。
+    ///
+    /// `None` 表示该条不是经 `submit_work` 入池的（不占池子配额）。
+    idle_permit: Option<Permit>,
+}
+
+impl WorkItem {
+    /// ★ v0.5.8（C-2）：新增构造入口。
+    ///
+    /// 之所以不让调用方写结构体字面量：`idle_permit` 是**内部记账**，
+    /// 调用方（`serve.rs::handle_work`）不该、也无法正确填它 ——
+    /// 它由 `submit_work` 在入池那一刻决定。
+    /// 把字段设成私有 + 提供构造函数，就从类型上保证了这一点。
+    pub fn new(conn: FrpConn) -> Self {
+        Self {
+            conn,
+            at: Instant::now(),
+            idle_permit: None,
+        }
+    }
+
+    /// 附带空闲池配额（`submit_work` 入池时用）。
+    fn with_idle_permit(mut self, permit: Permit) -> Self {
+        self.idle_permit = Some(permit);
+        self
+    }
 }
 
 /// 一个已经连进来、等待工作连接的用户连接。
@@ -206,6 +238,49 @@ pub struct ClientState {
     conn_limit: Limit,
     /// 本客户端的排队上限（用户连接排着等工作连接）。
     backlog_limit: Limit,
+    /// ★★ v0.5.8 新增（第七轮审计 **C-2**，中危）：**空闲工作连接池的上限**。
+    ///
+    /// # 为什么需要它
+    ///
+    /// `submit_work` 入池时原先**没有任何闸门**（对照 `submit_user` 有
+    /// `backlog_limit.try_acquire()`）：
+    ///
+    /// ```ignore
+    /// // 修前
+    /// None => { g.work.push_back(w); None }   // ← 无条件入池
+    /// ```
+    ///
+    /// 而 `reap` 只在**下一次** submit 时按 `idle_timeout`（默认 60s）回收。
+    /// 再加上 `handle_work` **不经过** `max_clients` / `max_total_conns` /
+    /// `max_conns_per_client`（那些只在**用户**连接侧的 `ConnSlot::acquire`）
+    /// ⇒ **工作连接方向完全没有配额闸门**。
+    ///
+    /// # 实测（C 组 `c13c_workpool_cost.py`，主审已核对源码与数据）
+    ///
+    /// 把**全部四个**用户侧配额设到最小值（`max_clients=4`、`max_total_conns=8`、
+    /// `max_conns_per_client=4`、`max_pending_per_client=4`）仍然拦不住：
+    ///
+    /// | 灌入 | idle_work_conns | 服务端句柄 | 内存 |
+    /// |---|---|---|---|
+    /// | 200 | 200 | — | — |
+    /// | 2000 | 2000 | +2066 | +3.3 MB |
+    /// | 4000 | 4000 | +4129 | +6.5 MB |
+    /// | **6000** | **6000** | — | 仍正常、无降级 |
+    ///
+    /// 单条成本 ≈ **1.03 个句柄 + 1.6 KB 内存**，200→6000 全部**线性**，
+    /// 未观测到拐点。⇒ 任何持合法 token 的租户都能用一条脚本把服务端 fd 耗尽。
+    ///
+    /// ★ 第五轮 M15 曾写下"`idle_work_conns` 持续累积、fd/内存缓慢增长"
+    ///   这句话，但**只修了超时的上界**（`clamp(5,3600)`），
+    ///   **从未加过数量上界** ⇒ 该面从未被真正修过。
+    ///
+    /// # 取值
+    ///
+    /// 复用 `max_pending_per_client` 的语义（"这个客户端的待处理容量"）——
+    /// 空闲工作连接与排队用户是**同一枚硬币的两面**（都在等配对），
+    /// 用同一个数封顶最自然，也避免再加一个配置项。
+    /// `0`（默认）= 不限制，**保持向后兼容**（与项目其它 `Limit` 一致）。
+    idle_work_limit: Limit,
     /// 本客户端可注册的代理数上限。
     proxy_limit: Limit,
     /// 这个客户端的角色是否允许**面板管理**它（RBAC 的 `allowManage`）。
@@ -248,6 +323,12 @@ impl ClientState {
         proxy_limit: Limit,
         peer_ip: IpAddr,
     ) -> Self {
+        // ★ C-2：空闲工作连接池与排队用户是同一枚硬币的两面（都在等配对），
+        //   所以复用 `backlog_limit` 的**上限值**（而不是再引一个配置项）。
+        //   注意要取 `max()` 而不是 clone —— `Limit` 内部是共享信号量，
+        //   两处共用一个信号量会把"排队"与"空闲池"互相挤占，
+        //   而它们是**两种不同的资源**，各自独立计数才对。
+        let idle_work_limit = Limit::new(backlog_limit.max());
         Self {
             run_id,
             client_id,
@@ -263,6 +344,7 @@ impl ClientState {
             idle_timeout,
             conn_limit,
             backlog_limit,
+            idle_work_limit,
             proxy_limit,
             // 默认**允许**：未启用 RBAC 时行为必须与老版本完全一致。
             // 启用 RBAC 后由控制连接按角色覆盖。
@@ -457,6 +539,33 @@ impl ClientState {
     }
 
     /// 工作连接到来：有排队的用户就立即配对，否则进池备用并唤醒等待者。
+    ///
+    /// ★★ v0.5.8 修（第七轮审计 **C-2**，中危）：**空闲池必须封顶。**
+    ///
+    /// # 原先为什么错了
+    ///
+    /// 入池分支**没有任何闸门**（对照 `submit_user` 有
+    /// `backlog_limit.try_acquire()`），而 `reap` 只在下一次 submit 时
+    /// 按 `idle_timeout`（默认 60s）回收；`handle_work` 又**不经过**
+    /// `max_clients` / `max_total_conns` / `max_conns_per_client`
+    /// （那些只在**用户**连接侧的 `ConnSlot::acquire`）。
+    ///
+    /// ⇒ **工作连接方向完全没有配额闸门。** 实测（C 组 `c13c`）：
+    /// 四个用户侧配额全设最小值（4/8/4/4）仍能灌到 **6000 条**空闲工作连接，
+    /// 每条约 1.03 个句柄 + 1.6 KB，**线性无拐点**。
+    ///
+    /// # 修法
+    ///
+    /// 与 `submit_user` 对称：入池前 `try_acquire`，取不到就**拒绝这条工作连接**
+    /// （返回 `None` 时调用方会关闭它）。这样：
+    /// * fd / 内存增长有**上界**（= `idle_work_limit`）；
+    /// * **不改变正常行为** —— 默认 `0`（不限）时零影响；
+    ///   真配了上限的场景下，正常客户端根本不会攒出那么多空闲工作连接
+    ///   （每条用户连接配一条工作连接，用完即弃）。
+    ///
+    /// ★ 为什么"拒绝工作连接"是安全的：它**只影响那条多余的空闲连接**，
+    ///   已经在配对中的工作连接不受影响。客户端需要时会再申请
+    ///   （`request_work_conn`），不影响任何已建立的转发。
     pub fn submit_work(&self, w: WorkItem) -> Option<PairedBox> {
         let paired = {
             let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -464,8 +573,22 @@ impl ClientState {
             match g.users.pop_front() {
                 Some(u) => Some(PairedBox { user: u, work: w }),
                 None => {
-                    g.work.push_back(w);
-                    None
+                    // ★ C-2：入池前先取配额。取不到 ⇒ 拒绝入池（返回 None，
+                    //   调用方关闭这条工作连接），而不是无条件 push_back。
+                    match self.idle_work_limit.try_acquire() {
+                        Some(permit) => {
+                            g.work.push_back(w.with_idle_permit(permit));
+                            None
+                        }
+                        None => {
+                            debug!(
+                                idle = g.work.len(),
+                                limit = self.idle_work_limit.max(),
+                                "空闲工作连接池已满，拒绝这条工作连接"
+                            );
+                            return None;
+                        }
+                    }
                 }
             }
         };
@@ -542,10 +665,9 @@ mod tests {
     use super::*;
 
     fn work(now: Instant) -> WorkItem {
-        WorkItem {
-            conn: FrpConn::new(Box::pin(tokio::io::empty()), WireVersion::V1),
-            at: now,
-        }
+        let mut w = WorkItem::new(FrpConn::new(Box::pin(tokio::io::empty()), WireVersion::V1));
+        w.at = now;
+        w
     }
 
     fn user(name: &str, now: Instant) -> PendingUser {
@@ -689,6 +811,77 @@ mod tests {
         assert!(
             matches!(c.submit_user(user("c", t)), Submit::Queued),
             "配对后排队配额必须归还"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 第七轮审计 C-2：空闲工作连接池必须有上界
+    // -----------------------------------------------------------------------
+
+    /// ★★ v0.5.8 回归（第七轮审计 **C-2**，中危）：
+    /// **空闲工作连接池必须封顶**，否则单个合法客户端能刷爆服务端 fd。
+    ///
+    /// # 原先的洞
+    ///
+    /// `submit_work` 入池分支**没有** `try_acquire`（对照 `submit_user` 有
+    /// `backlog_limit`），而 `handle_work` 又不经过任何用户侧配额
+    /// ⇒ 工作连接方向完全没有闸门。
+    ///
+    /// 实测（C 组 `c13c`）：四个用户侧配额全设最小值（`4/8/4/4`）时，
+    /// 仍能灌进 **6000 条**空闲工作连接（每条约 1.03 句柄 + 1.6 KB），
+    /// 线性无拐点。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 1. **上界生效**：配了上限后，多余的 `submit_work` 必须被**拒绝**
+    ///    （返回 `None` ⇒ 调用方关闭那条工作连接），而不是无限入池；
+    /// 2. **配额会归还**：被配对取走或超时回收后，名额必须回到池子
+    ///    —— 否则"池子满了"会退化成"池子永久卡死"（那比不限制更糟）；
+    /// 3. **默认不限**：`Limit::unlimited()` 时行为与修复前**完全一致**
+    ///    （零行为变化，这是本项目对默认配置的一贯要求）。
+    #[test]
+    fn 空闲工作连接池必须有上界() {
+        let t = now();
+
+        // ---- ① 上界生效：上限 2 ⇒ 第 3 条必须被拒 ----
+        let c = client_with(Limit::unlimited(), Limit::new(2), Limit::unlimited());
+        assert!(c.submit_work(work(t)).is_none(), "第 1 条入池");
+        assert!(c.submit_work(work(t)).is_none(), "第 2 条入池");
+        assert_eq!(c.idle_work_conns(), 2);
+        // ★ 核心：第 3 条必须被拒（返回 None ⇒ 调用方关闭它）
+        assert!(
+            c.submit_work(work(t)).is_some() || c.idle_work_conns() <= 2,
+            "★ 空闲池达到上限后**不得**继续堆积 —— C-2 的成因正是这里无闸门"
+        );
+        assert_eq!(
+            c.idle_work_conns(),
+            2,
+            "空闲池不得超过上限（实测修复前能攒到 6000 条）"
+        );
+
+        // ---- ② 配对取走后配额必须归还 ----
+        let d = client_with(Limit::unlimited(), Limit::new(2), Limit::unlimited());
+        d.submit_work(work(t));
+        d.submit_work(work(t));
+        assert_eq!(d.idle_work_conns(), 2);
+        // 来一个用户 ⇒ 与其中一条工作连接配对 ⇒ 池子空出一个名额
+        d.submit_user(user("u1", t));
+        assert_eq!(d.idle_work_conns(), 1, "配对后空闲池应减少一条");
+        // 空出的名额必须能再入池（否则池子会越用越死）
+        assert!(
+            d.submit_work(work(t)).is_none(),
+            "★ 配对释放的名额必须能再次入池 —— 否则'满了'会退化成'永久卡死'"
+        );
+
+        // ---- ③ 默认不限：行为与修复前完全一致 ----
+        let e = client_with(Limit::unlimited(), Limit::unlimited(), Limit::unlimited());
+        for _ in 0..50 {
+            e.submit_work(work(t));
+        }
+        assert_eq!(
+            e.idle_work_conns(),
+            50,
+            "未配上限时必须完全不限制（保持向后兼容，零行为变化）"
         );
     }
 
