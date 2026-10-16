@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.7-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.5.8-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -34,7 +34,7 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 | `tcpmux` | HTTP CONNECT 复用，多条代理共用一个服务端端口，支持 `routeByHTTPUser` 二级路由 |
 | `stcp` | 私密隧道，服务端不开公网端口，`secret_key` 校验 + `allow_users` 白名单 |
 | `sudp` | 与 stcp 同一套鉴权，数据面为 UDP，同样不占公网端口 |
-| `xtcp` | UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继 |
+| `xtcp` | UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继。v0.5.8 起 P2P 握手加两层校验（provider 回**派生应答口令** + 服务端把牵线 HELLO 绑定到控制连接来源 IP） |
 
 ### 传输层
 
@@ -61,7 +61,10 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 完整修复清单见 [SECURITY-FIXES.md](SECURITY-FIXES.md)；
 第四轮（11 项）见 [SECURITY-FIXES-ROUND4.md](SECURITY-FIXES-ROUND4.md)；
-第五轮（39 项）见 [SECURITY-FIXES-ROUND5.md](SECURITY-FIXES-ROUND5.md)。
+第五轮（39 项）见 [SECURITY-FIXES-ROUND5.md](SECURITY-FIXES-ROUND5.md)；
+第六轮（8 项）见 [SECURITY-FIXES-ROUND6.md](SECURITY-FIXES-ROUND6.md)；
+第七轮（13 项）见 [SECURITY-FIXES-ROUND7.md](SECURITY-FIXES-ROUND7.md)；
+第八轮（5 项）见 [SECURITY-FIXES-ROUND8.md](SECURITY-FIXES-ROUND8.md)。
 
 ### 运维与调度
 
@@ -83,7 +86,7 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 ### 工程质量
 
-- 699 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- 725 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
 - CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
 - 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
 - 发布产物附 `SHA256SUMS` + Ed25519 分离签名
@@ -204,6 +207,15 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 | **跨租户不能用同组名共享公网端口** | 不同 `user` 的客户端即使组名与 `groupKey` 都相同也**不能**共享端口 | 这是堵一个实测打出来的劫持（攻击者能分走一半用户流量）。**同一租户**的多个 frpc（重连、多开、一份配置多条 `[[proxies]]`）照常成组，官方"一个运维跑多个冗余后端"的用法**不受影响** |
 | **visitor 的 `run_id` 不能留空** | 用 `run_id = ""` 的 visitor 连接会被拒 | 官方 frpc 的 visitor **一定**带自己的 `run_id`，所以零影响。原先空值会绕过会话校验（实测匿名连接能把数据送进别人的隧道） |
 
+**0.5.8 起追加四处**（第七 / 八轮；详单见 `SECURITY-FIXES-ROUND7.md` 与 `SECURITY-FIXES-ROUND8.md`）：
+
+| 变更 | 影响 | 处理 |
+|---|---|---|
+| **xtcp 牵线加两层校验**：服务端把牵线 HELLO 的来源 IP 绑定到该 session 的控制连接 IP；provider 回**按 `secret_key`+`sid` 派生的应答口令**（替代固定 `"RTNL-OK"`），visitor 定长比较 | 修复"在途读到明文 HELLO（sid 泄露）⇒ 冒充 provider 劫持 P2P 会话"（第八轮 B-1，实测可拿到用户明文数据）。**混合版本时 P2P 直连会失败并自动回退中继**（新↔旧任意组合）：功能不受影响，只是少一层直连加速 | 两端都升到 0.5.8+ 才建立 P2P 直连；单边升级**不会**让连接失败，打洞窗口（8 秒）过后自动走中继。注意同一 NAT 后仍可能被同 IP 的观察者登记（第二层口令会拦住数据） |
+| **面板解析卫生 + 全名删除**：`Authorization` 只从请求**头区**解析（请求体里同形状的行不再"误投"）；面板列表展示的**线上全名**（`user.proxy`）可直接用于"移除代理" | ① 修复前，body 里带 `Authorization: Basic ...` 的请求能通过面板鉴权（与上游反代/WAF 口径不一致，属解析卫生）；② 修复前按列表全名删除会得到 502/400 且**两端状态分裂**（服务端已摘、客户端报"本地没有"） | 正常用法无感知；②修复后控制台/脚本从列表复制的名字（全名或短名）都能删 |
+| **`https2http` / `https2https` 上游收尾**：访问方断开时立刻放弃等待上游并释放上游连接；上游 connect / TLS 握手加 10 秒超时 | 修复前上游 accept 后悬挂时，每轮访问（连接→发请求→撤离）会留下一条永不释放的上游连接（可被公开访问方反复放大）；"等响应头"阶段仍然**没有**人为超时，长轮询 / SSE 不受影响 | 行为对齐官方 frpc（Go `http.Server` 在客户端断开时取消请求上下文）。上游就是慢（正常出数据）的场景不受影响，已实测 |
+| **`[acl]` 开始真正作用于数据面**（第七轮 F7-1）：公网 **TCP 代理端口**与 **HTTP/HTTPS vhost** 的 accept 现在过 IP 白/黑名单（修复前只挡控制连接） | 被你 `deny` 挡掉的来源此前"居然一直能访问"，本版起被拒（静默关连接 + 审计事件）；用白名单模式（`allow`）的部署尤其要注意：此前它对数据面形同虚设，本版起**按白名单收紧** | **UDP 代理端口与 xtcp 牵线（p2p）UDP 仍不在 `[acl]` 范围内**（面板另有自身鉴权）—— 如实记录在 `SECURITY-FIXES-ROUND7.md`。需要挡 UDP 来源请用防火墙 |
+
 其余需注意：
 
 - **OIDC 部署必须配 TLS**。OIDC 的 `privilege_key` 是原样的 access token，会明文出现在登录报文里；不加密链路上任何被动抓包的人都能拿走它。
@@ -220,24 +232,23 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                # 格式
 cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
-cargo test --workspace                    # 699 个测试
+cargo test --workspace                    # 725 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 |
 |---|---|
-| `common` 单元测试 | 332 |
-| `server` 单元测试（lib） | 219 |
+| `common` 单元测试 | 340 |
+| `server` 单元测试（lib） | 229 |
 | `server` 单元测试（bin） | 17 |
-| `client` 单元测试 | 107 |
+| `client` 单元测试 | 115 |
 | `server` 端到端集成测试 | 24 |
-| **合计** | **699** |
+| **合计** | **725** |
 
-★ 上表是 **v0.5.7 实测值**（`cargo test --workspace` 逐个 target 数的）。
-v0.5.6 的 README 里这张表是**过时**的（`e2e` 写 18、实际已有 23；
-合计算出来是 692 却被写成 699）。本轮按实测改正 —— 数字对不上时
-以 `cargo test` 的输出为准。
+★ 上表是 **v0.5.8 实测值**（`cargo test --workspace` 逐个 target 数的）。
+v0.5.7 的 699 加本轮 +26（第七轮 13 条修复的回归 + 第八轮 5 条的回归）= 725。
+数字对不上时以 `cargo test` 的输出为准。
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
 
