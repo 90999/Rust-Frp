@@ -48,6 +48,11 @@ pub struct SecurityContext {
     rbac: CompiledRbac,
     /// 审计日志（未启用时是个空操作实例）。
     pub audit: Arc<AuditLog>,
+    /// 凭证时间戳允许的偏差秒数（0 = 显式关闭）。
+    ///
+    /// ★ v0.5.7（第六轮审计 G-1）：放在这里而不是每个调用点各传一次 ——
+    ///   让"校验凭证"与"查新鲜性"用**同一个**来源，调用方没有机会漏。
+    max_clock_skew_secs: u64,
 }
 
 impl SecurityContext {
@@ -58,6 +63,11 @@ impl SecurityContext {
     /// 在这里直接 panic 会把一次偶发故障放大成永久不可用。
     pub fn auth(&self) -> AuthProvider {
         self.auth.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 凭证时间戳允许的偏差秒数（**所有**凭证校验路径都该用它）。
+    pub fn max_clock_skew_secs(&self) -> u64 {
+        self.max_clock_skew_secs
     }
 }
 
@@ -80,6 +90,10 @@ impl Default for SecurityContext {
             acl: CompiledAcl::default(),
             rbac: CompiledRbac::default_unrestricted(),
             audit: Arc::new(AuditLog::disabled()),
+            // 默认与 `ServerConfig::default_max_clock_skew()` 保持一致（300 秒）。
+            // 测试里直接构造 `SecurityContext::default()` 时也应当有窗口，
+            // 否则测试会掩盖"忘了传 skew"的问题。
+            max_clock_skew_secs: 300,
         }
     }
 }
@@ -144,6 +158,7 @@ impl SecurityContext {
             acl,
             rbac,
             audit,
+            max_clock_skew_secs: cfg.max_clock_skew_secs,
         })
     }
 
@@ -215,7 +230,25 @@ impl SecurityContext {
     pub fn verify_login(&self, cred: &str, ts: i64, run_id: &str) -> anyhow::Result<String> {
         // 取一份当前快照（短锁），避免在验签（可能很贵）期间占着读锁。
         let auth = self.auth();
-        auth.verify_login(cred, ts, run_id)
+        // 新鲜性校验在 `verify_login` 内部完成（`skew` 是必需参数）——
+        // 这里把配置里的窗口传进去，调用方**没有机会漏**。
+        auth.verify_login(cred, ts, run_id, self.max_clock_skew_secs)
+    }
+
+    /// 只做新鲜性校验（不校验凭证内容）。
+    ///
+    /// 给"自己手写凭证比对"的路径用：工作连接在 token 模式下是就地
+    /// `auth_key(token, ts)` 比对的，不适合整体改走 `verify_login`
+    /// （那条路径还要处理"空 token / 空凭证 / 能力位"三种兼容形态）。
+    ///
+    /// ★ 但"忘了调它"这件事本身是 G-1 的成因，所以：
+    ///   1. 工作连接那处**已经改成调用 `verify_login`**，本函数目前只作为
+    ///      纵深防御与测试入口保留；
+    ///   2. 新增的 `visitor` / `p2p` 两处走
+    ///      [`nfrp_common::security::verify_shared_secret_proof`]，
+    ///      那里的新鲜性校验是**嵌在函数体里**的，不是可选项。
+    pub fn check_freshness(&self, ts: i64, what: &str) -> anyhow::Result<()> {
+        nfrp_common::security::check_freshness(ts, self.max_clock_skew_secs, what)
     }
 
     /// ② 心跳 / 工作连接的后续复核。判据与登录一致，走同一份当前校验器。
@@ -284,7 +317,13 @@ mod tests {
         assert!(ctx.rbac().is_disabled());
         assert!(!ctx.audit.is_enabled());
         // 默认 token 为空 = 不校验（与官方 frps 一致）
-        assert!(ctx.verify_login("随便", 0, "run-x").is_ok());
+        //
+        // ★ v0.5.7：时间戳要用**当前时间** —— `verify_login` 现在自带
+        //   新鲜性校验（G-1 修复），传 0（1970）会被窗口先拦下，
+        //   那样就测不到"空 token 不校验凭证"这件事了。
+        assert!(ctx
+            .verify_login("随便", nfrp_common::util::now_unix_secs() as i64, "run-x")
+            .is_ok());
         // 任何人都拿到全权
         let r = ctx.role_for("anyone").unwrap();
         assert!(r.allow_manage && r.allow_port(22));
@@ -346,10 +385,23 @@ mod tests {
         );
 
         // ② 认证：正确的 md5 才过
-        let ts = 1700000000;
+        //
+        // ★ v0.5.7：用**当前时间**（原先写死 1700000000 = 2023-11-14）。
+        //   `verify_login` 现在自带新鲜性校验，写死的时间戳会被窗口拦下，
+        //   于是这条测试会"因为过期而失败"而不是"因为凭证对而通过"。
+        let ts = nfrp_common::util::now_unix_secs() as i64;
         let good = nfrp_common::frp::msg::auth_key("s3cret", ts);
         assert!(ctx.verify_login(&good, ts, "run-1").is_ok());
         assert!(ctx.verify_login("wrong", ts, "run-1").is_err());
+
+        // ★ 新增（G-1 回归）：**同一个正确凭证、换成过期的时间戳必须被拒**。
+        //   这是漏洞的核心：原先"凭证对"就放行，不看有多旧。
+        let stale_ts = ts - 365 * 24 * 3600; // 一年前
+        let stale_good = nfrp_common::frp::msg::auth_key("s3cret", stale_ts);
+        assert!(
+            ctx.verify_login(&stale_good, stale_ts, "run-1").is_err(),
+            "一年前的正确凭证必须被拒（否则就是无限期重放）"
+        );
 
         // ③ RBAC
         let r = ctx.role_for("whoever").unwrap();
@@ -372,8 +424,16 @@ mod tests {
         });
         let ctx = SecurityContext::from_config(&c).unwrap();
         // JWKS 还没拉：必须拒绝。**绝不能**因为"验不了"就放行。
+        //
+        // ★ v0.5.7：时间戳要用当前时间 —— `verify_login` 现在先判新鲜性，
+        //   传 0 会先撞上"时间戳超出偏差"，就测不到"OIDC 未就绪必须拒绝"了。
+        //   两种失败**都拒绝**（都是 fail-closed），但这条测试要盯的是后者。
         let e = ctx
-            .verify_login("any.token.here", 0, "run-a")
+            .verify_login(
+                "any.token.here",
+                nfrp_common::util::now_unix_secs() as i64,
+                "run-a",
+            )
             .unwrap_err()
             .to_string();
         assert!(e.contains("OIDC"), "{e}");
