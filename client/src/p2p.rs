@@ -60,7 +60,7 @@ use nfrp_common::{
         kcp::{self, KcpStream},
         msg::{constant_time_eq, NatHoleClient, NatHoleResp, NatHoleVisitor},
     },
-    p2p::{self, Packet, Role, Transport, HANDSHAKE_OK, SERVER_NAME},
+    p2p::{self, Packet, Role, Transport, SERVER_NAME},
 };
 use quinn::{Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
 use tokio::{
@@ -719,7 +719,15 @@ async fn kcp_accept(
 // 应用握手
 // ---------------------------------------------------------------------------
 
-/// visitor：先写口令，再等对方回 `HANDSHAKE_OK`；之后这条流就是数据通道。
+/// visitor：先写口令，再等对方回**由同一 `secret_key` 派生的应答口令**；
+/// 之后这条流就是数据通道。
+///
+/// ★ v0.5.8 修（第八轮审计 B-1，高危）：旧协议只校验"对方回没回固定的
+/// `RTNL-OK`"。牵线 HELLO 无鉴权且 sid 明文，攻击者冒充 provider 时事
+/// 实上不需要任何秘密就能被接受 —— visitor 会把用户流量交给它。
+/// 现在校验的应答由 `handshake_ack(secret_key, sid)` 派生，攻击者不知道
+/// `secret_key` 就答不上来；答不上来时这里直接失败，调用方按既有逻辑
+/// 回退 stcp 中继。
 async fn greet_client<S>(s: &mut S, sid: &str, secret_key: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -727,17 +735,19 @@ where
     // 注意：这里**不能**关掉写方向 —— 这条流握手完还要继续当数据通道用
     s.write_all(p2p::handshake_token(secret_key, sid).as_bytes())
         .await?;
-    let mut ok = [0u8; HANDSHAKE_OK.len()];
-    tokio::time::timeout(PUNCH_TIMEOUT, s.read_exact(&mut ok))
+    let expect = p2p::handshake_ack(secret_key, sid);
+    let mut got = vec![0u8; expect.len()];
+    tokio::time::timeout(PUNCH_TIMEOUT, s.read_exact(&mut got))
         .await
         .map_err(|_| anyhow!("等待 P2P 握手响应超时"))??;
-    if ok != HANDSHAKE_OK {
-        bail!("对端拒绝了 P2P 握手（口令不匹配）");
+    let got = String::from_utf8(got).map_err(|_| anyhow!("P2P 握手响应不是 UTF-8"))?;
+    if !constant_time_eq(&got, &expect) {
+        bail!("对端未能证明持有 secret_key（P2P 握手应答不匹配）");
     }
     Ok(())
 }
 
-/// provider：读口令并校验，校验通过才回 `HANDSHAKE_OK`。
+/// provider：读口令并校验，校验通过才回**由 `secret_key` 派生的应答口令**。
 async fn greet_server<S>(s: &mut S, sid: &str, secret_key: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -754,7 +764,10 @@ where
         let _ = s.shutdown().await;
         bail!("P2P 握手口令不匹配（对方不是本次 xtcp 会话的 peer）");
     }
-    s.write_all(HANDSHAKE_OK).await?;
+    // ★ v0.5.8 修（第八轮审计 B-1）：应答同样派生自 secret_key，
+    //   让 visitor 能反向确认"对面真的持有 secret_key"。
+    s.write_all(p2p::handshake_ack(secret_key, sid).as_bytes())
+        .await?;
     Ok(())
 }
 
@@ -1276,11 +1289,94 @@ mod tests {
             recv,
             _endpoint: client,
         });
-        // 用错密钥握手：客户端读回来的不是 OK，必须报错
+        // 用错密钥握手：客户端读回来的不是派生应答，必须报错
         let r = greet_client(&mut s, sid, "wrong-key").await;
         assert!(r.is_err(), "口令不对却成功了：等于 NAT 外谁都能进来");
         // 服务端侧也必须失败
         let srv = srv_task.await.unwrap();
         assert!(srv.is_err());
+    }
+
+    /// ★ v0.5.8（第八轮审计 B-1，高危）回归：假 provider **不知道 secret_key**，
+    /// 它能读到 visitor 递出的口令（口令是 visitor 先发的），然后模仿旧协议
+    /// 回固定 `RTNL-OK`，或回一个内容错误 / 密钥猜错的应答。
+    ///
+    /// 修复前第一种应答会被直接接受 —— 这就是 B-1 的劫持链（攻击者靠
+    /// 未鉴权的牵线 HELLO 拿到 sid，再靠固定应答骗过 visitor）；
+    /// 修复后三种都必须被拒，调用方按既有逻辑回退 stcp 中继。
+    #[tokio::test]
+    async fn fake_provider_without_secret_is_rejected() {
+        let sid = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let sk = "real-secret";
+
+        let fake_replies: Vec<Vec<u8>> = vec![
+            // 旧协议的固定应答（B-1 原始劫持用的就是这个）
+            b"RTNL-OK".to_vec(),
+            // 长度对但内容全错
+            vec![b'A'; 64],
+            // 猜错了 secret_key 的应答
+            nfrp_common::p2p::handshake_ack("wrong-key", sid).into_bytes(),
+        ];
+
+        for reply in fake_replies {
+            let reply_desc = String::from_utf8_lossy(&reply).to_string();
+            let scfg = server_config().unwrap();
+
+            let srv_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let srv_addr = srv_sock.local_addr().unwrap();
+            let server = Endpoint::new(
+                EndpointConfig::default(),
+                Some(scfg),
+                srv_sock,
+                Arc::new(TokioRuntime),
+            )
+            .unwrap();
+
+            let cli_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let client = Endpoint::new(
+                EndpointConfig::default(),
+                None,
+                cli_sock,
+                Arc::new(TokioRuntime),
+            )
+            .unwrap();
+
+            // 连接要活到 visitor 判定完成为止，否则"失败"可能只是 EOF 的假象
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let server2 = server.clone();
+            let fake = tokio::spawn(async move {
+                let incoming = server.accept().await.expect("accept");
+                let conn = incoming.accept().unwrap().await.expect("handshake");
+                let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+                // 攻击者确实拿得到 visitor 的口令（这正是要防的）
+                let mut tok = [0u8; 64];
+                recv.read_exact(&mut tok)
+                    .await
+                    .expect("假 provider 收到口令");
+                send.write_all(&reply).await.expect("假 provider 回应答");
+                let _ = send.finish();
+                let _ = done_rx.await;
+                drop(server2);
+            });
+
+            let conn = client
+                .connect_with(client_config().unwrap(), srv_addr, SERVER_NAME)
+                .unwrap()
+                .await
+                .expect("连接成功");
+            let (send, recv) = conn.open_bi().await.expect("open_bi");
+            let mut s = P2PStream::Quic(QuicStream {
+                send,
+                recv,
+                _endpoint: client,
+            });
+            let r = greet_client(&mut s, sid, sk).await;
+            assert!(
+                r.is_err(),
+                "假 provider 用 {reply_desc:?} 应答却被接受了：B-1 劫持链没堵住"
+            );
+            let _ = done_tx.send(());
+            fake.await.unwrap();
+        }
     }
 }
