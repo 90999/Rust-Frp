@@ -453,7 +453,16 @@ fn query_of(req: &str) -> String {
 }
 
 fn header_value(req: &str, name: &str) -> Option<String> {
-    for line in req.lines() {
+    // ★ v0.5.8 修（第八轮审计 F8-L1，低危）：只看**头区**，body 行不得参与解析。
+    //
+    // `req` 是整个读缓冲的转码（见 `handle` 里的读循环）—— 与请求头同一批
+    // 到达的请求体字节也在里面。原先逐行扫描整个缓冲，于是写在 body 里的
+    // `Authorization: Basic ...` 会被当成头参与鉴权（第八轮实测：同段发送
+    // 时 control=401 / body 行=200）。这与标准 HTTP 语义、以及上游中间件
+    // （反代/WAF/网关只按头区判定）的口径不一致，属解析卫生问题；
+    // 按纵深防御收紧到头区（`\r\n\r\n` 之前）。
+    let head = req.split("\r\n\r\n").next().unwrap_or(req);
+    for line in head.lines() {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case(name) {
                 return Some(v.trim().to_string());
@@ -889,6 +898,38 @@ mod tests {
         );
         assert_eq!(header_value(req, "HOST"), Some("x".to_string()));
         assert_eq!(header_value(req, "missing"), None);
+    }
+
+    /// ★ v0.5.8（第八轮审计 F8-L1，低危）回归：**body 行不得参与头解析/鉴权**。
+    ///
+    /// 修复前：`Authorization: Basic ...` 只要和请求头**同段到达**（LAN/localhost
+    /// 常规如此），即使写在 `Content-Length` 声明的请求体里也会被当成头 →
+    /// 面板返回 200。与上游中间件（按标准语义只看头区）产生口径差，
+    /// 属请求走私/解析差异类隐患，纵深防御必须收紧。
+    #[test]
+    fn header_lookup_must_ignore_body_lines() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let cred = STANDARD.encode("u:p");
+        let body = format!("Authorization: Basic {cred}");
+        let req = format!(
+            "GET /api/status HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            header_value(&req, "authorization"),
+            None,
+            "body 行不能当 Authorization 头"
+        );
+        assert_eq!(basic_auth_of(&req), None, "body 凭据不得通过鉴权解析");
+
+        // 修的是"只认头区"，不是"拒绝一切"：头区里的 Authorization 必须照常取到
+        let ok = format!("GET / HTTP/1.1\r\nAuthorization: Basic {cred}\r\n\r\nbody-尾");
+        assert_eq!(
+            header_value(&ok, "authorization"),
+            Some(format!("Basic {cred}"))
+        );
+        assert_eq!(basic_auth_of(&ok), Some("u:p".to_string()));
     }
 
     #[test]
