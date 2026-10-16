@@ -95,6 +95,29 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
         Ok(n)
     }
 
+    /// 边等别的事边盯着**本端是否已被对端关闭**：读到 EOF 返回 `Ok(true)`。
+    ///
+    /// 读到数据时存进缓冲（返回 `Ok(false)`）—— 管道化/续传的字节不会丢，
+    /// 后续 `read_head` / `read_n` 会照常消费它们；读出错则照常 `Err` 上抛
+    /// （调用方一律在收尾路径里释放资源，等价于"对端没了"）。
+    ///
+    /// 用途：等待上游（响应头、上游 TLS 握手）时用 `tokio::select!` 同时轮询
+    /// 这里 —— 对端撤离后立刻结束等待，别替一个已经离开的访问者继续等
+    /// （★ v0.5.8，第八轮审计 **F8T-1**：`https2*` 悬挂上游 + 访问方撤离，
+    /// 上游连接原先永不释放）。
+    ///
+    /// 取消安全：作为 `select!` 的另一支被 drop 时，`read` 不会吞掉字节
+    /// （tokio 的 `AsyncRead::read` 在取消时不消费数据）。
+    pub async fn watch_closed(&mut self) -> Result<bool> {
+        let mut chunk = [0u8; 1024];
+        let n = self.stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(true);
+        }
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(false)
+    }
+
     /// 读出一个 `\r\n\r\n` 结尾的头部块，返回行列表（不含结尾空行）。
     ///
     /// `Ok(None)` 表示还没读到任何字节对端就关了（干净的连接结束），
@@ -694,11 +717,23 @@ pub fn wants_upgrade(parts: &HeadParts) -> bool {
 ///
 /// ★ `Transfer-Encoding` **不在此列**。转发时我们是把 chunked 的分块格式
 /// 原样搬过去的，摘掉它下游就不知道该怎么解帧了。
+///
+/// ★★ v0.5.8 补（第七轮审计 **D7-3**，低危）：加入 `proxy-connection`。
+///
+/// 它**不在** RFC 7230 的逐跳头清单里 —— 那是 Netscape 时代的老写法，
+/// 但现实里大量反代（nginx 的部分配置、老 IIS、各类中间盒）**仍在收发它**。
+/// 语义上它就是一个 `Connection` 的变体（"这一跳的连接怎么处理"），
+/// 跨段转发本身就是错的；更实际的风险是它与 `Connection` **同时出现且取值不同**时，
+/// 不同实现会挑不同的那一个 ⇒ 又一处"两方口径分歧"（走私的通用成因）。
+///
+/// 实测（D 组）：其余 6 个头（含 `Connection` 里点名的）都正确剥掉了，
+/// **只有它被原样透传**。
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "upgrade",
@@ -743,6 +778,58 @@ pub fn validate_request_framing(req: &HeadParts) -> Result<(), String> {
     }
     if transfer_encoding_is_unsupported(req) {
         return Err("Transfer-Encoding 只支持唯一的 chunked".to_string());
+    }
+    Ok(())
+}
+
+/// ★★ v0.5.8 新增（第七轮审计 **D7-2**，中危）：**响应侧的 framing 校验**。
+///
+/// # 为什么需要它
+///
+/// 请求侧早就有 [`validate_request_framing`]（三项：TE+CL 并存 / 重复 CL /
+/// 不支持的 TE），而**响应侧一项都没有** —— 内网服务（或一个被攻陷的后端）
+/// 回什么 framing，NFrp 就原样转发给公网访客。
+///
+/// 这正是第七轮 **D7-1** 的同一条链路上的第二个洞：
+/// D7-1 修的是"响应侧**判定口径**与请求侧不一致"，
+/// 这一条修的是"响应侧**根本没有校验**"。
+///
+/// 实测（D 组 `d2_resp_framing.py`，主审已复核其口径）：
+/// 重复 `Content-Length`、`CL + TE`、`xchunked` 全部**原样透传**。
+///
+/// # 为什么"透传"是危险的
+///
+/// 响应侧的 framing 分歧同样会**去同步**下游连接：
+/// * 重复 CL ⇒ 下游取哪一个？与 NFrp 取的那个不同就是走私；
+/// * CL + TE ⇒ RFC 7230 §3.3.3 规定应以 TE 为准并**忽略 CL**，
+///   而 NFrp 若按 CL 读、下游按 TE 读，两者对"响应边界"的判断就分叉；
+/// * 不支持的 TE ⇒ 谁也不知道边界在哪。
+///
+/// ⇒ 与请求侧采取**同一策略：失败关闭**（回 502，而不是猜）。
+///
+/// # 与 D7-1 修复的关系
+///
+/// D7-1 让"不支持的 TE"不再被误判成 chunked（`is_chunked` 返回 false），
+/// 从而走 `Connection: close` 安全失败。本函数把它**提前**成显式拒绝，
+/// 并把"重复 CL / CL+TE"这两项也纳入 —— 两者的口径完全一致，不冲突。
+pub fn validate_response_framing(resp: &HeadParts) -> Result<(), String> {
+    // 无正文的响应（1xx/204/304）不看 framing：RFC 明确它们不带 body。
+    // HEAD 请求的响应由调用方另行处理，这里只管报头本身的自洽性。
+    if has_no_body(resp) {
+        return Ok(());
+    }
+    let has_te = resp.get("transfer-encoding").is_some();
+    let cl_count = resp.count("content-length");
+    if has_te && cl_count > 0 {
+        return Err("响应同时带 Transfer-Encoding 与 Content-Length（走私风险）".to_string());
+    }
+    if cl_count > 1 {
+        return Err("响应带重复的 Content-Length 头（走私风险）".to_string());
+    }
+    if transfer_encoding_is_unsupported(resp) {
+        return Err(
+            "响应的 Transfer-Encoding 不是受支持的形态（只支持唯一的 chunked）".to_string(),
+        );
     }
     Ok(())
 }
@@ -1029,6 +1116,25 @@ mod tests {
         assert!(io.read_head().await.unwrap().is_none());
     }
 
+    /// ★ v0.5.8（第八轮审计 F8T-1，低危）配套：`watch_closed` 要能识别 EOF，
+    /// 且**读到的字节不会丢**（存进缓冲，后续照常消费）。
+    ///
+    /// 这是"等待上游时同时盯着访问侧"的底层积木：识别不了 EOF 就退化成
+    /// 原来的"替已经离开的访问者一直等"；丢了字节就会破坏管道化请求。
+    #[tokio::test]
+    async fn watch_closed_识别_eof_且不丢字节() {
+        let (mut a, b) = duplex(64);
+        let mut io = HttpIo::new(b);
+        // 先来一段数据：不能算"关闭"，且字节要留在缓冲里
+        a.write_all(b"hello").await.unwrap();
+        assert!(!io.watch_closed().await.unwrap(), "收到数据不算关闭");
+        // 对端关闭：必须识别为关闭
+        drop(a);
+        assert!(io.watch_closed().await.unwrap(), "EOF 必须被识别");
+        // 之前读到的 5 字节一个都不能少
+        assert_eq!(io.read_n(5).await.unwrap(), b"hello".to_vec());
+    }
+
     #[tokio::test]
     async fn chunked_原样保留分块与_trailer() {
         let (mut a, b) = duplex(256);
@@ -1101,5 +1207,87 @@ mod tests {
         let mut rest = [0u8; 7];
         up.stream.read_exact(&mut rest).await.unwrap();
         assert_eq!(&rest, b"garbage");
+    }
+
+    /// ★★ v0.5.8 回归（第七轮审计 **D7-2**，中危）：**响应侧也要做 framing 校验**。
+    ///
+    /// # 原先的洞
+    ///
+    /// 请求侧早有 `validate_request_framing`（TE+CL / 重复 CL / 不支持的 TE
+    /// 三项全 400），而**响应侧一项都没有** —— 内网服务回什么就转发什么。
+    /// 实测（D 组 `d2_resp_framing.py`）：重复 CL、CL+TE、`xchunked` 全部原样透传。
+    ///
+    /// # 为什么必须失败关闭
+    ///
+    /// 响应侧的 framing 分歧同样会让下游**去同步**：
+    /// 不同实现取不同的响应边界 ⇒ 一个访客读到另一个访客的响应（跨用户投毒）。
+    /// 与请求侧采取同一策略：**拒绝**，而不是猜。
+    #[test]
+    fn 响应侧_framing_校验必须与请求侧同样严格() {
+        let resp = |v: &[&str]| HeadParts::parse(&lines(v)).expect("合法响应头");
+
+        // ---- 必须**拒绝**的形态 ----
+        // ① 重复 Content-Length：下游取哪一个都可能与 NFrp 不同
+        assert!(
+            validate_response_framing(&resp(&[
+                "HTTP/1.1 200 OK",
+                "Content-Length: 5",
+                "Content-Length: 6"
+            ]))
+            .is_err(),
+            "响应带重复 Content-Length 必须被拒绝（走私风险）"
+        );
+        // ② TE 与 CL 并存：RFC 7230 §3.3.3 说以 TE 为准并忽略 CL，
+        //    但只要有一方按 CL 读，边界就分叉
+        assert!(
+            validate_response_framing(&resp(&[
+                "HTTP/1.1 200 OK",
+                "Content-Length: 5",
+                "Transfer-Encoding: chunked"
+            ]))
+            .is_err(),
+            "响应同时带 TE 与 CL 必须被拒绝（走私风险）"
+        );
+        // ③ 不支持的 TE 形态
+        for te in ["xchunked", "chunked, gzip", "chunked, chunked"] {
+            assert!(
+                validate_response_framing(&resp(&[
+                    "HTTP/1.1 200 OK",
+                    &format!("Transfer-Encoding: {te}")
+                ]))
+                .is_err(),
+                "响应的 Transfer-Encoding: {te} 必须被拒绝"
+            );
+        }
+
+        // ---- 必须**放行**的形态（不能修得过头）----
+        assert!(
+            validate_response_framing(&resp(&["HTTP/1.1 200 OK", "Content-Length: 5"])).is_ok(),
+            "普通的 Content-Length 响应必须放行"
+        );
+        assert!(
+            validate_response_framing(&resp(&["HTTP/1.1 200 OK", "Transfer-Encoding: chunked"]))
+                .is_ok(),
+            "唯一 chunked 是 RFC 支持形态，必须放行"
+        );
+        assert!(
+            validate_response_framing(&resp(&[
+                "HTTP/1.1 200 OK",
+                "Transfer-Encoding: identity, chunked"
+            ]))
+            .is_ok(),
+            "`identity, chunked` 是 RFC 合法形态，不能被拒 —— \
+             第四轮修过'修得过头把合法的也拒了'，别再犯"
+        );
+        // 无正文的响应不受 framing 约束（RFC：1xx/204/304 不带 body）
+        assert!(
+            validate_response_framing(&resp(&[
+                "HTTP/1.1 204 No Content",
+                "Content-Length: 0",
+                "Content-Length: 0"
+            ]))
+            .is_ok(),
+            "204 无正文，重复 CL 不应影响（RFC 明确它不带 body）"
+        );
     }
 }
