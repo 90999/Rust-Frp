@@ -42,12 +42,42 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 }
 
 static SERVER_CFG: OnceLock<quinn::ServerConfig> = OnceLock::new();
+/// 缓存里那份配置当初是用哪个 ALPN 建的。
+///
+/// ★★ v0.5.9（第九轮审计 **C9-2**，预防性加固）：`server_config(alpn)` 收了
+/// `alpn` 参数，但**缓存命中时直接返回**、忽略本次传入值 ——
+/// 也就是说**只有第一次的 ALPN 生效**。
+///
+/// 当前**不构成漏洞**：全仓只有 2 处调用（`quic.rs:143` / `:354`），都传
+/// 同一个 `ALPN = b"nfrp-frp"`；而 xtcp 的 `b"nfrp-xtcp"` 走的是
+/// `client/src/p2p.rs` 里**独立的** `SERVER_CFG`（`p2p.rs:778`），不共用这个缓存。
+///
+/// 但这是"**靠巧合安全**"：如果将来有人加第三个 ALPN 并复用本函数，
+/// 第二次调用会**静默拿到错误 ALPN** 的配置，症状是
+/// "peer doesn't support any known protocol" 这种极难排查的握手失败。
+///
+/// ⇒ 记下首次的 ALPN，缓存命中时**断言一致**（不一致就报错，
+///   让问题在开发期暴露，而不是在用户那里表现为莫名的握手失败）。
+static CACHED_ALPN: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// 服务端 QUIC 配置（自签证书）。
 pub fn server_config(alpn: &[u8]) -> Result<quinn::ServerConfig> {
     if let Some(c) = SERVER_CFG.get() {
+        // ★ C9-2：缓存命中时必须确认 ALPN 与首次构造时一致。
+        if let Some(first) = CACHED_ALPN.get() {
+            if first.as_slice() != alpn {
+                anyhow::bail!(
+                    "quic::server_config 的缓存已用 ALPN {:?} 建立，不能再用 {:?} 复用 —— \
+                     不同 ALPN 需要各自独立的缓存（参考 client/src/p2p.rs 的做法）。\
+                     这不是运行时错误，而是调用方用错了这个函数。",
+                    String::from_utf8_lossy(first),
+                    String::from_utf8_lossy(alpn)
+                );
+            }
+        }
         return Ok(c.clone());
     }
+    let _ = CACHED_ALPN.set(alpn.to_vec());
     let key = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
         .context("生成 QUIC 自签证书失败")?;
     let cert_der = key.cert.der().clone();
@@ -353,6 +383,54 @@ mod tests {
     fn configs_build() {
         let _ = server_config(ALPN).expect("服务端配置");
         let _ = client_config(ALPN).expect("客户端配置");
+    }
+
+    /// ★★ v0.5.9 回归（第九轮审计 **C9-2**，预防性加固）：
+    /// **`server_config` 的缓存不能跨 ALPN 复用。**
+    ///
+    /// # 背景
+    ///
+    /// `server_config(alpn)` 收 `alpn` 参数，但**缓存命中时直接返回**、
+    /// 忽略本次传入值 —— 只有第一次的 ALPN 生效。
+    ///
+    /// 当前**不是漏洞**（全仓只有 2 处调用都传 `ALPN`；xtcp 的
+    /// `b"nfrp-xtcp"` 走 `client/src/p2p.rs` 里独立的 `SERVER_CFG`）。
+    /// 但这是「**靠巧合安全**」：加第三个 ALPN 就会静默串。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 用 ALPN 建好缓存后，再用**另一个 ALPN** 调，必须**报错**而不是
+    /// 静默返回错误配置。
+    ///
+    /// ★ 测试间有全局 `OnceLock` 状态，所以这里只做"同一进程内"的验证：
+    ///   先确保缓存已用 `ALPN` 建好（别的测试多半已经建了），再试别的。
+    #[test]
+    fn 缓存不能跨_alpn_复用() {
+        // 确保缓存已建立（用正式 ALPN）
+        let _ = server_config(ALPN).expect("首次建立缓存");
+
+        // 再用另一个 ALPN 调用 —— 必须报错，而不是静默返回错误的配置
+        let other = b"nfrp-some-other-alpn";
+        let r = server_config(other);
+        assert!(
+            r.is_err(),
+            "★ 用不同的 ALPN 复用同一个缓存**必须报错** —— \
+             否则调用方会静默拿到错误 ALPN 的配置，\
+             表现为 'peer doesn't support any known protocol' 这种极难排查的握手失败"
+        );
+        if let Err(e) = r {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("ALPN") || msg.contains("alpn"),
+                "错误信息要说明是 ALPN 不一致：{msg}"
+            );
+        }
+
+        // 用**相同**的 ALPN 再调一次必须正常（不能把正常路径也给拦了）
+        assert!(
+            server_config(ALPN).is_ok(),
+            "同一个 ALPN 重复调用必须照常成功（不能修得过头）"
+        );
     }
 
     /// 真连一次：验证 listen/connect/QuicStream 这条链路能跑通数据。
