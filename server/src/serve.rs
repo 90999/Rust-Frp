@@ -7,7 +7,7 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicBool, atomic::Ordering, Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -57,6 +57,76 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 取 30s：正常握手是毫秒级（本地实测 ~2ms），30s 足以覆盖高延迟链路
 /// 与 OIDC 首次验签（JWKS 已在启动时预热），超时即断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 未认证握手的**全局**并发上限（第九轮 C9-3 修复）。
+///
+/// # 为什么
+///
+/// 每条未认证的 frp 握手（明文连接或 yamux 子流）在认证完成前要占住一个
+/// 任务和一份读缓冲。第九轮实测（`tmp/audit9/c/c9_3_yamux_flood.py`）：
+/// yamux 未认证开流每条 ≈9.5 KiB、单会话上限 512 条、跨会话**没有**全局
+/// 上限 —— 攻击者 129 KB 流量 + 22 个 fd 就把服务端内存抬到 +100 MB。
+///
+/// 这里给**所有**未认证握手一个全局名额：超出即短暂排队，排队也拿不到
+/// 名额就断开 ⇒ 未认证内存峰值有界（≈ 2048 × ~10 KiB ≈ 20 MB），
+/// 与攻击者的会话数、fd 数无关。
+///
+/// ★★ 复验修正（同日，C9-3 元验证抓出）：**名额必须在 spawn 之前取**。
+/// 第一版把闸门放在任务体内部 —— 攻击者 11264 条流照旧全量 spawn，
+/// 而每条流一 spawn 就分配 ~9 KiB 的 future ⇒ 峰值仍 +97 MB（约等于
+/// 未修复）。现在 mux accept 循环先取名额再 spawn；已认证会话
+/// （控制流登录成功后置位）的工作流直接放行（每条仍要各自握手认证）。
+/// 配合 mux 通道反压（容量 8）与内核 TCP 缓冲，"已创建但未认证"的
+/// 流数量被钉在闸门上限附近。
+const PREAUTH_MAX: usize = 2048;
+
+/// 拿不到名额时最多排队的时长：给突发重连留出空间，之后直接断开
+/// （攻击流量下让队列尽快排空，而不是无限堆积）。
+const PREAUTH_WAIT: Duration = Duration::from_secs(5);
+
+/// 全局闸门的单例。
+static PREAUTH_HANDSHAKES: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn preauth_gate() -> &'static tokio::sync::Semaphore {
+    PREAUTH_HANDSHAKES.get_or_init(|| tokio::sync::Semaphore::new(PREAUTH_MAX))
+}
+
+/// 申请一个未认证握手名额；排队超时（或信号量异常）返回 `None`。
+///
+/// 抽成独立函数是为了让测试能用小信号量直接验证"排满即超时"的行为。
+async fn acquire_preauth_slot(
+    gate: &tokio::sync::Semaphore,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    acquire_preauth_slot_with(gate, PREAUTH_WAIT).await
+}
+
+/// [`acquire_preauth_slot`] 的可参数化本体（测试用短超时）。
+async fn acquire_preauth_slot_with(
+    gate: &tokio::sync::Semaphore,
+    wait: Duration,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    match tokio::time::timeout(wait, gate.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // `Ok(Err(_))`：信号量被关闭（本进程不会发生）；`Err(_)`：排队超时。
+        _ => None,
+    }
+}
+
+/// 未认证握手闸门的**入场方式**（C9-3 复验补强）。
+///
+/// 用三态枚举而不是 `Option<Permit>`：`Option` 的 `None` 会同时被解释成
+/// "没有预取（自己去取）"和"免闸门"，第一版就栽在这里 —— mux 已认证会话
+/// 的流走了放行分支（`None`），任务体却又把它当成"没预取"去排队取名额，
+/// 闸门满载时把合法工作流挡在门外（实测攻击期间转发失败，日志变体
+/// "…断开" + 合法会话端口）。三态后语义唯一：
+enum PreauthSlot {
+    /// 直连路径：由 `handle_frp_stream` 在 ACL 之后自己取名额。
+    Deferred,
+    /// mux 未认证会话：accept 循环已在 spawn 之前取好名额（内存封顶关键）。
+    Preacquired(tokio::sync::SemaphorePermit<'static>),
+    /// mux 已认证会话的后续流：免闸门（每条仍要各自通过握手认证）。
+    Bypassed,
+}
 
 /// ★★ v0.5.8（第七轮审计 A-1）：**认证前连接失败日志的折叠器**。
 ///
@@ -304,7 +374,8 @@ pub async fn serve_on_with(
                 .await
                 .with_context(|| format!("监听 UDP {addr} 失败"))?,
         );
-        tokio::spawn(crate::p2p::run_rendezvous(sock, hub));
+        // ★ v0.5.9（第九轮审计 E9-1）：牵线 UDP 也过 ACL（纵深防御，口径统一）。
+        tokio::spawn(crate::p2p::run_rendezvous(sock, hub, registry.security()));
     }
 
     // 内置面板 + /metrics：与 frp 的 dashboard 一样是可选端口
@@ -676,7 +747,7 @@ async fn handle_stream(
     secure: bool,
 ) -> Result<()> {
     if secure {
-        return handle_frp_stream(stream, peer, cfg, registry).await;
+        return handle_frp_stream(stream, peer, cfg, registry, PreauthSlot::Deferred, None).await;
     }
 
     // 第二层：yamux（可选）。自动探测，兼容 tcpMux=true / false 的客户端。
@@ -700,13 +771,56 @@ async fn handle_stream(
         }
         if first[0] == YAMUX_VERSION_BYTE {
             // yamux 会话：每个 stream 都是一条独立的 frp 连接
+            let session_authed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
             let mut acceptor =
                 frp::mux::serve(Box::pin(PrefixedStream::new(vec![first[0]], stream)));
             while let Some(s) = acceptor.accept().await {
                 let cfg = cfg.clone();
                 let registry = registry.clone();
+                if session_authed.load(Ordering::Relaxed) {
+                    // 已认证会话（控制流登录 / 工作流验过 run_id+token 后置位）：
+                    // 后续流**免闸门**直接放行 —— 它们每条仍要各自通过握手认证，
+                    // 不占"未认证并发"的名额（攻击者拿不到 token，置不了位）。
+                    let authed = session_authed.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_frp_stream(
+                            s,
+                            peer,
+                            cfg,
+                            registry,
+                            PreauthSlot::Bypassed,
+                            Some(authed),
+                        )
+                        .await
+                        {
+                            debug!(%peer, "yamux stream 结束：{e:#}");
+                        }
+                    });
+                    continue;
+                }
+                // ★★ C9-3 复验补强：**未认证会话先取名额、再 spawn**。
+                //
+                // spawn 那一刻就按 future 大小分配内存（实测 ~9 KiB/条）——
+                // 第一版闸门放在任务体内，攻击者 11264 条流照样全量 spawn，
+                // 闸门只限住了握手 CPU：峰值内存仍 +97 MB（约等于未修复）。
+                // 放在 spawn 之前，配合 mux 通道反压（容量 8），
+                // "已创建但未认证"的流对象被钉在闸门上限附近（≈20 MB）。
+                let Some(permit) = acquire_preauth_slot(preauth_gate()).await else {
+                    debug!(%peer, "未认证握手并发已达上限（{PREAUTH_MAX}），丢弃该流");
+                    continue; // 丢的是这条流（会话保留，合法客户端会重试开流）
+                };
+                let authed = session_authed.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_frp_stream(s, peer, cfg, registry).await {
+                    if let Err(e) = handle_frp_stream(
+                        s,
+                        peer,
+                        cfg,
+                        registry,
+                        PreauthSlot::Preacquired(permit),
+                        Some(authed),
+                    )
+                    .await
+                    {
                         debug!(%peer, "yamux stream 结束：{e:#}");
                     }
                 });
@@ -714,18 +828,25 @@ async fn handle_stream(
             return Ok(());
         }
         let stream: BoxStream = Box::pin(PrefixedStream::new(vec![first[0]], stream));
-        return handle_frp_stream(stream, peer, cfg, registry).await;
+        return handle_frp_stream(stream, peer, cfg, registry, PreauthSlot::Deferred, None).await;
     }
 
-    handle_frp_stream(stream, peer, cfg, registry).await
+    handle_frp_stream(stream, peer, cfg, registry, PreauthSlot::Deferred, None).await
 }
 
 /// 在一条流上完成 frp v2 握手并分发到控制连接 / 工作连接。
+///
+/// `admission`：未认证闸门的入场方式（直连自取 / mux 循环预取 / 已认证免闸，
+/// 见 [`PreauthSlot`]）。`session_authed`：mux 会话的"已认证"标志 ——
+/// 首次握手成功即置位，之后同一会话上的后续流走 `Bypassed`
+/// （每条仍要各自握手认证）。
 async fn handle_frp_stream(
     stream: BoxStream,
     peer: SocketAddr,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
+    admission: PreauthSlot,
+    session_authed: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let run_id = util::new_run_id();
     let sec = registry.security();
@@ -743,6 +864,24 @@ async fn handle_frp_stream(
         debug!(%peer, "IP 访问控制拒绝：{reason}");
         anyhow::bail!("连接被拒绝");
     }
+
+    // (1.5) 未认证握手的全局并发闸（第九轮 C9-3）。
+    //
+    // 放在 ACL 之后：被白黑名单拒掉的连接不该占名额；
+    // 放在握手之前：让"读 Login 前的缓冲 + 任务"也计入闸门。
+    //
+    // 三条入场路径见 [`PreauthSlot`]：直连自取 / mux 循环预取 / 已认证免闸。
+    let preauth_permit: Option<tokio::sync::SemaphorePermit<'static>> = match admission {
+        PreauthSlot::Preacquired(p) => Some(p),
+        PreauthSlot::Bypassed => None,
+        PreauthSlot::Deferred => match acquire_preauth_slot(preauth_gate()).await {
+            Some(p) => Some(p),
+            None => {
+                debug!(%peer, "未认证握手并发已达上限（{PREAUTH_MAX}），断开");
+                return Ok(());
+            }
+        },
+    };
 
     // (2) 认证 + (3) 授权。
     //
@@ -785,7 +924,11 @@ async fn handle_frp_stream(
         authorize,
         cfg.max_clock_skew_secs,
     );
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+    let hs_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await;
+    // ★ C9-3：认证阶段到此结束（成功/失败/超时都算），立刻释放未认证名额 ——
+    //   之后的会话流量不计入闸门；免闸门（Bypassed）时本来就没有名额可释放。
+    drop(preauth_permit);
+    match hs_result {
         Err(_) => {
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
@@ -804,6 +947,11 @@ async fn handle_frp_stream(
                 udp_binary,
                 caps,
             }) => {
+                // ★ C9-3 复验补强：认证通过 ⇒ 本 mux 会话标记"已认证"，
+                //   其后续工作流不再占用未认证并发名额（每条仍各自握手）。
+                if let Some(f) = &session_authed {
+                    f.store(true, Ordering::Relaxed);
+                }
                 let wire_version = conn.version();
                 // (4) 审计：登录成功也要记 —— 只记失败的话，
                 //     "这个 IP 到底有没有进来过"就永远查不出来。
@@ -829,6 +977,11 @@ async fn handle_frp_stream(
                 .await
             }
             Ok(ServerAccept::Work { conn, msg }) => {
+                // 工作流握手带 run_id + token，验过同样说明客户端是熟客 ⇒
+                // 会话也标已认证（同 Control 臂）。
+                if let Some(f) = &session_authed {
+                    f.store(true, Ordering::Relaxed);
+                }
                 handle_work(conn, msg, &sec, registry, peer).await
             }
             Ok(ServerAccept::Visitor { conn, msg }) => {
@@ -1436,7 +1589,13 @@ async fn register_udp(
             return Err(e);
         }
     };
-    let handle = udp_proxy::spawn(Arc::new(udp), m.proxy_name.clone(), client.clone());
+    // ★ v0.5.9（第九轮审计 E9-0）：把安全上下文传进去，让 UDP 数据面也过 ACL。
+    let handle = udp_proxy::spawn(
+        Arc::new(udp),
+        m.proxy_name.clone(),
+        client.clone(),
+        registry.security(),
+    );
     registry.attach_listener(m.remote_port, handle.abort_handle());
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
     Ok(format!("{}:{}/udp", cfg.bind_addr, m.remote_port))
@@ -2494,6 +2653,18 @@ mod tests {
         let l = limits_from(&cfg);
         assert_eq!(l.max_total_conns, 0, "默认必须保持向后兼容：不限制");
         assert_eq!(l.max_clients, 0);
+    }
+
+    /// ★ C9-3 修复的回归锁：闸门排满后必须**排队超时放弃**，而不是无限等待。
+    #[tokio::test]
+    async fn 未认证闸门排满后排队超时放弃() {
+        let gate = tokio::sync::Semaphore::new(1);
+        let held = gate.acquire().await.expect("拿住唯一名额");
+        let got = acquire_preauth_slot_with(&gate, Duration::from_millis(50)).await;
+        assert!(got.is_none(), "排满时必须超时放弃");
+        drop(held);
+        let got2 = acquire_preauth_slot_with(&gate, Duration::from_millis(50)).await;
+        assert!(got2.is_some(), "名额释放后应当立刻拿到");
     }
 
     // ---- allowPorts / maxPortsPerClient ----
