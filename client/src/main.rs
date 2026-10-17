@@ -337,6 +337,21 @@ async fn main() -> Result<()> {
             .cloned(),
     );
 
+    // ★ v0.5.9 修（第九轮 D9-7，低危）：启动时**预检插件配置**。
+    //
+    // `Plugin::from_proxy` 是纯函数（不连网、不落盘），但原先只有工作连接
+    // 真正建立时才会调用 —— 于是"Windows 上配了 unix_domain_socket 插件"
+    // 这类**一眼可知**的错误要等到第一条用户流量进来，才在工作连接收尾里
+    // 以 `debug`（默认看不见）留一句。这里在启动时逐条检查，一次说清。
+    for p in cfg.proxies.iter() {
+        if let Some(Err(e)) = plugin::Plugin::from_proxy(p) {
+            warn!(
+                proxy = %p.name,
+                "代理的插件配置有问题，该代理将无法工作：{e:#}"
+            );
+        }
+    }
+
     // 客户端本地管理界面（`[webServer]`）。
     //
     // `port` 为 0（默认）时整段都不执行：不绑端口、不起任务，
