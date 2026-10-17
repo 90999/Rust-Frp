@@ -33,6 +33,18 @@ const TLS_HANDSHAKE_BYTE: u8 = 0x16;
 /// 探测首字节的等待时间，与 frp 的 `connReadTimeout` 对应。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TLS 握手阶段的总超时（第九轮 C9-4 修复）。
+///
+/// 原先 `accept_server` 对 rustls 握手**没有任何时限**：只发一个 `0x16`
+/// （或 `0x17`）字节后静默，`TlsAcceptor::accept` 会永远等下去 ——
+/// 第九轮实测（`tmp/audit9/c/c9_4_timeouts_tls.py`）：50s 后仍被挂住，
+/// 且可线性囤积（500 条连接 +515 句柄 / +6.4MB，无一被清理）。
+/// rustls 自己不做握手超时（协议层允许任意慢的来包），必须在调用侧加。
+///
+/// 取 30s 与登录握手的 `HANDSHAKE_TIMEOUT` 同口径：正常 TLS 握手是
+/// 毫秒级（本地实测 <10ms），30s 足以覆盖高延迟链路，超时即断开。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 服务端证书只生成一次：RSA/ECDSA 密钥生成有几十毫秒开销，
 /// 每个连接都生成会明显拖慢握手。
 static SERVER_TLS_CONFIG: OnceLock<Arc<rustls::ServerConfig>> = OnceLock::new();
@@ -274,18 +286,22 @@ where
     match first[0] {
         FRP_TLS_HEAD_BYTE => {
             let acceptor = TlsAcceptor::from(server_config()?);
-            let tls = acceptor
-                .accept(stream)
+            // ★ C9-4：握手必须有总时限，否则单字节就能永久占住一条连接。
+            let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                 .await
+                .context("TLS 服务端握手超时")?
                 .context("TLS 服务端握手失败")?;
             Ok(Box::pin(tls))
         }
         TLS_HANDSHAKE_BYTE => {
             let acceptor = TlsAcceptor::from(server_config()?);
-            let tls = acceptor
-                .accept(PrefixedStream::new(vec![first[0]], stream))
-                .await
-                .context("TLS 服务端握手失败")?;
+            let tls = tokio::time::timeout(
+                TLS_HANDSHAKE_TIMEOUT,
+                acceptor.accept(PrefixedStream::new(vec![first[0]], stream)),
+            )
+            .await
+            .context("TLS 服务端握手超时")?
+            .context("TLS 服务端握手失败")?;
             Ok(Box::pin(tls))
         }
         other => {
