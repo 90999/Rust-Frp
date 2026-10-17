@@ -84,10 +84,37 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const WORK_CONN_WAIT: Duration = Duration::from_secs(15);
 
 /// 启动一个 UDP 代理：绑定 UDP 端口并持续维护"专用工作连接"。
+///
+/// ★★ v0.5.9 修（第九轮审计 **E9-0**，中危）：新增 `sec` 参数。
+///
+/// # 原先为什么错了
+///
+/// `[acl]`（IP 白/黑名单）的唯一判定入口 `SecurityContext::check_ip`
+/// 在 v0.5.8 里只有 **4 处**调用（控制面 / TCP 代理 / vhost / VNet），
+/// **UDP 代理端口一处都没有** ⇒ 管理员用 `[acl]` 表达"只允许某些来源"时，
+/// **UDP 代理完全不遵守**（静默失效）。
+///
+/// # 实测（`tmp/audit9/_indep/verify_udp_acl.py`，12/12 判据全过）
+///
+/// 服务端绑 `0.0.0.0`、`[acl] deny = ["<LAN>"]`，**只改源地址**：
+///
+/// | 场景 | 结果 |
+/// |---|---|
+/// | 不配 ACL，从 LAN 发 UDP | ✅ 通（`UDP-REPLY-HELLO-UDP`） |
+/// | **同一条 ACL ⇒ 控制面登录** | ✅ **被拒**（证明 ACL 真的在起作用） |
+/// | 从 `127.0.0.1`（放行）发 UDP | ✅ 通（正对照） |
+/// | **从 LAN（被 deny）发 UDP** | ❌ **仍被转发**（内网服务收到包数 1 → 2） |
+///
+/// ⇒ 与第七轮 F7-1（TCP 数据面未过 ACL）**完全同型**：
+///   第七轮补了 TCP，**UDP 被漏掉了**。
+///
+/// ★ 这条比面板那条严重：**UDP 代理没有别的防线**（不需要认证），
+///   ACL 是唯一的来源管控手段。
 pub fn spawn(
     udp: Arc<UdpSocket>,
     proxy_name: String,
     client: Arc<ClientState>,
+    sec: Arc<crate::guard::SecurityContext>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -102,7 +129,7 @@ pub fn spawn(
                     continue;
                 }
             };
-            if let Err(e) = run_session(work.conn, udp.clone(), &proxy_name).await {
+            if let Err(e) = run_session(work.conn, udp.clone(), &proxy_name, sec.clone()).await {
                 debug!(proxy = %proxy_name, "UDP 工作连接结束：{e:#}");
             }
             if client.is_stopped() {
@@ -116,7 +143,14 @@ pub fn spawn(
 }
 
 /// 一条 UDP 工作连接的生命周期：双向搬运 + 心跳。
-async fn run_session(mut conn: FrpConn, udp: Arc<UdpSocket>, proxy_name: &str) -> Result<()> {
+///
+/// ★ v0.5.9（第九轮审计 E9-0）：新增 `sec`，用于在**每个数据报**上做 ACL 判定。
+async fn run_session(
+    mut conn: FrpConn,
+    udp: Arc<UdpSocket>,
+    proxy_name: &str,
+    sec: Arc<crate::guard::SecurityContext>,
+) -> Result<()> {
     conn.send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
         proxy_name: proxy_name.to_string(),
         ..Default::default()
@@ -164,11 +198,31 @@ async fn run_session(mut conn: FrpConn, udp: Arc<UdpSocket>, proxy_name: &str) -
     let udp_task = {
         let udp = udp.clone();
         let seen_ips = seen_ips.clone();
+        // ★ E9-0：`proxy_name` 是 `&str`，而 spawn 的任务要求 `'static`
+        //   （日志里要用它）⇒ 克隆一份。这只是一次短字符串分配，可忽略。
+        let proxy_name_owned = proxy_name.to_string();
         tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {
+                        // ★★ v0.5.9 修（第九轮审计 **E9-0**，中危）：
+                        //    **UDP 数据面也要过 ACL**。
+                        //
+                        // 这是 ACL 在 UDP 代理端口上**唯一**的判定点 ——
+                        // UDP 没有"连接建立"这个时刻，只能在每个数据报上判。
+                        //
+                        // 顺序与 TCP 侧一致：ACL 是一次位运算，放在最前面最便宜。
+                        // 拒绝时**静默丢弃**（不回任何 UB 报文，也不记 seen_ips）：
+                        // 被拒的 IP 不该因为"发过包"而获得回写资格。
+                        if let Err(reason) = sec.check_ip(src.ip()) {
+                            debug!(
+                                %src,
+                                proxy = %proxy_name_owned,
+                                "UDP 数据面 IP 访问控制拒绝：{reason}"
+                            );
+                            continue;
+                        }
                         // 记下这个"真的发过包的"访客 IP
                         seen_ips.record(src.ip());
                         if to_client_tx
