@@ -26,6 +26,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -35,6 +36,8 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::interval,
 };
+
+use crate::util::RateLimited;
 
 // ---------------------------------------------------------------------------
 // 常量（ikcp.go）
@@ -984,10 +987,69 @@ type SessionTx = UnboundedSender<(std::net::SocketAddr, Bytes)>;
 /// 源地址 → 会话收包队列。
 type SessionTable = Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, SessionTx>>>;
 
+/// ★★ v0.5.9 新增（第九轮审计 **C9-1**，中危）：**KCP 会话表的条数上限**。
+///
+/// # 为什么必须有
+///
+/// `KcpListener::accept` 对**任意 UDP 源地址/端口**无条件建会话
+/// （会话表的键是 `from`，**含源端口**），而且**没有任何条数上限**。
+/// 每个会话要占：HashMap 条目 + 一条 tokio task + 一个 unbounded channel + 缓冲区。
+///
+/// # 实测（`tmp/audit9/c/c9_1b_kcp_cost.py` / `c9_1c_decisive.py`）
+///
+/// 单会话成本 ≈ **15.3 KB**，成本曲线**严格线性、无拐点**：
+///
+/// | 会话数 | 峰值内存 | 每会话 |
+/// |---|---|---|
+/// | 1000 | 23.4 MB | 16.6 KB |
+/// | 5000 | 82.7 MB | 15.5 KB |
+/// | 15080 | **233.2 MB** | 15.3 KB |
+///
+/// 持续灌 20 秒（每包 **25 字节**）：
+///
+/// ```text
+/// 上行 757 KB（31000 个包）⇒ 内存峰值 238.0 MB（增量 +230.7 MB）
+/// ★ 放大比 = 312×（1 字节上行 → 312 字节内存）
+/// ```
+///
+/// ⇒ **一个 25 字节的 UDP 包换来 15 KB 内存，放大 312 倍。**
+///   服务端不会崩溃（`alive=True`），危害是**内存耗尽**。
+///
+/// # ★ 代码注释原先的定级依据是错的
+///
+/// 上面 `rcv_queue` 那段注释写着「**1:1 占用，非放大** —— 攻击者要占用 8MB
+/// 就得真的发 8MB」。那个算法只算了"会话里堆的数据"（确实是 1:1），
+/// **漏掉了会话本身的开销**。实测放大比是 312×，不是 1:1。
+///
+/// 真正让它是"中危而非高危"的理由是**另一条**：**KCP 默认不启用**
+/// （需显式配 `kcpBindPort`）。这一条注释写对了，但第一条论据必须更正。
+///
+/// # 取值
+///
+/// 1024。理由：
+/// * 正常部署里 "同时有 1024 条 KCP 控制连接" 已经远超任何真实规模
+///   （KCP 只是控制连接的传输层，一条客户端一条连接）；
+/// * 1024 × 15.3 KB ≈ **15 MB** 峰值，可接受；
+/// * 超限时**丢弃新会话**（不回包）—— 让发起方按 KCP 自己的重传超时放弃，
+///   不引入新的协议语义。
+///
+/// ★ 为什么**不**按源 IP 限：同一 NAT 后面可能有多个合法客户端，
+///   按 IP 限会误伤。按**总量**限才只影响"超出容量的那部分"。
+pub const MAX_KCP_SESSIONS: usize = 1024;
+
+/// ★ v0.5.9 收尾（C9-1）：会话表打满后"丢弃新会话"日志的折叠器。
+///
+/// 该分支**按被丢弃的数据报数触发**、与 `max_sessions` **无关** —— 不折叠
+/// 就能被未认证对手以灌包速率无限刷 debug 日志。与 A-1 的连接失败日志
+/// 同一套工具：每窗口配额 + 压制计数汇总。
+static KCP_DROP_LOG: RateLimited = RateLimited::with_reporting(5, Duration::from_secs(10));
+
 pub struct KcpListener {
     sock: Arc<UdpSocket>,
     /// 源地址 → 该会话的收包队列。
     sessions: SessionTable,
+    /// 会话表条数上限（见 [`MAX_KCP_SESSIONS`]）。
+    max_sessions: usize,
 }
 
 impl KcpListener {
@@ -996,7 +1058,14 @@ impl KcpListener {
         Ok(Self {
             sock: Arc::new(sock),
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            max_sessions: MAX_KCP_SESSIONS,
         })
+    }
+
+    /// ★ v0.5.9（C9-1）：覆盖会话数上限（测试与特殊部署用）。
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -1031,6 +1100,34 @@ impl KcpListener {
             let (tx, rx) = mpsc::unbounded_channel();
             {
                 let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                // ★★ v0.5.9 修（第九轮审计 **C9-1**，中危）：**会话表必须封顶**。
+                //
+                // 超过上限时**丢弃这个数据报**（不回包、不建会话）：
+                // * 让发起方按 KCP 自己的重传超时放弃，不引入新的协议语义；
+                // * **不动已有会话** —— 上限满了不影响正在服务的那些连接；
+                // * 不按源 IP 限（同一 NAT 后可能有多个合法客户端，按 IP 会误伤）。
+                //
+                // 实测依据见 [`MAX_KCP_SESSIONS`] 的文档注释：
+                // 单会话 ≈ 15.3 KB，25 字节的包换 15 KB 内存，**放大 312×**。
+                if g.len() >= self.max_sessions {
+                    // 与"非 KCP 数据报"同一处理：静默丢弃（不回包）。
+                    //
+                    // ★ v0.5.9 订正：这条路径**按被丢弃的数据报数触发**、与
+                    // `max_sessions` 无关 —— 原先自注"日志量受 max_sessions
+                    // 约束"不成立，未认证对手保持灌包就能无限刷 debug 日志。
+                    // 已改用 `RateLimited` 折叠（配额 + 压制计数汇总）。
+                    let (ok, suppressed) = KCP_DROP_LOG.allow_with_metadata();
+                    if ok {
+                        tracing::debug!(
+                            sessions = g.len(),
+                            limit = self.max_sessions,
+                            suppressed,
+                            %from,
+                            "KCP 会话数已达上限，丢弃新会话的建连请求"
+                        );
+                    }
+                    continue;
+                }
                 g.insert(from, tx);
             }
             let sessions = Arc::clone(&self.sessions);
@@ -1352,6 +1449,109 @@ mod tests {
     fn conv_from_sid_is_stable_and_shared() {
         assert_eq!(conv_from_sid("sid-1"), conv_from_sid("sid-1"));
         assert_ne!(conv_from_sid("sid-1"), conv_from_sid("sid-2"));
+    }
+
+    /// ★★ v0.5.9 回归（第九轮审计 **C9-1**，中危）：**KCP 会话表必须封顶。**
+    ///
+    /// # 原先的洞
+    ///
+    /// `accept()` 对**任意 UDP 源地址/端口**无条件 `sessions.insert(from, tx)`，
+    /// **没有条数上限**。而单会话成本 ≈ 15.3 KB。
+    ///
+    /// 实测（`tmp/audit9/c/c9_1c_decisive.py`）：
+    /// * 上行 **757 KB**（31000 个 25 字节的包）⇒ 内存峰值 **238.0 MB**
+    /// * **放大比 312×**
+    ///
+    /// ★ `rcv_queue` 那段注释说「**1:1 占用，非放大**」，那个算法只算了
+    ///   "会话里堆的数据"，**漏掉了会话本身的开销**（HashMap 条目 + task + channel）。
+    ///
+    /// # 这条测试的做法（**踩过两次坑才写对**）
+    ///
+    /// 坑 1：第一版把 `accept()` 包在 `tokio::spawn` + `timeout` 里等 500ms，
+    ///       结果会话数是 0 —— 是**测试没跑通**，不是上限有效。
+    /// 坑 2：第二版逐轮驱动 `accept()` 并计数，但**丢掉了返回的 `KcpStream`**
+    ///       ⇒ 它的 `Drop` 立刻把会话从表里移除（诊断输出 `established=24
+    ///       sessions_len=0`）⇒ 永远观察不到会话表，退回上限也「测试仍绿」。
+    ///
+    /// ⇒ 第三版：**持有所有 `KcpStream`**，会话才会留在表里。
+    ///   这是"退回验证抓到测试测错了对象"的第三次出现。
+    #[tokio::test]
+    async fn kcp_会话表必须有上限() {
+        // 用小上限便于测（真实默认是 MAX_KCP_SESSIONS = 1024）
+        const LIMIT: usize = 8;
+        // ★ 只多送 4 个：超出的那几个会让 `accept()` 超时，
+        //   每超时一次要等 1 秒 ⇒ 不能送太多（送 3× 会让测试跑 16 秒）。
+        const SENDS: usize = LIMIT + 4;
+
+        let listener = Arc::new(
+            KcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap()
+                .with_max_sessions(LIMIT),
+        );
+        let listen_addr = listener.local_addr().unwrap();
+
+        // 预先造好 SENDS 个"客户端"（每个一个独立源端口）
+        let mut clients = Vec::new();
+        for i in 0..SENDS {
+            let sk = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let pkt = {
+                let mut h = Kcp::new(0x4000_0000 + i as u32, IKCP_MTU_DEF);
+                h.send(b"X");
+                h.flush_now(0);
+                h.out.pop_front().unwrap()
+            };
+            clients.push((sk, pkt));
+        }
+
+        // 逐个发，每发一个就跑一轮 accept。
+        // ★★ 必须**持有**返回的 KcpStream —— 它一 Drop 会话就被摘掉。
+        //
+        // ★ 时序容错：`accept()` 的超时不能太紧。
+        //   实测 200ms 在机器繁忙时不够（同一份代码 4.0s 过、0.75s 挂 —— 时序抖动），
+        //   所以给到 1 秒。一个包**只对应一次** accept 机会：
+        //   能建就建（拿流并持有），被上限挡住就超时（那正是我们要观察的）。
+        let mut held: Vec<KcpStream> = Vec::new();
+        for (sk, pkt) in &clients {
+            let _ = sk.send_to(pkt, listen_addr).await;
+            if let Ok(Ok((stream, _addr))) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                Arc::clone(&listener).accept(),
+            )
+            .await
+            {
+                held.push(stream);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let n = {
+            let g = listener.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            g.len()
+        };
+
+        // ---- ① 上限内确实建成了会话（防止假绿）----
+        assert!(
+            held.len() >= LIMIT,
+            "★ 上限内应当能建成至少 {LIMIT} 条会话（实际 {}）—— \
+             若这里是 0/极少，说明测试没跑通，不是上限生效",
+            held.len()
+        );
+
+        // ---- ② 核心：会话数不得超过上限 ----
+        assert!(
+            n <= LIMIT,
+            "★ KCP 会话数**不得超过**上限 {LIMIT} —— 实际 {n}（持有 {} 条流）。\
+             原先无上限：实测 31000 个 25 字节的包即可把内存推到 238 MB（放大 312×）",
+            held.len()
+        );
+
+        // ---- ③ 默认值合理 ----
+        assert!(
+            (64..=65536).contains(&MAX_KCP_SESSIONS),
+            "默认上限应当是个合理值（当前 {MAX_KCP_SESSIONS}）"
+        );
+        drop(held);
     }
 
     #[test]
