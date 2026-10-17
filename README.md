@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.8-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.5.9-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -54,8 +54,8 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 - OIDC 认证（`auth.method = "oidc"`），对接 Keycloak / Google / Azure AD 等任意标准 IdP；客户端走 Client Credentials Grant，服务端验签 JWKS（RS256 / PS256 / ES256）
 - RBAC 角色权限表（`[[roles]]`），按序匹配 + `deny_unknown` / `default_role` 兜底
-- IP 白 / 黑名单（`[acl]`），CIDR 语法，`deny` 优先
-- 审计日志（`[audit]`），JSONL 追加写 + 内存环形缓冲；关闭时零开销
+- IP 白 / 黑名单（`[acl]`），CIDR 语法，`deny` 优先；**v0.5.9 起铺满全部数据面入口**（TCP / UDP 代理、vhost、VNet、xtcp 牵线、管理面板）
+- 审计日志（`[audit]`），JSONL 追加写 + 内存环形缓冲；关闭时零开销。**v0.5.9 起支持 `maxFileMB` 轮转**（默认 64，单份 `.1` 备份）
 - 凭据比较统一走常量时间；HTTP 转发做逐跳头剥离、`Host` 规范化、CL+TE 走私拒绝
 - 面板与客户端本地界面**绑非回环地址却没有凭据时拒绝启动**（逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）
 
@@ -214,7 +214,18 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 | **xtcp 牵线加两层校验**：服务端把牵线 HELLO 的来源 IP 绑定到该 session 的控制连接 IP；provider 回**按 `secret_key`+`sid` 派生的应答口令**（替代固定 `"RTNL-OK"`），visitor 定长比较 | 修复"在途读到明文 HELLO（sid 泄露）⇒ 冒充 provider 劫持 P2P 会话"（第八轮 B-1，实测可拿到用户明文数据）。**混合版本时 P2P 直连会失败并自动回退中继**（新↔旧任意组合）：功能不受影响，只是少一层直连加速 | 两端都升到 0.5.8+ 才建立 P2P 直连；单边升级**不会**让连接失败，打洞窗口（8 秒）过后自动走中继。注意同一 NAT 后仍可能被同 IP 的观察者登记（第二层口令会拦住数据） |
 | **面板解析卫生 + 全名删除**：`Authorization` 只从请求**头区**解析（请求体里同形状的行不再"误投"）；面板列表展示的**线上全名**（`user.proxy`）可直接用于"移除代理" | ① 修复前，body 里带 `Authorization: Basic ...` 的请求能通过面板鉴权（与上游反代/WAF 口径不一致，属解析卫生）；② 修复前按列表全名删除会得到 502/400 且**两端状态分裂**（服务端已摘、客户端报"本地没有"） | 正常用法无感知；②修复后控制台/脚本从列表复制的名字（全名或短名）都能删 |
 | **`https2http` / `https2https` 上游收尾**：访问方断开时立刻放弃等待上游并释放上游连接；上游 connect / TLS 握手加 10 秒超时 | 修复前上游 accept 后悬挂时，每轮访问（连接→发请求→撤离）会留下一条永不释放的上游连接（可被公开访问方反复放大）；"等响应头"阶段仍然**没有**人为超时，长轮询 / SSE 不受影响 | 行为对齐官方 frpc（Go `http.Server` 在客户端断开时取消请求上下文）。上游就是慢（正常出数据）的场景不受影响，已实测 |
-| **`[acl]` 开始真正作用于数据面**（第七轮 F7-1）：公网 **TCP 代理端口**与 **HTTP/HTTPS vhost** 的 accept 现在过 IP 白/黑名单（修复前只挡控制连接） | 被你 `deny` 挡掉的来源此前"居然一直能访问"，本版起被拒（静默关连接 + 审计事件）；用白名单模式（`allow`）的部署尤其要注意：此前它对数据面形同虚设，本版起**按白名单收紧** | **UDP 代理端口与 xtcp 牵线（p2p）UDP 仍不在 `[acl]` 范围内**（面板另有自身鉴权）—— 如实记录在 `SECURITY-FIXES-ROUND7.md`。需要挡 UDP 来源请用防火墙 |
+| **`[acl]` 开始真正作用于数据面**（第七轮 F7-1）：公网 **TCP 代理端口**与 **HTTP/HTTPS vhost** 的 accept 现在过 IP 白/黑名单（修复前只挡控制连接） | 被你 `deny` 挡掉的来源此前"居然一直能访问"，本版起被拒（静默关连接 + 审计事件）；用白名单模式（`allow`）的部署尤其要注意：此前它对数据面形同虚设，本版起**按白名单收紧** | **UDP 代理端口与 xtcp 牵线（p2p）UDP 仍不在 `[acl]` 范围内**（面板另有自身鉴权）—— 如实记录在 `SECURITY-FIXES-ROUND7.md`。需要挡 UDP 来源请用防火墙（**v0.5.9 起 UDP 代理端口 / 牵线 / 面板也已纳入 ACL**，见下） |
+
+**0.5.9 起追加六处**（第九轮；详单见 `SECURITY-FIXES-ROUND9.md`）：
+
+| 变更 | 影响 | 处理 |
+|---|---|---|
+| **`[acl]` 覆盖面补齐**（E9-0 / E9-1 / E9-2）：**UDP 代理端口**、**xtcp 牵线 UDP**、**管理面板**从此也过 IP 白 / 黑名单 | 修复前 UDP 代理端口**完全不遵守** `[acl]`（无需任何凭据即可把 UDP 包送进内网服务）；牵线与面板同样漏过（面板另有独立 Basic Auth，属纵深防御缺失） | 用白名单（`allow`）模式的部署请确认放行面；只想挡 UDP 来源也可以继续用防火墙。升级后来源突然被拦属于配置本意（此前是静默失效） |
+| **未认证连接的时间上界 + 全局闸门**（C9-3 / C9-4）：TLS 握手 30s 超时、yamux 空转会话看门狗（30s）、未认证握手全局并发闸（2048，排队 5s）；`0x00` / `0x16` / `0x17` 单字节后静默的连接不再永久驻留 | 修复前"发一个字节然后静默"即可无限挂住连接（实测 500 条 `0x00` 占 500 fd + 6.4 MB）；未认证开流可放大 **≈800×**（12 字节换 9.5 KB） | 常规流量零感知。**极端饱和**（同时 >2048 个未认证握手）时新连接排队 5 秒后被拒 —— 已有会话与合法工作流不受影响，含合法客户端重新登录 |
+| **审计日志轮转 `maxFileMB`**（A9-3，默认 64；`0` = 不轮转） | 修复前审计文件可被公开流量灌到任意大（实测 ~1000 条/秒、37 MB/h 起、无上界，还会挤掉环形缓冲里的真实事件） | 轮转保留单份 `<path>.1` 备份，总占用 ≈ 2× 阈值；需要更长历史请自行归档 `.1`。要恢复旧的无限增长行为设 `maxFileMB = 0` |
+| **stcp / xtcp visitor 默认配置恢复可用**（A9-5，修 0.5.7 / 0.5.8 的功能回归） | 双方都未配 `user` 时（官方默认语义 `"" == ""`），0.5.7 / 0.5.8 会"能登录、能配对、但数据永远不通" | 配了 `allow_users` 的部署行为不变；若你此前为绕开问题给双方硬配了 `user`，本版起可以去掉 |
+| **KCP 会话表封顶 1024**（C9-1，仅启用 `kcp_bind_port` 时）：同时最多 1024 条 KCP 会话，超出丢弃新会话（不回包，**已有会话不受影响**） | 修复前 25 字节的 UDP 包可换 ≈15 KB 内存（**放大 312×**，实测 757 KB 上行把内存推高到 238 MB） | 未启用 KCP 的部署不受影响；单实例 KCP 会话数持续 >1024 的部署请拆分实例 |
+| **客户端启动即点名插件配置错误**（D9-7）：原先 Windows 上 `unix_domain_socket` 配置错误仅 DEBUG 一行，默认级别完全静默 | 影响面很小（配置错误本来就不工作），只是从"看不见"变成"一眼看见" | 无 —— 看到 WARN 按提示修配置即可 |
 
 其余需注意：
 
@@ -232,22 +243,22 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                # 格式
 cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
-cargo test --workspace                    # 725 个测试
+cargo test --workspace                    # 732 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 |
 |---|---|
-| `common` 单元测试 | 340 |
-| `server` 单元测试（lib） | 229 |
+| `common` 单元测试 | 344 |
+| `server` 单元测试（lib） | 232 |
 | `server` 单元测试（bin） | 17 |
 | `client` 单元测试 | 115 |
 | `server` 端到端集成测试 | 24 |
-| **合计** | **725** |
+| **合计** | **732** |
 
-★ 上表是 **v0.5.8 实测值**（`cargo test --workspace` 逐个 target 数的）。
-v0.5.7 的 699 加本轮 +26（第七轮 13 条修复的回归 + 第八轮 5 条的回归）= 725。
+★ 上表是 **v0.5.9 实测值**（`cargo test --workspace` 逐个 target 数的）。
+v0.5.8 的 725 加本轮 +7（第九轮 9 条修复 + 1 条加固的回归）= 732。
 数字对不上时以 `cargo test` 的输出为准。
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
