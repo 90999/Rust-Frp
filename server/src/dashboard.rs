@@ -70,6 +70,57 @@ pub async fn run(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // ★★ v0.5.9 修（第九轮审计 **E9-2**，低危）：**面板也要过 ACL**。
+                //
+                // # 原先为什么错了
+                //
+                // `[acl]` 的语义在文档里是"**谁能连上来**"
+                // （`common/src/security.rs:3`），且明确写着
+                // "**在认证之前执行**，所以被拒的连接连 token 都不用发"
+                // （`assets/frps.toml`）。**两条都没把面板排除在外。**
+                //
+                // 而 `dashboard.rs` 原先**零 `check_ip` 调用**。
+                //
+                // # 实测（`tmp/audit9/_indep/verify_dashboard_acl.py`，8/8 判据全过）
+                //
+                // `[acl] deny = ["127.0.0.1"]` 下：
+                //
+                // | 端点 | 无凭据 | 错凭据 | **正确凭据** |
+                // |---|---|---|---|
+                // | `/` | 401 | 401 | **200** |
+                // | `/api/status` | 401 | 401 | **200** |
+                // | `/metrics` | 401 | 401 | **200** |
+                // | `/api/healthz` | **200** | 200 | 200 |
+                //
+                // 而**同一条 ACL 让控制面登录被拒**、日志出现"IP 访问控制拒绝"
+                // ⇒ 证明 ACL 本身有效，只是**没覆盖面板**。
+                //
+                // # 定级为什么是「低危」而非更高
+                //
+                // 面板**有独立的 Basic Auth**（无/错凭据一律 401），
+                // 所以这不是认证绕过，而是**纵深防御缺失**：
+                // 管理员若用 `[acl]` 表达"只允许办公网访问面板"，这个意图会静默落空。
+                //
+                // ★ 与 UDP 那条（E9-0，中危）的区别正在于此：
+                //   **UDP 代理没有别的防线**，面板**有**。
+                //
+                // # 关于 `/api/healthz`（免鉴权探针端点）
+                //
+                // 这里**一视同仁**都会被 ACL 判定 —— 因为 ACL 的语义是来源管控，
+                // 不该有"某些端点例外"的隐含规则（那又是一个"没铺满"）。
+                // 用 k8s/docker 探针的部署，只要把**探针来源**放进 allow 即可；
+                // 这是管理员配置时该做的事，不是代码该替他猜的事。
+                let sec = registry.security();
+                if let Err(reason) = sec.check_ip(peer.ip()) {
+                    registry.audit().record(
+                        crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                            .ip(peer.ip().to_string())
+                            .detail(format!("{reason}（管理面板数据面）")),
+                    );
+                    debug!(%peer, "面板数据面 IP 访问控制拒绝：{reason}");
+                    drop(stream);
+                    continue;
+                }
                 let Ok(permit) = gate.clone().try_acquire_owned() else {
                     debug!(%peer, limit = MAX_DASHBOARD_CONNS, "面板并发连接已达上限，直接关闭");
                     drop(stream);
