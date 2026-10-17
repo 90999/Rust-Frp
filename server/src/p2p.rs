@@ -254,7 +254,43 @@ impl P2PHub {
 }
 
 /// 在 UDP socket 上跑牵线主循环。
-pub async fn run_rendezvous(sock: Arc<UdpSocket>, hub: Arc<P2PHub>) {
+///
+/// ★★ v0.5.9 修（第九轮审计 **E9-1**，低危）：新增 `sec`，让牵线 UDP 也过 ACL。
+///
+/// # 原先为什么错了
+///
+/// `p2p.rs` 里**没有 `check_ip` 调用**（第九轮 grep 零命中）。
+/// 牵线唯一的来源判定是第八轮 B-1 加的"与控制连接 IP 同源"
+/// （`register` 里的 `same_host` 检查）—— 那拦的是"**冒充别人**"，
+/// **不读 `[acl]`**，两者不等价。
+///
+/// # 实测（`tmp/audit9/_indep/verify_p2p_acl.py`，6/6 判据全过）
+///
+/// `[acl] deny = ["<LAN>"]` 下，从被 deny 的地址发 HELLO：
+///
+/// ```text
+/// DEBUG 收到 HELLO peer=127.0.0.1:52669 …      ← 放行侧
+/// DEBUG 收到 HELLO peer=192.168.56.1:52673 …   ← 被 deny 侧**也被收到了**
+/// （服务端日志里**没有任何** "IP 访问控制拒绝"）
+/// ```
+///
+/// # 定级为什么只是「低危」
+///
+/// 必须精确，不能夸大：
+/// * `hub.register` 要求 sid 对应的会话**已存在**（`g.get_mut(sid)?`），
+///   而会话由**已认证的控制通道**创建，控制通道**受 ACL 约束**；
+/// * ⇒ 净效果：ACL 挡住了控制面 ⇒ 没有 sid ⇒ 牵线这条路也走不通。
+///   **ACL 在这里是"间接生效"的。**
+/// * 所以这是"如果将来某条路径能拿到 sid，ACL 不会兜底"的**纵深防御缺口**，
+///   不是当下可打的漏洞。
+///
+/// ★ 但补它的成本极低（一次位运算），而口径统一的价值很高：
+///   不能有一条路径"碰巧安全"却靠的是另一条路径的防线。
+pub async fn run_rendezvous(
+    sock: Arc<UdpSocket>,
+    hub: Arc<P2PHub>,
+    sec: Arc<crate::guard::SecurityContext>,
+) {
     info!(
         "xtcp 牵线服务已启动，UDP {}",
         sock.local_addr()
@@ -271,6 +307,12 @@ pub async fn run_rendezvous(sock: Arc<UdpSocket>, hub: Arc<P2PHub>) {
                 continue;
             }
         };
+        // ★ E9-1：ACL 判定放在**解析报文之前** —— 与其它路径同序（最便宜的闸先撞）。
+        //   拒绝时静默丢弃：不给被拒的来源任何回包，也就不会泄露"这里有个牵线服务"。
+        if let Err(reason) = sec.check_ip(peer.ip()) {
+            debug!(%peer, "牵线 UDP 的 IP 访问控制拒绝：{reason}");
+            continue;
+        }
         let Some(Packet::Hello {
             role,
             sid,
