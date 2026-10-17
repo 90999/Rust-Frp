@@ -529,6 +529,7 @@ mod tests {
                 enable: true,
                 path: String::new(),
                 max_entries: 10,
+                max_file_mb: 0, // 本用例不涉轮转
             };
         });
         let ctx = SecurityContext::from_config(&c).unwrap();
