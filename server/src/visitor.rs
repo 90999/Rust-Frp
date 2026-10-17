@@ -83,13 +83,25 @@ impl VisitorEntry {
     /// 不会再收到空串**。但认证路径上"字段缺失 ⇒ 跳过校验"是危险模式，
     /// 所以在**判据本身**里再堵一层：即使将来某个调用点又传了空串，
     /// 它也不会被当成"匹配任意"。
+    ///
+    /// ★★ 第九轮 A9-5 修正（功能回归）：上面那句"即使传了空串也不匹配任意"
+    /// 原先实现成 **空串一律 false** —— 但空 `user` 不是攻击者的专利：
+    /// 双方都没配 `user`（配置里的默认值就是空）时，官方 frps 走
+    /// "空 `allow_users` ⇒ 只允许 provider 自己的 user" ⇒ `"" == ""` 放行。
+    /// 实测该组合下 stcp visitor **完全无法配对**（A9-5 调试：
+    /// 服务端打 `visitor 用户不在 allow_users 白名单内`）。
+    /// 现在只在**命中白名单**的方向上堵空串；`allow_users` 为空时恢复官方语义。
     pub fn check_user(&self, visitor_user: &str) -> bool {
-        // ★ 没有身份 ≠ 匹配任意
+        if self.allow_users.is_empty() {
+            // 官方语义：空 `allow_users` 退化成"只允许 provider 自己的 user"。
+            // 登录已完成认证，这里比的是"身份相同"，不是"匹配任意" ——
+            // 空 provider_user 与空访客 identity 相等是合法的默认场景。
+            return self.provider_user == visitor_user;
+        }
+        // `allow_users = ["*"]` 的语义是"任意**已登录用户**"，不是"任意 TCP
+        // 连接" —— 空身份不得命中星号，也不得命具名白名单。
         if visitor_user.is_empty() {
             return false;
-        }
-        if self.allow_users.is_empty() {
-            return self.provider_user == visitor_user;
         }
         self.allow_users
             .iter()
@@ -243,6 +255,16 @@ mod tests {
         );
         assert!(e.check_user("bob"), "provider 自己的 user 应当放行");
         assert!(!e.check_user("alice"), "别的 user 应当拒绝");
+
+        // ★ 第九轮 A9-5：provider 自己也是空 user（默认场景）时，
+        //   空身份 == 空 provider_user 必须放行（否则 visitor 功能不可用）。
+        e.allow_users = Vec::new();
+        e.provider_user = String::new();
+        assert!(
+            e.check_user(""),
+            "双方都没配 user 是默认场景，官方语义放行；不许回归"
+        );
+        assert!(!e.check_user("alice"), "空 provider 只允许空身份");
 
         // ★ 被测的那条：`["*"]`（"对所有人开放"）也不能被空身份命中
         e.allow_users = vec!["*".into()];
