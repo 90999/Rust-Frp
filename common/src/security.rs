@@ -1039,10 +1039,24 @@ pub struct AuditConfig {
     /// 内存里保留多少条（面板查询用）。默认 1000。
     #[serde(default = "default_audit_capacity", rename = "maxEntries")]
     pub max_entries: usize,
+    /// 审计文件轮转阈值（MB）。默认 64；`0` = 不轮转。
+    ///
+    /// 轮转保留**上一份**备份（`<path>.1`），磁盘占用上界 ≈ 2×。
+    ///
+    /// ★ v0.5.9（第九轮 A9-3）：原先只有内存环形上限，审计文件**无上界** ——
+    /// 实测 ~1000 行/s、约 37 MB/h 可持续增长，这是一条可被利用的磁盘
+    /// 耗尽路径（审计默认关闭，但开启后就再无保护）。有了默认上限后
+    /// 占用可预期，且**事件不丢**（旧内容在 `.1` 里）。
+    #[serde(default = "default_audit_max_file_mb", rename = "maxFileMB")]
+    pub max_file_mb: u64,
 }
 
 fn default_audit_capacity() -> usize {
     1000
+}
+
+fn default_audit_max_file_mb() -> u64 {
+    64
 }
 
 impl Default for AuditConfig {
@@ -1051,6 +1065,7 @@ impl Default for AuditConfig {
             enable: false,
             path: String::new(),
             max_entries: default_audit_capacity(),
+            max_file_mb: default_audit_max_file_mb(),
         }
     }
 }
@@ -1465,6 +1480,7 @@ mod tests {
         assert!(rbac.is_disabled());
         let aud = AuditConfig::default();
         assert!(!aud.enable && aud.max_entries == 1000);
+        assert_eq!(aud.max_file_mb, 64, "审计轮转默认阈值 64MB（v0.5.9 A9-3）");
     }
 
     // ------------------------------------------------------------------
