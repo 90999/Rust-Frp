@@ -1737,6 +1737,10 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     debug!(%peer, port = remote_port, "数据面 IP 访问控制拒绝：{reason}");
                     continue;
                 }
+                // 小包请求-响应式流量（HTTP / RPC 等）关闭 Nagle：避免攒包引入
+                // 毫秒级延迟；与 `vhost` / `vnet` 等其它数据面入口的处理一致。
+                // 纯套接字选项，设置失败不影响转发。
+                stream.set_nodelay(true).ok();
                 // group 负载均衡：这个端口背后可能挂着多个客户端（同组代理），
                 // 每条新连接轮询挑一个；挑不到说明后端全掉了，直接关掉。
                 // 选**在途连接最少**的后端，并立刻给它记一条 ——
