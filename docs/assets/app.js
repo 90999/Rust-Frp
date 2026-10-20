@@ -1,165 +1,248 @@
 /* ===========================================================================
-   NFrp 文档 · 应用逻辑
+   NFrp Docs · Application logic
    ---------------------------------------------------------------------------
-   零依赖。负责：
-   - 把 PAGES 注入 #dynamicPages
-   - 哈希路由 + 侧栏高亮 + 上下页
-   - 主题切换（记忆到 localStorage）
-   - 代码块复制按钮
-   - 滚动进场动画（IntersectionObserver）
-   - 移动端抽屉导航
+   Zero dependencies.
+
+   Highlights:
+   - English URL slugs, bilingual content (zh / en) switchable at runtime
+   - Sequential page handoff with staggered content animation
+   - Sticky-header shadow on scroll, scroll progress bar
+   - Sidebar active indicator that slides between items
+   - Number count-up on the home stats
+   - Scroll reveal, copy buttons, mobile drawer
+
+   All motion touches transform / opacity only (GPU composited).
+   prefers-reduced-motion is honoured throughout.
    =========================================================================== */
 
 (function () {
   'use strict';
 
-  /* ---------- 页面顺序（用于上下页导航） ---------- */
-  const ORDER = [
-    { id: 'home',            title: '概览' },
-    { id: 'install',         title: '安装' },
-    { id: 'quickstart',      title: '快速开始' },
-    { id: 'config-server',   title: '服务端配置' },
-    { id: 'config-client',   title: '客户端配置' },
-    { id: 'proxies',         title: '代理类型' },
-    { id: 'plugins',         title: '插件' },
-    { id: 'transports',      title: '传输层' },
-    { id: 'protocol',        title: '线协议总览' },
-    { id: 'protocol-v1',     title: 'v1 与加密' },
-    { id: 'protocol-v2',     title: 'v2 与 AEAD' },
-    { id: 'messages',        title: '消息类型' },
-    { id: 'security',        title: '安全模型' },
-    { id: 'acl-rbac',        title: 'ACL 与 RBAC' },
-    { id: 'audit',           title: '审计日志' },
-    { id: 'changes',         title: '安全修复史' },
-    { id: 'api',             title: 'HTTP API' },
-    { id: 'library',         title: '作为库使用' },
-    { id: 'compat',          title: '与官方 frp 互通' },
+  /* ---------- Route table ----------
+     Slugs are English in every language so URLs stay stable and readable. */
+  const ROUTES = [
+    { slug: 'overview',               page: 'home',          title: 'home' },
+    { slug: 'installation',           page: 'install',       title: 'install' },
+    { slug: 'quick-start',            page: 'quickstart',    title: 'quickstart' },
+    { slug: 'server-configuration',   page: 'config-server', title: 'config-server' },
+    { slug: 'client-configuration',   page: 'config-client', title: 'config-client' },
+    { slug: 'proxy-types',            page: 'proxies',       title: 'proxies' },
+    { slug: 'plugins',                page: 'plugins',       title: 'plugins' },
+    { slug: 'transports',             page: 'transports',    title: 'transports' },
+    { slug: 'wire-protocol',          page: 'protocol',      title: 'protocol' },
+    { slug: 'protocol-v1',            page: 'protocol-v1',   title: 'protocol-v1' },
+    { slug: 'protocol-v2',            page: 'protocol-v2',   title: 'protocol-v2' },
+    { slug: 'message-types',          page: 'messages',      title: 'messages' },
+    { slug: 'security-model',         page: 'security',      title: 'security' },
+    { slug: 'acl-and-rbac',           page: 'acl-rbac',      title: 'acl-rbac' },
+    { slug: 'audit-log',              page: 'audit',         title: 'audit' },
+    { slug: 'security-history',       page: 'changes',       title: 'changes' },
+    { slug: 'http-api',               page: 'api',           title: 'api' },
+    { slug: 'use-as-library',         page: 'library',       title: 'library' },
+    { slug: 'frp-interoperability',   page: 'compat',        title: 'compat' },
   ];
 
   const $ = (s, r) => (r || document).querySelector(s);
   const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 
-  /* ---------- 注入动态页面 ---------- */
-  function injectPages() {
-    const host = $('#dynamicPages');
-    if (!host || typeof PAGES === 'undefined') return;
-    const frag = document.createDocumentFragment();
-    Object.keys(PAGES).forEach(function (id) {
-      const sec = document.createElement('section');
-      sec.className = 'page';
-      sec.id = 'page-' + id;
-      sec.hidden = true;
-      sec.innerHTML = PAGES[id];
-      frag.appendChild(sec);
-    });
-    host.appendChild(frag);
-  }
-
-  /* ---------- 路由 ---------- */
-  function currentRoute() {
-    const h = (location.hash || '').replace(/^#\/?/, '').trim();
-    if (!h) return 'home';
-    return h.replace(/\/$/, '') || 'home';
-  }
-
-  /* ---------- 页面切换：交叉过渡 ---------- */
-  // 当前正在显示的页面（用于撤销上一次未完成的过渡）
-  let activeEl = null;
-  let switchTimer = null;
+  const LANG_KEY = 'nfrp-doc-lang';
+  const THEME_KEY = 'nfrp-doc-theme';
 
   const REDUCED = window.matchMedia
     ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
     : false;
 
-  function activate(id) {
-    // 找不到就退回首页
-    let target = $('#page-' + id);
-    if (!target) {
-      id = 'home';
-      target = $('#page-home');
-    }
+  let lang = 'zh';
+  let activePage = null;
+  let switchTimer = null;
 
-    // 1) 侧栏高亮立刻更新（用户最先看的是这里，不该等动画）
-    $$('.nav-link').forEach(function (a) {
-      const href = (a.getAttribute('href') || '').replace(/^#\/?/, '') || 'home';
-      a.classList.toggle('active', href === id);
+  /* ---------- Language detection ---------- */
+  function detectLang() {
+    let saved = null;
+    try { saved = localStorage.getItem(LANG_KEY); } catch (e) {}
+    if (saved === 'zh' || saved === 'en') return saved;
+
+    // Hash may carry an explicit override: #/installation?lang=en
+    const m = /[?&]lang=(zh|en)/.exec(location.hash || '');
+    if (m) return m[1];
+
+    const nav = (navigator.language || 'zh').toLowerCase();
+    return nav.startsWith('zh') ? 'zh' : 'en';
+  }
+
+  function t(key) {
+    const table = (typeof I18N !== 'undefined' && I18N[lang]) || {};
+    if (key in table) return table[key];
+    const fallback = (typeof I18N !== 'undefined' && I18N.zh) || {};
+    return fallback[key] || key;
+  }
+
+  /* ---------- Inject dynamic pages ---------- */
+  function pageSource() {
+    if (lang === 'en' && typeof PAGES_EN !== 'undefined') return PAGES_EN;
+    if (lang === 'zh' && typeof PAGES_ZH !== 'undefined') return PAGES_ZH;
+    if (typeof PAGES_ZH !== 'undefined') return PAGES_ZH;
+    if (typeof PAGES_EN !== 'undefined') return PAGES_EN;
+    return {};
+  }
+
+  function injectPages() {
+    const host = $('#dynamicPages');
+    if (!host) return;
+    host.innerHTML = '';
+
+    const src = pageSource();
+    const frag = document.createDocumentFragment();
+    Object.keys(src).forEach(function (id) {
+      const sec = document.createElement('section');
+      sec.className = 'page';
+      sec.id = 'page-' + id;
+      sec.hidden = true;
+      sec.innerHTML = src[id];
+      frag.appendChild(sec);
     });
+    host.appendChild(frag);
+  }
 
-    // 2) 滚动到顶部（在切换前做，避免动画期间跳动）
-    if (!location.hash.includes('#', 2)) {
-      window.scrollTo({ top: 0, behavior: 'auto' });
-    }
+  /* ---------- Routing ---------- */
+  function slugFromHash() {
+    const h = (location.hash || '').replace(/^#\/?/, '').split('?')[0].trim();
+    return (h || 'overview').replace(/\/$/, '') || 'overview';
+  }
 
-    const old = activeEl;
-    activeEl = target;
+  function routeOf(slug) {
+    return (
+      ROUTES.find(function (r) { return r.slug === slug; }) ||
+      ROUTES[0]
+    );
+  }
 
-    // 同一个页面重复点击：不重播动画
+  /* ---------- Static shell translation ---------- */
+  function applyLangToShell() {
+    document.documentElement.setAttribute('lang', t('_htmlLang'));
+    $$('[data-i18n]').forEach(function (el) {
+      const key = el.getAttribute('data-i18n');
+      const val = t(key);
+      if (val && val !== key) el.textContent = val;
+    });
+    const lbl = $('#langLabel');
+    // Button shows the language you would switch TO
+    if (lbl) lbl.textContent = lang === 'zh' ? 'EN' : '中文';
+  }
+
+  /* ---------- Page switching with staggered animation ---------- */
+  function activate(slug) {
+    const route = routeOf(slug);
+    const target = $('#page-' + route.page) || $('#page-home');
+
+    /* Sidebar: highlight immediately, and slide the indicator */
+    $$('.nav-link').forEach(function (a) {
+      const s = (a.getAttribute('href') || '').replace(/^#\/?/, '').split('?')[0];
+      a.classList.toggle('active', s === route.slug);
+    });
+    moveIndicator();
+
+    /* Scroll before animating so nothing jumps mid-transition */
+    window.scrollTo({ top: 0, behavior: 'auto' });
+
+    const old = activePage;
+    activePage = target;
+
+    document.title = t('t-' + route.title) + ' | NFRp Docs';
+
     if (old === target) {
+      buildPager(route);
+      animateContent(target, true);
       return;
     }
 
     clearTimeout(switchTimer);
 
-    // 3) 新页面先占位但不显示；旧页面淡出后再入场
-    //    不用"两页叠加"的交叉 —— 因为两页内容结构完全不同，
-    //    叠加会形成两层文字重影，观感比闪切更差。
-    //    这里做的是"顺序交接"：旧页 140ms 退场 → 新页 240ms 入场。
-    target.classList.remove('page-exit');
-    target.classList.remove('page-enter');
+    target.classList.remove('page-exit', 'page-enter');
 
-    if (old && old !== target && !REDUCED) {
-      // 旧页还在：让它淡出，退场结束才显示新页
-      old.classList.add('page-exit');
-      old.hidden = false;
-
-      switchTimer = setTimeout(function () {
-        old.hidden = true;
-        old.classList.remove('page-exit');
-        target.hidden = false;
-        target.classList.add('page-enter');
-        void target.offsetWidth;
-        window.clearTimeout(switchTimer);
-        switchTimer = setTimeout(function () {
-          target.classList.remove('page-enter');
-        }, 300);
-      }, 140);
-    } else {
-      // 首次进入 / 减少动态偏好：直接显示并淡入
-      if (old && old !== target) {
-        old.hidden = true;
-        old.classList.remove('page-exit');
-      }
+    const reveal = function () {
       target.hidden = false;
       if (!REDUCED) {
         target.classList.add('page-enter');
         void target.offsetWidth;
         switchTimer = setTimeout(function () {
           target.classList.remove('page-enter');
-        }, 300);
+        }, 420);
       }
+      animateContent(target, false);
+    };
+
+    if (old && !REDUCED) {
+      /* Old page fades out and lifts, then the new one comes in.
+         Not a cross fade: two structurally different pages overlapping
+         reads as doubled text at the crossover. */
+      old.classList.add('page-exit');
+      old.hidden = false;
+      switchTimer = setTimeout(function () {
+        old.hidden = true;
+        old.classList.remove('page-exit');
+        reveal();
+      }, 150);
+    } else {
+      if (old) {
+        old.hidden = true;
+        old.classList.remove('page-exit');
+      }
+      reveal();
     }
 
-    // 6) 内容增强（这些与动画无关，立即做）
-    buildPager(target, id);
+    buildPager(route);
     decorateCodeBlocks(target);
-    observeReveals(target);
     closeDrawer();
-
-    document.title =
-      (ORDER.find(function (o) { return o.id === id; }) || { title: '文档' }).title +
-      ' · NFrp 文档';
   }
 
-  /* ---------- 上下页 ---------- */
-  function buildPager(host, id) {
-    const idx = ORDER.findIndex(function (o) { return o.id === id; });
-    if (idx < 0) return;
+  /* Stagger the headings / blocks inside a freshly shown page */
+  function animateContent(host, repeat) {
+    if (REDUCED) return;
 
-    const prev = ORDER[idx - 1];
-    const next = ORDER[idx + 1];
-    const old = $('.pager', host);
-    if (old) old.remove();
+    const items = $$(
+      ':scope > h1, :scope > .lead, :scope > h2, :scope > h3, ' +
+      ':scope > p, :scope > pre, :scope > .table-wrap, :scope > .callout, ' +
+      ':scope > .cards, :scope > .stats, :scope > ul, :scope > ol, ' +
+      ':scope > .hero > *, :scope > .card, :scope > .stat',
+      host
+    );
 
+    items.forEach(function (el, i) {
+      if (!repeat && el.dataset.animated === '1') return;
+      el.dataset.animated = '1';
+      el.classList.remove('anim-in');
+      el.style.animationDelay = Math.min(i * 26, 340) + 'ms';
+      void el.offsetWidth;
+      el.classList.add('anim-in');
+    });
+  }
+
+  /* ---------- Sliding sidebar indicator ---------- */
+  function moveIndicator() {
+    const bar = $('#navIndicator');
+    const active = $('.nav-link.active');
+    const sidebar = $('#sidebar');
+    if (!bar || !active || !sidebar) return;
+
+    const sr = sidebar.getBoundingClientRect();
+    const ar = active.getBoundingClientRect();
+    if (ar.height === 0) return; // drawer closed
+
+    bar.style.transform = 'translateY(' + (ar.top - sr.top + sidebar.scrollTop) + 'px)';
+    bar.style.height = ar.height + 'px';
+    bar.style.opacity = '1';
+  }
+
+  /* ---------- Prev/next pager ---------- */
+  function buildPager(route) {
+    const slot = $('#pagerSlot');
+    if (!slot) return;
+    const idx = ROUTES.indexOf(route);
+    const prev = ROUTES[idx - 1];
+    const next = ROUTES[idx + 1];
+
+    slot.innerHTML = '';
     if (!prev && !next) return;
 
     const nav = document.createElement('nav');
@@ -168,12 +251,12 @@
     if (prev) {
       nav.insertAdjacentHTML(
         'beforeend',
-        '<a href="#/' + prev.id + '">' +
+        '<a href="#/' + prev.slug + '">' +
           '<span class="dir">' +
           '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
           'stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>' +
-          '上一页</span>' +
-          '<span class="name">' + prev.title + '</span></a>'
+          t('pager-prev') + '</span>' +
+          '<span class="name">' + t('t-' + prev.title) + '</span></a>'
       );
     } else {
       nav.insertAdjacentHTML('beforeend', '<span class="spacer"></span>');
@@ -182,19 +265,19 @@
     if (next) {
       nav.insertAdjacentHTML(
         'beforeend',
-        '<a class="next" href="#/' + next.id + '">' +
-          '<span class="dir">下一页' +
+        '<a class="next" href="#/' + next.slug + '">' +
+          '<span class="dir">' + t('pager-next') +
           '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
           'stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>' +
           '</span>' +
-          '<span class="name">' + next.title + '</span></a>'
+          '<span class="name">' + t('t-' + next.title) + '</span></a>'
       );
     }
 
-    host.appendChild(nav);
+    slot.appendChild(nav);
   }
 
-  /* ---------- 代码块复制 ---------- */
+  /* ---------- Copy buttons ---------- */
   const COPY_ICON =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
     'stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/>' +
@@ -211,7 +294,7 @@
       const btn = document.createElement('button');
       btn.className = 'copy-btn';
       btn.type = 'button';
-      btn.setAttribute('aria-label', '复制代码');
+      btn.setAttribute('aria-label', 'Copy');
       btn.innerHTML = COPY_ICON;
       btn.addEventListener('click', function () {
         const code = pre.querySelector('code');
@@ -251,61 +334,113 @@
     }
   }
 
-  /* ---------- 滚动进场 ---------- */
+  /* ---------- Scroll reveal ---------- */
   let io = null;
+  function initReveal() {
+    if (!('IntersectionObserver' in window)) return;
+    io = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) {
+            e.target.classList.add('in');
+            io.unobserve(e.target);
+          }
+        });
+      },
+      { rootMargin: '0px 0px -6% 0px', threshold: 0.05 }
+    );
+  }
+
   function observeReveals(host) {
     const items = $$('.reveal', host).filter(function (el) {
       return !el.classList.contains('in');
     });
     if (!items.length) return;
 
-    if (!('IntersectionObserver' in window)) {
+    if (!io) {
       items.forEach(function (el) { el.classList.add('in'); });
       return;
     }
-
-    if (!io) {
-      io = new IntersectionObserver(
-        function (entries) {
-          entries.forEach(function (e) {
-            if (e.isIntersecting) {
-              e.target.classList.add('in');
-              io.unobserve(e.target);
-            }
-          });
-        },
-        { rootMargin: '0px 0px -8% 0px', threshold: 0.06 }
-      );
-    }
     items.forEach(function (el, i) {
-      el.style.transitionDelay = Math.min(i * 45, 260) + 'ms';
+      el.style.transitionDelay = Math.min(i * 50, 300) + 'ms';
       io.observe(el);
     });
   }
 
-  /* ---------- 主题 ---------- */
-  const THEME_KEY = 'nfrp-doc-theme';
+  /* ---------- Count-up numbers ---------- */
+  function countUp() {
+    $$('.stat[data-count]').forEach(function (el) {
+      if (el.dataset.counted === '1') return;
+      el.dataset.counted = '1';
 
-  function applyTheme(t) {
-    document.documentElement.setAttribute('data-theme', t);
+      const target = parseFloat(el.dataset.count);
+      const suffix = el.dataset.suffix || '';
+      const out = $('.stat-value', el);
+      if (!out || REDUCED || isNaN(target)) return;
+
+      const decimals = (el.dataset.count.split('.')[1] || '').length;
+      const dur = 900;
+      const t0 = performance.now();
+
+      const step = function (now) {
+        const p = Math.min((now - t0) / dur, 1);
+        // easeOutCubic
+        const eased = 1 - Math.pow(1 - p, 3);
+        const v = (target * eased).toFixed(decimals);
+        out.textContent = v + suffix;
+        if (p < 1) requestAnimationFrame(step);
+        else out.textContent = target.toFixed(decimals) + suffix;
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
+  /* ---------- Scroll effects: header shadow + progress bar ---------- */
+  function initScrollFx() {
+    const header = $('.header');
+    const bar = $('#progressBar');
+    let ticking = false;
+
+    const update = function () {
+      const y = window.scrollY || document.documentElement.scrollTop;
+      if (header) header.classList.toggle('scrolled', y > 8);
+
+      if (bar) {
+        const h = document.documentElement.scrollHeight - window.innerHeight;
+        const p = h > 0 ? Math.min(y / h, 1) : 0;
+        bar.style.transform = 'scaleX(' + p + ')';
+      }
+      ticking = false;
+    };
+
+    window.addEventListener(
+      'scroll',
+      function () {
+        if (!ticking) {
+          ticking = true;
+          requestAnimationFrame(update);
+        }
+      },
+      { passive: true }
+    );
+    update();
+  }
+
+  /* ---------- Theme ---------- */
+  function applyTheme(th) {
+    document.documentElement.setAttribute('data-theme', th);
     const moon = $('.ico-moon');
     const sun = $('.ico-sun');
     if (moon && sun) {
-      const light = t === 'light';
+      const light = th === 'light';
       moon.style.display = light ? 'none' : '';
       sun.style.display = light ? '' : 'none';
     }
-    const meta = document.querySelector('meta[name="color-scheme"]');
-    if (meta) meta.setAttribute('content', t === 'light' ? 'light dark' : 'dark light');
   }
 
   function initTheme() {
     let saved = null;
     try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
-    // 默认深色 —— 不跟随系统。
-    // 这套配色是按深色设计的（B 站粉在深底上才够亮），
-    // 跟随系统会让浅色用户看到一个"次选"的观感。
-    // 想换浅色点右上角的图标，选择会被记住。
     applyTheme(saved || 'dark');
 
     const btn = $('#themeBtn');
@@ -319,7 +454,35 @@
     }
   }
 
-  /* ---------- 移动端抽屉 ---------- */
+  /* ---------- Language switch ---------- */
+  function setLang(next, persist) {
+    lang = next;
+    if (persist) {
+      try { localStorage.setItem(LANG_KEY, next); } catch (e) {}
+    }
+
+    applyLangToShell();
+    injectPages();
+
+    // Re-render the current page in the new language
+    const route = routeOf(slugFromHash());
+    activePage = null;
+    activate(route.slug);
+    observeReveals($('#content'));
+    countUp();
+  }
+
+  function initLang() {
+    lang = detectLang();
+    const btn = $('#langBtn');
+    if (btn) {
+      btn.addEventListener('click', function () {
+        setLang(lang === 'zh' ? 'en' : 'zh', true);
+      });
+    }
+  }
+
+  /* ---------- Mobile drawer ---------- */
   function openDrawer() {
     const sb = $('#sidebar');
     const scrim = $('#scrim');
@@ -328,6 +491,7 @@
     sb.classList.add('open');
     scrim && scrim.classList.add('show');
     btn && btn.setAttribute('aria-expanded', 'true');
+    setTimeout(moveIndicator, 60);
   }
 
   function closeDrawer() {
@@ -352,17 +516,28 @@
     });
   }
 
-  /* ---------- 启动 ---------- */
+  /* ---------- Boot ---------- */
   function boot() {
-    injectPages();
     initTheme();
+    initReveal();
+    initScrollFx();
     initDrawer();
+    initLang();
+
+    applyLangToShell();
+    injectPages();
 
     window.addEventListener('hashchange', function () {
-      activate(currentRoute());
+      activate(slugFromHash());
     });
+    window.addEventListener('resize', moveIndicator);
 
-    activate(currentRoute());
+    activate(slugFromHash());
+
+    // Reveal anything already on screen and start the counters
+    observeReveals($('#content'));
+    countUp();
+    setTimeout(moveIndicator, 120);
   }
 
   if (document.readyState === 'loading') {
