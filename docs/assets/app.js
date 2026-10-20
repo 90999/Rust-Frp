@@ -126,8 +126,17 @@
       if (val && val !== key) el.textContent = val;
     });
     const lbl = $('#langLabel');
-    // Button shows the language you would switch TO
-    if (lbl) lbl.textContent = lang === 'zh' ? 'EN' : '中文';
+    // Show "current -> target" so the button explains itself.
+    // 当前 -> 目标，点了会变成哪个语言一目了然
+    if (lbl) lbl.textContent = lang === 'zh' ? '中文 \u2192 EN' : 'EN \u2192 中文';
+    const btn = $('#langBtn');
+    if (btn) {
+      btn.setAttribute(
+        'aria-label',
+        lang === 'zh' ? 'Switch to English' : '切换到中文'
+      );
+      btn.title = lang === 'zh' ? 'Switch to English' : '切换到中文';
+    }
   }
 
   /* ---------- Page switching with staggered animation ---------- */
