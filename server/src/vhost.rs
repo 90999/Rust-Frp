@@ -41,9 +41,6 @@ use tracing::{debug, info, warn};
 
 use crate::{pool::ClientState, registry::Registry};
 
-/// 向客户端索要工作连接的超时。
-const WORK_CONN_WAIT: Duration = Duration::from_secs(15);
-
 // ---------------------------------------------------------------------------
 // 路由表
 // ---------------------------------------------------------------------------
@@ -544,9 +541,10 @@ async fn handle_https(
         return Ok(());
     };
 
+    // 等待时长由服务端 `userConnTimeout`（默认 10 秒）决定，不再硬编码 15 秒。
     let work = route
         .client
-        .acquire_work_conn(WORK_CONN_WAIT)
+        .acquire_work_conn()
         .await
         .ok_or_else(|| anyhow!("等待工作连接超时"))?;
     let mut work_conn: FrpConn = work.conn;
@@ -822,9 +820,10 @@ async fn handle_tcpmux(
         }
     }
 
+    // 等待时长由服务端 `userConnTimeout`（默认 10 秒）决定，不再硬编码 15 秒。
     let work = route
         .client
-        .acquire_work_conn(WORK_CONN_WAIT)
+        .acquire_work_conn()
         .await
         .ok_or_else(|| anyhow!("等待工作连接超时"))?;
     let mut work_conn: FrpConn = work.conn;
@@ -1158,7 +1157,8 @@ where
         }
 
         // ---- 取工作连接并转发 ----
-        let work = match route.client.acquire_work_conn(WORK_CONN_WAIT).await {
+        // 等待时长由服务端 `userConnTimeout`（默认 10 秒）决定。
+        let work = match route.client.acquire_work_conn().await {
             Some(w) => w,
             None => {
                 io.stream

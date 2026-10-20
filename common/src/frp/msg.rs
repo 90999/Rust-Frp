@@ -243,6 +243,13 @@ pub struct NewProxy {
     pub group_key: String,
     #[serde(default, skip_serializing_if = "is_empty_map")]
     pub metas: HashMap<String, String>,
+    /// 注解键值对（frp 0.71 的 `annotations`；官方 `msg.go` 里紧跟 `Metas`）。
+    ///
+    /// 官方 frps 收下后**只存不查**（`server/` 下没有任何读取点，0.71 实测），
+    /// 这里同样只做透传 —— 保持与官方 frpc 的报文逐字段一致。
+    /// 客户端侧的键名 / 大小校验见 `config.rs` 的 `reject_bad_annotations`。
+    #[serde(default, skip_serializing_if = "is_empty_map")]
+    pub annotations: HashMap<String, String>,
     /// 仅 tcp / udp 使用。
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub remote_port: u16,
@@ -559,6 +566,9 @@ impl NewProxy {
             //   官方 frpc 的 `MarshalToMsg` 写的是 `m.Metas = c.Metadatas`，
             //   顶层那份只进登录消息（`Login.Metas`）。
             metas: p.metas.clone(),
+            // ★ 官方 frpc 的 `MarshalToMsg`：`m.Annotations = c.Annotations`
+            //   （基础代理配置对所有类型都带）—— 只透传，不解读。
+            annotations: p.annotations.clone(),
             ..Default::default()
         };
 

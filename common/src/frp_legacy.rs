@@ -382,6 +382,26 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     put_int(out, sec, "heartbeat_interval", "heartbeat_interval")?;
     put_int(out, sec, "heartbeat_timeout", "heartbeat_timeout")?;
     put_int(out, sec, "reconnect_interval", "reconnect_interval")?;
+    // 连接服务端的超时与本机出口绑定（限制①批次1 实现；官方 legacy 同名键，
+    // 见 `legacy/conversion.go` 的 `out.Transport.DialServerTimeout` /
+    // `ConnectServerLocalIP` 两行）。
+    put_int(out, sec, "dial_server_timeout", "dial_server_timeout")?;
+    put_str(
+        out,
+        sec,
+        "connect_server_local_ip",
+        "connect_server_local_ip",
+    );
+    // TCP keepalive / yamux 保活（限制①批次2 实现；官方 legacy 同名键，
+    // 见 `legacy/conversion.go` 的 `out.Transport.DialServerKeepAlive` /
+    // `TCPMuxKeepaliveInterval` 两行）。
+    put_int(out, sec, "dial_server_keepalive", "dial_server_keepalive")?;
+    put_int(
+        out,
+        sec,
+        "tcp_mux_keepalive_interval",
+        "tcp_mux_keepalive_interval",
+    )?;
     put_int(out, sec, "pool_count", "pool_count")?;
     put_bool(out, sec, "tcp_mux", "tcp_mux")?;
     put_str(out, sec, "log_level", "log_level");
@@ -390,6 +410,9 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     // —— 所以这里也只认 `log_file`，语义与官方逐字一致。
     put_str(out, sec, "log_file", "log_to");
     put_int(out, sec, "log_max_days", "max_days")?;
+    // 官方 legacy 的 `disable_log_color` → v1 的 `log.disablePrintColor`
+    // （`conversion.go:70` 同一行）。
+    put_bool(out, sec, "disable_log_color", "disable_print_color")?;
     put_str(out, sec, "tls_server_name", "tls_server_name");
 
     // 传输协议：INI 里叫 `protocol`（tcp / kcp / quic / websocket / wss），
@@ -796,6 +819,9 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     let out = &mut root;
 
     put_str(out, common, "bind_addr", "bind_addr");
+    // 数据面监听地址（限制①批次1；官方 `conversion.go:111`：
+    // `out.ProxyBindAddr = conf.ProxyBindAddr`）。
+    put_str(out, common, "proxy_bind_addr", "proxy_bind_addr");
     put_int(out, common, "bind_port", "bind_port")?;
     put_str(out, common, "token", "token");
     put_str(out, common, "log_level", "log_level");
@@ -804,6 +830,19 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     put_str(out, common, "subdomain_host", "subdomain_host");
     put_bool(out, common, "tcp_mux", "tcp_mux")?;
     put_int(out, common, "heartbeat_timeout", "heartbeat_timeout")?;
+    // 等用户连接配工作连接的超时 + 单客户端空闲池上限（限制①批次1；
+    // 官方 `conversion.go:140/147`）。
+    put_int(out, common, "user_conn_timeout", "user_conn_timeout")?;
+    put_int(out, common, "max_pool_count", "max_pool_count")?;
+    // yamux 保活间隔 + 主端口 TCP keepalive（限制①批次2；
+    // 官方 `conversion.go:145/146`）。
+    put_int(
+        out,
+        common,
+        "tcp_mux_keepalive_interval",
+        "tcp_mux_keepalive_interval",
+    )?;
+    put_int(out, common, "tcp_keepalive", "tcp_keepalive")?;
     // frp 的 `tls_only`（强制客户端走 TLS）对应 NFrp 的 `tls_force`
     put_bool(out, common, "tls_only", "tls_force")?;
 
@@ -857,6 +896,8 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     // 同客户端：官方 `out.Log.To = conf.LogFile`，不看 `log_way`。
     put_str(out, common, "log_file", "log_to");
     put_int(out, common, "log_max_days", "max_days")?;
+    // `disable_log_color` → `log.disablePrintColor`（`conversion.go:135`）。
+    put_bool(out, common, "disable_log_color", "disable_print_color")?;
 
     // 内置面板：frp 叫 dashboard_*，NFrp 也叫 dashboard_*
     put_int(out, common, "dashboard_port", "dashboard_port")?;
@@ -888,6 +929,63 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::config::{parse_client, parse_client_toml, parse_server};
+
+    /// 限制①批次1：legacy INI 里的新字段（官方同名键）要能搬进来 ——
+    /// 客户端 `dial_server_timeout` / `connect_server_local_ip` /
+    /// `disable_log_color`，服务端 `proxy_bind_addr` / `user_conn_timeout` /
+    /// `max_pool_count` / `disable_log_color`。
+    #[test]
+    fn ini_批次1字段映射到位() {
+        let client = r#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+dial_server_timeout = 7
+connect_server_local_ip = 192.168.1.5
+disable_log_color = true
+"#;
+        let cfg = parse_client(client).unwrap();
+        assert_eq!(cfg.dial_server_timeout, 7);
+        assert_eq!(cfg.connect_server_local_ip, "192.168.1.5");
+        assert!(cfg.disable_print_color);
+
+        let server = r#"[common]
+bind_port = 7000
+proxy_bind_addr = 192.168.1.5
+user_conn_timeout = 3
+max_pool_count = 4
+disable_log_color = true
+"#;
+        let cfg = parse_server(server).unwrap();
+        assert_eq!(cfg.proxy_bind_addr, "192.168.1.5");
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(3));
+        assert_eq!(cfg.max_pool_count, 4);
+        assert!(cfg.disable_print_color);
+    }
+
+    /// 限制①批次2：keepalive 组在 legacy INI 里的同名键也要能搬进来 ——
+    /// 客户端 `dial_server_keepalive` / `tcp_mux_keepalive_interval`，
+    /// 服务端 `tcp_mux_keepalive_interval` / `tcp_keepalive`。
+    #[test]
+    fn ini_批次2字段映射到位() {
+        let client = r#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+dial_server_keepalive = 111
+tcp_mux_keepalive_interval = 22
+"#;
+        let cfg = parse_client(client).unwrap();
+        assert_eq!(cfg.dial_server_keepalive, 111);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 22);
+
+        let server = r#"[common]
+bind_port = 7000
+tcp_mux_keepalive_interval = 33
+tcp_keepalive = 444
+"#;
+        let cfg = parse_server(server).unwrap();
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 33);
+        assert_eq!(cfg.tcp_keepalive, 444);
+    }
 
     /// 樱花（SakuraFrp）真实下发的 INI —— 结构与线上那份**逐字一致**，
     /// 只把 token 换成了占位值。

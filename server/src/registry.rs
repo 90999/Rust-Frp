@@ -734,6 +734,20 @@ impl ClientGuard {
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.run_id);
+        // ★★ v0.6.1 修（Shannon 审计，低危）：**会话结束时清掉 OIDC 的 subject 绑定**。
+        //
+        // `forget_session` 早就写好（`security.rs` / `guard.rs` / `oidc.rs`），
+        // 但**除了一处单测，全仓没有任何生产调用点** ⇒
+        // `OidcVerifier::subjects` 这张 `run_id -> sub` 表
+        // **每个 OIDC 会话泄漏一条，直到进程重启**。
+        //
+        // 泄漏的量很小（一条 map 条目），但它同时意味着：
+        // 已经登出的 run_id 仍能在表里查到绑定关系 —— 而 `run_id` 是会被复用的
+        // 语义符号，留着旧绑定没有任何好处。
+        //
+        // 放在 `Drop` 里是为了**覆盖所有退出路径**（正常断开、被踢、panic 展开），
+        // 与上面 `remove` 同一个位置，不会漏。
+        self.registry.security().forget_session(&self.run_id);
     }
 }
 
@@ -743,6 +757,59 @@ mod tests {
     use crate::pool::{self, CtrlCmd};
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// ★★ v0.6.1 回归（Shannon 审计，低危）：**控制连接退出时必须清掉 OIDC 的 subject 绑定。**
+    ///
+    /// # 原先的问题
+    ///
+    /// `forget_session` 早就写好（`security.rs` / `guard.rs` / `oidc.rs` 三层都有），
+    /// 但**除了一处单测，全仓没有任何生产调用点** ——
+    /// `OidcVerifier::subjects` 这张 `run_id -> sub` 表
+    /// **每个会话泄漏一条，直到进程重启**。
+    ///
+    /// # 这条测试测什么
+    ///
+    /// 造一个**真的 OIDC 上下文**（`AuthProvider::Oidc`），手工塞一条绑定，
+    /// 然后 drop 一个 `ClientGuard` —— 绑定必须消失。
+    ///
+    /// ★ 不用 `SecurityContext::from_config`：那条路径在 JWKS 未拉取时会把
+    ///   认证换成 `OidcUnavailable`，`forget_session` 变成空操作，测不到修复点。
+    #[test]
+    fn 控制连接退出必须清掉_oidc_subject_绑定() {
+        use nfrp_common::security::AuthProvider;
+        use std::sync::Arc;
+
+        let r = Arc::new(Registry::unlimited());
+
+        let verifier =
+            nfrp_common::auth::oidc::OidcVerifier::new(nfrp_common::auth::oidc::ServerOidcConfig {
+                issuer: "https://idp.example".into(),
+                ..Default::default()
+            })
+            .expect("构造 OidcVerifier");
+        {
+            let sec = r.security();
+            let mut slot = sec.auth.write().unwrap_or_else(|e| e.into_inner());
+            *slot = AuthProvider::Oidc(verifier.clone());
+        }
+
+        verifier.bind_subject_for_test("run-guard", "alice");
+        assert_eq!(
+            verifier.subject_count(),
+            1,
+            "前置：绑定表里应当有 1 条（否则是测试没跑通，不是修复生效）"
+        );
+
+        {
+            let _guard = ClientGuard::new(r.clone(), "run-guard".to_string());
+        }
+        assert_eq!(
+            verifier.subject_count(),
+            0,
+            "控制连接退出后必须清掉 OIDC subject 绑定\
+             （原先漏了这一步，每个会话泄漏一条直到重启）"
+        );
+    }
 
     fn client(run_id: &str) -> Arc<ClientState> {
         client_with_user("", run_id)
@@ -764,11 +831,13 @@ mod tests {
             user.into(),
             tx,
             Duration::from_secs(60),
+            Duration::from_secs(10),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
+            0,
             proxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))

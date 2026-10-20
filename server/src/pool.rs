@@ -179,12 +179,21 @@ struct PoolState {
 
 impl PoolState {
     /// 丢弃超时的空闲工作连接与排队用户，避免半开连接无限堆积。
-    fn reap(&mut self, timeout: Duration) {
+    ///
+    /// 两个超时是**两个不同的量**（限制①批次1 起拆分）：
+    /// * `work_timeout`（`work_conn_idle_timeout`，nfrp 自有字段）：空闲工作
+    ///   连接在池里能躺多久 —— 躺太久说明客户端预建的连接早已失效；
+    /// * `user_timeout`（`userConnTimeout`，对齐官方 `GetWorkConn()` 默认 10 秒）：
+    ///   排队用户等多久配不到工作连接就放弃。
+    ///
+    /// 原先两者共用 `idle_timeout`：用户连接要傻等 60 秒才被清理，而官方
+    /// 10 秒就放弃了 —— 等得越久，占着内存的半开连接越多。
+    fn reap(&mut self, work_timeout: Duration, user_timeout: Duration) {
         let now = Instant::now();
         while self
             .work
             .front()
-            .map(|w| now.duration_since(w.at) > timeout)
+            .map(|w| now.duration_since(w.at) > work_timeout)
             .unwrap_or(false)
         {
             self.work.pop_front();
@@ -192,7 +201,7 @@ impl PoolState {
         while self
             .users
             .front()
-            .map(|u| now.duration_since(u.at) > timeout)
+            .map(|u| now.duration_since(u.at) > user_timeout)
             .unwrap_or(false)
         {
             self.users.pop_front();
@@ -234,6 +243,12 @@ pub struct ClientState {
     work_notify: tokio::sync::Notify,
     stopped: AtomicBool,
     idle_timeout: Duration,
+    /// 用户连接等待工作连接的超时（对应 frp `userConnTimeout`，官方默认 10 秒）。
+    ///
+    /// ★ 限制①批次1：替掉三处硬编码 —— visitor 路径等 10s、vhost / UDP 路径
+    /// 等 15s、排队用户由 `idle_timeout`（默认 60s）兜底。全部统一到本字段，
+    /// 与官方 `GetWorkConn()` 的语义对齐（等不到工作连接就放弃这条用户连接）。
+    user_conn_timeout: Duration,
     /// 本客户端的同时活跃转发连接上限。
     conn_limit: Limit,
     /// 本客户端的排队上限（用户连接排着等工作连接）。
@@ -278,8 +293,12 @@ pub struct ClientState {
     ///
     /// 复用 `max_pending_per_client` 的语义（"这个客户端的待处理容量"）——
     /// 空闲工作连接与排队用户是**同一枚硬币的两面**（都在等配对），
-    /// 用同一个数封顶最自然，也避免再加一个配置项。
-    /// `0`（默认）= 不限制，**保持向后兼容**（与项目其它 `Limit` 一致）。
+    /// 用同一个数封顶最自然。
+    ///
+    /// ★ 限制①批次1：再叠加官方 `maxPoolCount`（`ServerConfig::max_pool_count`），
+    /// 两者**取更小**（任一为 0 = 该侧不设限；两侧都 0 = 不限制）。官方口径是
+    /// "池容量 = min(客户端 poolCount, maxPoolCount) + 10 余量"，这里映射成
+    /// 空闲池闸门 —— 默认（都没配）时与原行为完全一致。
     idle_work_limit: Limit,
     /// 本客户端可注册的代理数上限。
     proxy_limit: Limit,
@@ -315,11 +334,13 @@ impl ClientState {
         user: String,
         req_tx: mpsc::UnboundedSender<CtrlCmd>,
         idle_timeout: Duration,
+        user_conn_timeout: Duration,
         caps: NfrpCaps,
         udp_binary: bool,
         wire_version: WireVersion,
         conn_limit: Limit,
         backlog_limit: Limit,
+        max_pool_count: usize,
         proxy_limit: Limit,
         peer_ip: IpAddr,
     ) -> Self {
@@ -328,7 +349,17 @@ impl ClientState {
         //   注意要取 `max()` 而不是 clone —— `Limit` 内部是共享信号量，
         //   两处共用一个信号量会把"排队"与"空闲池"互相挤占，
         //   而它们是**两种不同的资源**，各自独立计数才对。
-        let idle_work_limit = Limit::new(backlog_limit.max());
+        //
+        // ★ 限制①批次1：再叠加官方 `maxPoolCount` —— 两个上限**取更小**；
+        //   任一为 0（该侧不设限）就取另一个；都为 0 = 不限制。
+        let backlog_max = backlog_limit.max();
+        let idle_cap = match (backlog_max, max_pool_count) {
+            (0, 0) => 0,
+            (0, m) => m,
+            (b, 0) => b,
+            (b, m) => b.min(m),
+        };
+        let idle_work_limit = Limit::new(idle_cap);
         Self {
             run_id,
             client_id,
@@ -342,6 +373,7 @@ impl ClientState {
             work_notify: tokio::sync::Notify::new(),
             stopped: AtomicBool::new(false),
             idle_timeout,
+            user_conn_timeout,
             conn_limit,
             backlog_limit,
             idle_work_limit,
@@ -482,10 +514,18 @@ impl ClientState {
         let _ = self.req_tx.send(CtrlCmd::Send(Box::new(msg)));
     }
 
-    /// 主动取一条工作连接：池里没有就向客户端要，并等待它到来。
+    /// 主动取一条工作连接：池里没有就向客户端要，并等待 `user_conn_timeout`
+    /// （对应官方 `userConnTimeout`，默认 10 秒）。
     ///
     /// UDP 代理和 HTTP 代理都不是"用户连进来才要连接"，必须自己发起。
-    pub async fn acquire_work_conn(self: &Arc<Self>, wait: Duration) -> Option<WorkItem> {
+    /// 访问方（vhost / visitor / UDP）一律走这个入口 —— 超时预算由服务端
+    /// 配置决定，而不是各处硬编码。
+    pub async fn acquire_work_conn(self: &Arc<Self>) -> Option<WorkItem> {
+        self.acquire_work_conn_within(self.user_conn_timeout).await
+    }
+
+    /// 同 [`Self::acquire_work_conn`]，但**显式指定**等待时长（测试 / 特殊路径用）。
+    pub async fn acquire_work_conn_within(self: &Arc<Self>, wait: Duration) -> Option<WorkItem> {
         if let Some(w) = self
             .pool
             .lock()
@@ -526,7 +566,7 @@ impl ClientState {
     /// 而不是让它无限排队（那是另一种形式的资源耗尽）。
     pub fn submit_user(&self, mut user: PendingUser) -> Submit {
         let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        g.reap(self.idle_timeout);
+        g.reap(self.idle_timeout, self.user_conn_timeout);
         if let Some(w) = g.work.pop_front() {
             return Submit::Paired(Box::new(PairedBox { user, work: w }));
         }
@@ -569,7 +609,7 @@ impl ClientState {
     pub fn submit_work(&self, w: WorkItem) -> Option<PairedBox> {
         let paired = {
             let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            g.reap(self.idle_timeout);
+            g.reap(self.idle_timeout, self.user_conn_timeout);
             match g.users.pop_front() {
                 Some(u) => Some(PairedBox { user: u, work: w }),
                 None => {
@@ -650,11 +690,13 @@ pub(crate) fn dummy_client(run_id: &str) -> Arc<ClientState> {
         String::new(),
         tx,
         Duration::from_secs(60),
+        Duration::from_secs(10),
         Default::default(),
         false,
         nfrp_common::frp::WireVersion::V1,
         Limit::unlimited(),
         Limit::unlimited(),
+        0,
         Limit::unlimited(),
         "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
     ))
@@ -698,11 +740,13 @@ mod tests {
             String::new(),
             tx,
             Duration::from_secs(60),
+            Duration::from_secs(10),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
+            0,
             proxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
@@ -770,11 +814,14 @@ mod tests {
             String::new(),
             tx,
             Duration::from_millis(50),
+            // 用户侧超时给足：本用例测的是 work 侧回收，"新来的连接必须留住"
+            Duration::from_secs(60),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             Limit::unlimited(),
             Limit::unlimited(),
+            0,
             Limit::unlimited(),
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         );
@@ -786,6 +833,79 @@ mod tests {
         c.submit_user(user("fresh", Instant::now()));
         assert_eq!(c.idle_work_conns(), 0, "过期的工作连接应被回收");
         assert_eq!(c.backlog(), 1, "新来的连接必须留住");
+    }
+
+    /// 限制①批次1：`maxPoolCount` 给空闲池封顶 —— 第二条空闲工作连接被拒，
+    /// 池里的数量保持在 1（不配上限时它会是 2）。
+    #[test]
+    fn max_pool_count_给空闲池封顶() {
+        let (tx, rx) = mpsc::unbounded_channel::<CtrlCmd>();
+        std::mem::forget(rx);
+        let c = ClientState::new(
+            "mp".into(),
+            "mp".into(),
+            String::new(),
+            tx,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Default::default(),
+            false,
+            nfrp_common::frp::WireVersion::V1,
+            Limit::unlimited(),
+            Limit::unlimited(),
+            1, // max_pool_count = 1
+            Limit::unlimited(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        );
+        let t = now();
+        assert!(c.submit_work(work(t)).is_none(), "第一条进空闲池");
+        assert_eq!(c.idle_work_conns(), 1);
+        assert!(
+            c.submit_work(work(t)).is_none(),
+            "第二条被拒（拒绝路径同样返回 None）"
+        );
+        assert_eq!(c.idle_work_conns(), 1, "上限 = 1 时池不能涨到 2");
+
+        // 排队用户仍然能正常配对（配对路径不占用空闲名额）
+        assert!(matches!(c.submit_user(user("ssh", t)), Submit::Paired(_)));
+    }
+
+    /// 限制①批次1：排队用户按 `userConnTimeout` 回收，与工作连接侧的超时分开。
+    #[test]
+    fn 排队用户按_user_conn_timeout_回收() {
+        let (tx, rx) = mpsc::unbounded_channel::<CtrlCmd>();
+        std::mem::forget(rx);
+        let c = ClientState::new(
+            "uc".into(),
+            "uc".into(),
+            String::new(),
+            tx,
+            // 工作连接侧给足，本用例只测用户侧
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+            Default::default(),
+            false,
+            nfrp_common::frp::WireVersion::V1,
+            Limit::unlimited(),
+            Limit::unlimited(),
+            0,
+            Limit::unlimited(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        );
+        assert!(matches!(
+            c.submit_user(user("slow", Instant::now())),
+            Submit::Queued
+        ));
+        assert_eq!(c.backlog(), 1);
+
+        std::thread::sleep(Duration::from_millis(90));
+        // 工作连接到来时顺带 reap：排队的用户已超时被丢，工作连接无人可配 ⇒ 进池
+        assert!(
+            c.submit_work(work(Instant::now())).is_none(),
+            "用户已被回收，工作连接应进池而不是配对"
+        );
+        assert_eq!(c.backlog(), 0, "超时的用户必须被回收");
+        assert_eq!(c.idle_work_conns(), 1);
     }
 
     #[test]
@@ -936,7 +1056,7 @@ mod tests {
     async fn acquire_work_conn_times_out_without_client() {
         let c = dummy_client("c8");
         let started = Instant::now();
-        let r = c.acquire_work_conn(Duration::from_millis(120)).await;
+        let r = c.acquire_work_conn_within(Duration::from_millis(120)).await;
         assert!(r.is_none(), "客户端一直不来工作连接时应超时返回 None");
         assert!(started.elapsed() >= Duration::from_millis(100));
     }
@@ -951,7 +1071,7 @@ mod tests {
         });
         let r = tokio::time::timeout(
             Duration::from_secs(2),
-            c.acquire_work_conn(Duration::from_secs(2)),
+            c.acquire_work_conn_within(Duration::from_secs(2)),
         )
         .await
         .expect("不应超时");

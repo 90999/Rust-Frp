@@ -335,6 +335,19 @@ pub struct ServerConfig {
     #[serde(skip)]
     pub bind_addr_explicitly_set: bool,
 
+    /// 代理（公网端口 / 虚拟主机 / tcpmux）的监听地址（对应 frp `proxyBindAddr`）。
+    ///
+    /// 与官方一致：**留空（默认）时跟随 `bind_addr`**（官方 `Complete()`：
+    /// `if ProxyBindAddr == "" { ProxyBindAddr = BindAddr }`）。
+    /// 配上之后 tcp/udp 的 remote_port 监听、http/https 虚拟主机、
+    /// tcpmux 的 CONNECT 端口都绑到它上面；控制端口 / 工作端口 / 面板 /
+    /// VirtualNet 仍然绑 `bind_addr`（与官方 `service.go` 的用法一致）。
+    ///
+    /// 典型用途：控制端口开在 `0.0.0.0`，而公网代理端口只想开在
+    /// 内网网卡或某个特定地址上。
+    #[serde(default)]
+    pub proxy_bind_addr: String,
+
     /// 控制端口：客户端在这里建控制连接。
     #[serde(default = "default_control_port")]
     pub control_port: u16,
@@ -354,6 +367,67 @@ pub struct ServerConfig {
     /// 池中空闲工作连接的存活时间（秒）。
     #[serde(default = "default_work_conn_idle_timeout")]
     pub work_conn_idle_timeout: u64,
+
+    /// 用户连接等待工作连接的超时（秒，对应 frp `userConnTimeout`，官方默认 10）。
+    ///
+    /// 官方 `GetWorkConn()`：池里没有空闲工作连接时向客户端要一条，最多等
+    /// `userConnTimeout` 秒，超时就关掉这条用户连接（`timeout trying to get
+    /// work connection`）。nfrp 的对应路径：TCP 用户连接的排队回收 + vhost /
+    /// UDP / visitor 的 `acquire_work_conn`，全部由它决定。
+    ///
+    /// `0` 按官方 `Complete()` 的 `util.EmptyOr(..., 10)` 口径**折算为 10 秒**
+    /// —— 而不是"不限"：不设等待上限会让对端瘫掉时用户连接永远挂着。
+    /// 取值入口见 [`ServerConfig::user_conn_timeout`]。
+    #[serde(default = "default_user_conn_timeout")]
+    pub user_conn_timeout: u64,
+
+    /// 单个客户端**空闲工作连接池**的上限（对应 frp `maxPoolCount`）。
+    ///
+    /// 官方语义（`server/control.go`）：`effectivePoolCount = min(客户端
+    /// Login.poolCount, 本项)`，空闲池容量 = 该值 + 10 的余量，超出即拒。
+    /// nfrp 把它落到空闲池闸门上（C-2 修的 `idle_work_limit`），与
+    /// `max_pending_per_client` 同口径**取更小者**。
+    ///
+    /// `0`（默认）= 不限制 —— 保持向后兼容（与项目其它 `Limit` 一致）。
+    /// ★ 与官方的默认值 5 **不同**：官方不写就是 5（+10 余量），nfrp 不写
+    ///   就是不限制；只有显式写入才生效。官方配置原样搬过来时照常起作用。
+    #[serde(default)]
+    pub max_pool_count: usize,
+
+    /// yamux 会话的保活间隔（秒，对应 frp `tcpMuxKeepaliveInterval`，官方默认 30）。
+    ///
+    /// 官方把该值交给 Go yamux：每 `interval` 秒向对端发一个 Ping，超时收不到
+    /// Pong 就关会话。rust-yamux **没有** keepalive API（0.13 / 0.14 均无），
+    /// nfrp 落成等价看门狗：驱动器持续轮询，让 crate 自带的 yamux Ping/Pong
+    /// 保持流动，同时盯载体流**有没有从对端读到任何字节** —— 静默超过
+    /// `interval + 10` 秒（10 秒对齐官方 yamux 的 Pong 超时
+    /// `ConnectionWriteTimeout`）、且不低于 30 秒，即判定会话已死并关闭
+    /// （所有流一起断开，客户端按既有逻辑重连）。健康会话的静默上限 ≈ 10~12
+    /// 秒，下限 30 秒保证不会误杀。
+    ///
+    /// 对官方对端完全互通：官方 yamux 的 Ping 由 crate 原生应答，反向的
+    /// Ping/Pong 也照常流动，本看门狗只是补上"静默即断"的判定。
+    ///
+    /// `0` 表示**关闭看门狗**（行为回到 v0.5.10 基线）—— 项目约定
+    /// "0 = 关掉这项"；官方把 0 折算成 30，这里不复刻。
+    ///
+    /// 只在 `tcp_mux = true` 时有意义（官方注释同）。
+    #[serde(default = "default_tcp_mux_keepalive_interval")]
+    pub tcp_mux_keepalive_interval: u64,
+
+    /// 控制口接下的 TCP 连接的 keepalive 空闲时长（秒，对应 frp
+    /// `tcpKeepalive`，官方默认 7200）。
+    ///
+    /// 官方在 `bind_port` 主监听器上 `SetKeepAlive` —— 即**所有从主端口接下的
+    /// TCP 连接**（控制连接、v1 协议下客户端拨入的工作连接等）。nfrp 在
+    /// accept 之后对每条连接做同样的事（`SO_KEEPALIVE` + 空闲时长）。
+    ///
+    /// `0` 表示**不打开**（内核默认行为）；官方把 0 折算成 7200，这里不复刻。
+    ///
+    /// 只作用于 TCP 主端口；vhost / dashboard 端口与 KCP / QUIC 不受影响
+    /// （与官方只包装主监听器一致）。
+    #[serde(default = "default_tcp_keepalive")]
+    pub tcp_keepalive: u64,
 
     /// frp 兼容模式端口（控制连接与工作连接复用同一个端口）。
     /// 未配置时回退到 `control_port`。
@@ -439,6 +513,14 @@ pub struct ServerConfig {
     /// 日志保留天数（对应 frp `log.maxDays`，默认 3；`<= 0` = 不清理）。
     #[serde(default = "default_log_max_days")]
     pub max_days: i64,
+
+    /// 禁用控制台日志的 ANSI 颜色（对应 frp `log.disablePrintColor`）。
+    ///
+    /// 默认 false = 跟随官方行为（输出到**终端**才上色，写文件本来就不上色）；
+    /// 置 true 后即使输出是终端也不上色 —— 给"终端里重定向 stdout"这类
+    /// 场景一个显式开关。
+    #[serde(default)]
+    pub disable_print_color: bool,
 
     // ---- 资源上限（0 = 不限，默认全部不限制以保持向后兼容）----
     /// 全局同时活跃的转发连接数上限。
@@ -763,6 +845,32 @@ impl ServerConfig {
         (self.vhost_http_timeout > 0)
             .then(|| std::time::Duration::from_secs(self.vhost_http_timeout))
     }
+
+    /// 数据面实际生效的监听地址：代理端口 / 虚拟主机 / tcpmux 都绑它
+    /// （对应 frp `proxyBindAddr`）。
+    ///
+    /// 与官方一致：**空 = 跟随 `bind_addr`**（官方 `Complete()` 的
+    /// `if ProxyBindAddr == "" { ProxyBindAddr = BindAddr }`）。
+    pub fn effective_proxy_bind_addr(&self) -> &str {
+        if self.proxy_bind_addr.trim().is_empty() {
+            &self.bind_addr
+        } else {
+            &self.proxy_bind_addr
+        }
+    }
+
+    /// 用户连接等待工作连接的超时（对应 frp `userConnTimeout`，官方默认 10 秒）。
+    ///
+    /// `0` 按官方 `Complete()` 的 `util.EmptyOr(..., 10)` 口径**折算为默认值 10**，
+    /// 而不是"不限" —— 不设等待上限会让对端瘫掉时用户连接永远挂着。
+    pub fn user_conn_timeout(&self) -> std::time::Duration {
+        let secs = if self.user_conn_timeout == 0 {
+            10
+        } else {
+            self.user_conn_timeout
+        };
+        std::time::Duration::from_secs(secs)
+    }
 }
 
 /// **唯一判据**：这对面板 / 管理界面凭据能不能用来鉴权（v0.5.6 修审计总报告 H1）。
@@ -925,11 +1033,17 @@ impl Default for ServerConfig {
             bind_addr: default_bind_addr(),
             // 默认（没从文件读过）⇒ 视为"用户没显式写过"
             bind_addr_explicitly_set: false,
+            // 空 = 跟随 bind_addr（与官方 proxyBindAddr 的语义一致）
+            proxy_bind_addr: String::new(),
             control_port: default_control_port(),
             work_port: default_work_port(),
             token: String::new(),
             heartbeat_timeout: default_heartbeat_timeout(),
             work_conn_idle_timeout: default_work_conn_idle_timeout(),
+            user_conn_timeout: default_user_conn_timeout(),
+            max_pool_count: 0,
+            tcp_mux_keepalive_interval: default_tcp_mux_keepalive_interval(),
+            tcp_keepalive: default_tcp_keepalive(),
             bind_port: None,
             protocol: Protocol::default(),
             tcp_mux: true,
@@ -944,6 +1058,7 @@ impl Default for ServerConfig {
             log_level: default_log_level(),
             log_to: String::new(),
             max_days: default_log_max_days(),
+            disable_print_color: false,
             transport_protocol: default_transport_protocol(),
             kcp_bind_port: None,
             max_total_conns: 0,
@@ -1170,6 +1285,29 @@ pub struct ProxyConfig {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub metas: std::collections::HashMap<String, String>,
 
+    // ---- 启用开关 / 注解（frp 0.71 的 ProxyBaseConfig）----
+    /// 是否启用这条代理（对应 frp `enabled`；`None` / `true` = 启用，`false` = 禁用）。
+    ///
+    /// 官方语义（`pkg/config/load.go` 的 `FilterClientConfigurers`）：`enabled = false`
+    /// 的代理 / 访客在**加载期**就被摘掉，之后完全等同于"没配" —— 不注册、
+    /// 不进本地表、不进面板。nfrp 在 [`parse_client`] 里做同一件事。
+    ///
+    /// 用 `Option<bool>` 而不是 `bool` + `serde(default = "true")`：
+    /// `ProxyConfig` 有 `#[derive(Default)]`，bool 版本会让"程序内构造"与
+    /// "从配置反序列化"得到**两个不同的默认值**（v0.5.6 修 L1 的教训）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// 注解键值对（对应 frp `annotations`）。
+    ///
+    /// 官方语义：随 `NewProxy` 消息带给服务端（`m.Annotations = c.Annotations`，
+    /// `pkg/config/v1/proxy.go:176`），官方 frps 0.71 只把它存进代理对象、
+    /// **不做任何解读**（`server/` 下没有任何读取点）。
+    /// 客户端侧做与官方 [`crate::config`] 内同款校验（Kubernetes 风格键名 +
+    /// 总大小 ≤256 KiB，见 `reject_bad_annotations`）。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub annotations: std::collections::HashMap<String, String>,
+
     // ---- 负载均衡分组 ----
     /// 组名：同名组的多个代理可以**共享同一个 remote_port**，
     /// 服务端把用户连接按轮询分摊到组内各后端（官方 frp 的 `loadBalancer.group`）。
@@ -1391,6 +1529,13 @@ pub struct VisitorConfig {
     /// 官方配置在解析阶段就 `invalid value: integer -1, expected u16` 直接失败。
     #[serde(default, alias = "bindPort")]
     pub bind_port: i32,
+
+    /// 是否启用这个 visitor（对应 frp `enabled`；`None` / `true` = 启用）。
+    ///
+    /// 语义与 [`ProxyConfig::enabled`] 相同：官方 `FilterClientConfigurers`
+    /// 对访客同样过滤，禁用条目在加载期直接摘掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 impl Default for VisitorConfig {
@@ -1406,6 +1551,8 @@ impl Default for VisitorConfig {
             //   在 `Default::default()` 与反序列化两条路径下会得到不同结果。
             bind_addr: default_visitor_bind_addr(),
             bind_port: 0,
+            // 与 serde 保持一致：`None` / `true` = 启用
+            enabled: None,
         }
     }
 }
@@ -1598,10 +1745,63 @@ pub struct ClientConfig {
     #[serde(default = "default_log_max_days")]
     pub max_days: i64,
 
+    /// 禁用控制台日志的 ANSI 颜色（对应 frp `log.disablePrintColor`）。
+    ///
+    /// 默认 false = 跟随官方行为（输出到**终端**才上色，写文件本来就不上色）；
+    /// 置 true 后即使输出是终端也不上色。
+    #[serde(default)]
+    pub disable_print_color: bool,
+
     // ---- 传输层 ----
     /// 与服务端之间的传输协议：`tcp`（默认）或 `quic`，需与服务端一致。
     #[serde(default = "default_transport_protocol")]
     pub transport_protocol: String,
+
+    /// 连接服务端的超时（秒，对应 frp `dialServerTimeout`，官方默认 10）。
+    ///
+    /// 控制连接、以及 `tcpMux = false` 时每条新拨的工作连接都走它
+    /// （官方 connector 的 `WithTimeout` 对两者同样生效）。
+    /// KCP / QUIC 是另一条路，不受它影响（官方同）。
+    ///
+    /// `0` = 不限（跟随系统默认超时）—— 与项目其它超时项"0 = 关掉这项"
+    /// 的约定一致。注意官方把 0 折算成默认 10（`EmptyOr`），这里不复刻该
+    /// 折算：写 0 的意图就是明确关掉。
+    #[serde(default = "default_dial_server_timeout")]
+    pub dial_server_timeout: u64,
+
+    /// 连接服务端时绑定的本地 IP（对应 frp `connectServerLocalIP`）。
+    ///
+    /// 多网卡 / 多出口的机器用它指定走哪块网卡。可以只写 IP
+    /// （本地端口自动取 0），也可以写 `IP:端口`。官方注释：仅 TCP /
+    /// WebSocket 协议有效、KCP 不支持 —— nfrp 同样只在 TCP 拨号路径生效。
+    #[serde(default)]
+    pub connect_server_local_ip: String,
+
+    /// 到服务端的 TCP 连接的 keepalive 空闲时长（秒，对应 frp
+    /// `dialServerKeepalive`，官方默认 7200）。
+    ///
+    /// 官方把它挂在拨号器上（`libnet.WithKeepAlive`），**控制连接与每条新拨的
+    /// 工作连接**都生效（`tcp_mux = true` 时只有一条 yamux 载体）。nfrp 在
+    /// 客户端 `dial_server`（main.rs）建连成功后给 socket 打开 `SO_KEEPALIVE`
+    /// 并把空闲时长设为该值 —— 连接空闲这么久后内核开始探活，对端无响应则由
+    /// 内核断开。
+    ///
+    /// `0` 表示**不打开**（内核默认行为）—— 项目约定"0 = 关掉这项"；
+    /// 官方把 0 折算成 7200，这里不复刻。
+    ///
+    /// 只对 TCP / WebSocket 拨号生效；KCP / QUIC 是 UDP，没有 TCP keepalive。
+    #[serde(default = "default_dial_server_keepalive")]
+    pub dial_server_keepalive: u64,
+
+    /// yamux 会话的保活间隔（秒，对应 frp `tcpMuxKeepaliveInterval`，官方默认 30）。
+    ///
+    /// 语义与落法见服务端 [`ServerConfig::tcp_mux_keepalive_interval`] 的说明
+    /// （两边同源：官方在 client connector 与 server service 上设置同一个值）。
+    /// 客户端侧的不同点：`tcp_mux = false` 时没有 yamux 会话，这一项无意义。
+    ///
+    /// `0` = 关闭看门狗（行为回到 v0.5.10 基线）。
+    #[serde(default = "default_tcp_mux_keepalive_interval")]
+    pub tcp_mux_keepalive_interval: u64,
 
     // ---- xtcp 真 P2P ----
     /// 服务端牵线（rendezvous）用的 UDP 端口，需与服务端 `p2p_port` 一致。
@@ -1729,7 +1929,12 @@ impl Default for ClientConfig {
             log_level: default_log_level(),
             log_to: String::new(),
             max_days: default_log_max_days(),
+            disable_print_color: false,
             transport_protocol: default_transport_protocol(),
+            dial_server_timeout: default_dial_server_timeout(),
+            connect_server_local_ip: String::new(),
+            dial_server_keepalive: default_dial_server_keepalive(),
+            tcp_mux_keepalive_interval: default_tcp_mux_keepalive_interval(),
             p2p_port: None,
             p2p_enable: true,
             xtcp_transport: default_xtcp_transport(),
@@ -2128,6 +2333,26 @@ fn default_log_max_days() -> i64 {
 fn default_vhost_http_timeout() -> u64 {
     DEFAULT_VHOST_HTTP_TIMEOUT
 }
+/// 客户端连接服务端的默认超时（官方 `dialServerTimeout` 默认 10 秒）。
+fn default_dial_server_timeout() -> u64 {
+    10
+}
+/// 服务端等"用户连接配工作连接"的默认超时（官方 `userConnTimeout` 默认 10 秒）。
+fn default_user_conn_timeout() -> u64 {
+    10
+}
+/// 客户端拨号 TCP 连接的 keepalive 空闲时长（官方 `dialServerKeepalive` 默认 7200 秒）。
+fn default_dial_server_keepalive() -> u64 {
+    7200
+}
+/// yamux 会话保活间隔（官方 `tcpMuxKeepaliveInterval` 默认 30 秒）。
+fn default_tcp_mux_keepalive_interval() -> u64 {
+    30
+}
+/// 服务端主端口 TCP 连接的 keepalive 空闲时长（官方 `tcpKeepalive` 默认 7200 秒）。
+fn default_tcp_keepalive() -> u64 {
+    7200
+}
 /// 代理类型默认 tcp。
 fn default_proxy_type() -> String {
     "tcp".to_string()
@@ -2179,7 +2404,19 @@ pub fn parse_client(raw: &str) -> Result<ClientConfig> {
     } else {
         parse_client_toml(raw)?
     };
+    // ① 解码类检查（官方在解码阶段就报错的项）：必须跑在 enabled 过滤**之前**
+    //    —— `enabled = false` 不能把未知类型变成合法（官方同样如此）。
     reject_unimplemented_types(&cfg)?;
+    // ② `enabled = false` 的代理 / 访客在这里摘掉，之后完全等同于"没配"
+    //    （官方 `pkg/config/load.go` 的 `FilterClientConfigurers`，对代理和
+    //    访客都过滤）。INI 路径没有 enabled 键，这两行是无操作。
+    cfg.proxies.retain(|p| p.enabled.unwrap_or(true));
+    cfg.visitors.retain(|v| v.enabled.unwrap_or(true));
+    // ③ 结构化校验（官方在过滤**之后**做）：tcpmux 约束 + `annotations`。
+    //    放这里而不是 ① 里，是为了让"先禁用、之后再补全"的配置块能留在文件里。
+    for p in &cfg.proxies {
+        reject_structured_proxy(p)?;
+    }
     // 逐条把"官方有、NFrp 没实现"的字段名打到日志上（见 UNSUPPORTED_CLIENT_FIELDS）。
     // 这里只是**采集**，打日志交给调用方（库层不该直接往 stdout 写）。
     cfg.unsupported_fields.sort();
@@ -2297,8 +2534,13 @@ pub fn unimplemented_plugin_types() -> Vec<&'static str> {
         .collect()
 }
 
-/// 单条代理的类型 + 插件 + tcpmux 自检（配置文件与远程下发共用）。
-fn reject_bad_proxy(p: &ProxyConfig) -> Result<()> {
+/// 单条代理的**解码类**自检：类型 + 插件。
+///
+/// "解码类" = 官方在 JSON 解码阶段就会报错的项（`pkg/config/v1/decode.go` 的
+/// `unknown proxy type` / `unknown plugin type`）。因此它在 [`parse_client`] 里
+/// 必须跑在 `enabled = false` **过滤之前** —— 官方同样如此：解码先于
+/// `FilterClientConfigurers`，`enabled = false` 不能把未知类型变成合法。
+fn reject_decoded_proxy(p: &ProxyConfig) -> Result<()> {
     if !SUPPORTED_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
         return Err(crate::error::Error::Protocol(format!(
             "代理 [{}] 的类型 {:?} 不受支持（NFrp 实现了 {}）",
@@ -2307,13 +2549,30 @@ fn reject_bad_proxy(p: &ProxyConfig) -> Result<()> {
             SUPPORTED_PROXY_TYPES.join(" / ")
         )));
     }
-    reject_unimplemented_plugin(p)?;
-    reject_bad_tcpmux(p)
+    reject_unimplemented_plugin(p)
 }
 
+/// 单条代理的**结构化**校验：tcpmux 约束 + 注解。
+///
+/// 与 [`reject_decoded_proxy`] 分开是因为二者在官方流程里的**时机不同**：
+/// 解码检查在 enabled 过滤**前**，结构化校验（`ValidateClientConfig` 一族）
+/// 在过滤**后** —— 所以"禁用但暂时不完整"的配置块不该被这两项拦住。
+/// 见 [`parse_client`] 里的执行顺序。
+fn reject_structured_proxy(p: &ProxyConfig) -> Result<()> {
+    reject_bad_tcpmux(p)?;
+    reject_bad_annotations(p)
+}
+
+/// 单条代理的完整自检（类型 + 插件 + tcpmux + 注解），远程下发路径共用。
+fn reject_bad_proxy(p: &ProxyConfig) -> Result<()> {
+    reject_decoded_proxy(p)?;
+    reject_structured_proxy(p)
+}
+
+/// 解析路径的**解码类**检查（未知代理 / 访客 / 插件类型）。
 fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for p in &cfg.proxies {
-        reject_bad_proxy(p)?;
+        reject_decoded_proxy(p)?;
     }
     for v in &cfg.visitors {
         if !SUPPORTED_VISITOR_TYPES.contains(&v.visitor_type.as_str()) {
@@ -2706,6 +2965,108 @@ fn is_loopback_host(host: &str) -> bool {
         // 解析不出（域名，含 `localhost`）⇒ 从严当作"非本机"
         Err(_) => false,
     }
+}
+
+/// `annotations` 校验，对齐官方 `ValidateAnnotations`（`pkg/config/v1/validation/proxy.go:243`）。
+///
+/// 规则（与官方逐条对应）：
+/// 1. 键先**整体转小写**再校验（官方 `validation.IsQualifiedName(strings.ToLower(k))`），
+///    所以键里写大写字母不会报错；
+/// 2. 键是 Kubernetes 风格的 qualified name：`[前缀/]名字` —— 前缀（可选）是
+///    ≤253 字符的 DNS 子域，名字 ≤63 字符、以字母数字开头结尾、中间可含 `- _ .`；
+///    多于一个 `/` 不合法；
+/// 3. 全部键值对的**总字节数**（键 + 值）不超过 256 KiB（官方
+///    `TotalAnnotationSizeLimitB = 256 * (1 << 10)`）。
+///
+/// 官方 frps 对随 `NewProxy` 收到的注解只存不查（`server/` 下没有任何读取点，
+/// 0.71 实测），所以只需要管客户端侧这一遍。
+fn reject_bad_annotations(p: &ProxyConfig) -> Result<()> {
+    if p.annotations.is_empty() {
+        return Ok(());
+    }
+    let mut total: usize = 0;
+    for (k, v) in &p.annotations {
+        total = total.saturating_add(k.len()).saturating_add(v.len());
+        if let Some(reason) = annotation_key_error(k) {
+            return Err(crate::error::Error::Protocol(format!(
+                "代理 [{}] 的注解键 {k:?} 不合法：{reason}",
+                p.name
+            )));
+        }
+    }
+    /// 与官方 `TotalAnnotationSizeLimitB` 一致：256 KiB。
+    const ANNOTATION_SIZE_LIMIT: usize = 256 * (1 << 10);
+    if total > ANNOTATION_SIZE_LIMIT {
+        return Err(crate::error::Error::Protocol(format!(
+            "代理 [{}] 的 annotations 总大小 {total} 字节，超过官方上限 256 KiB（{ANNOTATION_SIZE_LIMIT} 字节）",
+            p.name
+        )));
+    }
+    Ok(())
+}
+
+/// 单个注解键的合格性检查，返回 `Some(原因)` 表示不合格。
+///
+/// 逐条对齐 Kubernetes `validation.IsQualifiedName`（官方直接调用它，且
+/// **先做 `strings.ToLower`**）：格式为 `[前缀/]名字`。
+fn annotation_key_error(key: &str) -> Option<String> {
+    let lower = key.to_lowercase();
+    let parts: Vec<&str> = lower.split('/').collect();
+    let name = match parts.as_slice() {
+        [name] => *name,
+        [prefix, name] => {
+            if prefix.is_empty() {
+                return Some("`/` 前面不能为空".to_string());
+            }
+            if !is_dns1123_subdomain(prefix) {
+                return Some(format!(
+                    "前缀 {prefix:?} 不是合法的 DNS 子域（小写字母数字与 `-`、`.`，\
+                     每段以字母数字开头结尾且 ≤63 字符，总长 ≤253）"
+                ));
+            }
+            *name
+        }
+        _ => return Some("最多只能有一个 `/`（格式 `前缀/名字`）".to_string()),
+    };
+    if !is_qualified_name_part(name) {
+        return Some(format!(
+            "名字 {name:?} 不合法（字母数字开头结尾，中间可含 `- _ .`，长度 ≤63）"
+        ));
+    }
+    None
+}
+
+/// DNS-1123 子域：点分标签，每个标签是 DNS-1123 label，总长 ≤253。
+fn is_dns1123_subdomain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(is_dns1123_label)
+}
+
+/// DNS-1123 label：`[a-z0-9]` 开头结尾，中间可含 `-`，长度 ≤63。
+fn is_dns1123_label(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let b = s.as_bytes();
+    let edge = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    edge(b[0]) && edge(b[b.len() - 1]) && b.iter().all(|&c| edge(c) || c == b'-')
+}
+
+/// Kubernetes qualified-name 的"名字"部分（不含前缀）：
+/// 字母数字开头结尾、中间可含 `[-_.]`，长度 ≤63。
+///
+/// 注意名字部分**不是** DNS label —— 它允许大写、`_` 和 `.`
+/// （官方先整体小写，所以实践上等效于允许 `[a-z0-9._-]` 这些字符）。
+fn is_qualified_name_part(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let b = s.as_bytes();
+    let alnum = |c: u8| c.is_ascii_alphanumeric();
+    let mid = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.');
+    alnum(b[0]) && alnum(b[b.len() - 1]) && b.iter().all(|&c| mid(c))
 }
 
 /// `tcpmux` 的两条必填约束，对齐官方 `validateTCPMuxProxyConfigForClient`。

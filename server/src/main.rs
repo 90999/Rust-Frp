@@ -122,9 +122,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     // 开了热重载就用可替换的日志过滤器，这样改 log_level 不用重启
     let log_handle = if cfg.hot_reload {
-        util::init_tracing_reloadable(&level, &cfg.log_to, cfg.max_days)
+        util::init_tracing_reloadable(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color)
     } else {
-        util::init_tracing(&level, &cfg.log_to, cfg.max_days);
+        util::init_tracing(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color);
         None
     };
 

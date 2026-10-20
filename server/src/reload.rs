@@ -137,6 +137,24 @@ pub fn apply_dynamic(
     changed("bind_port", old.bind_port != new.bind_port);
     changed("control_port", old.control_port != new.control_port);
     changed("work_port", old.work_port != new.work_port);
+    // 数据面监听地址 + 用户连接超时 + 空闲池上限（限制①批次1）：三者都固化在
+    // 每个 `ClientState` / 监听器里，热改没法让已建立的会话回头生效。
+    changed(
+        "proxy_bind_addr",
+        old.proxy_bind_addr != new.proxy_bind_addr,
+    );
+    changed(
+        "user_conn_timeout",
+        old.user_conn_timeout != new.user_conn_timeout,
+    );
+    changed("max_pool_count", old.max_pool_count != new.max_pool_count);
+    // TCP keepalive / yamux 保活（限制①批次2）：都固化在监听器与已建会话上，
+    // 热改没法回头生效。
+    changed(
+        "tcp_mux_keepalive_interval",
+        old.tcp_mux_keepalive_interval != new.tcp_mux_keepalive_interval,
+    );
+    changed("tcp_keepalive", old.tcp_keepalive != new.tcp_keepalive);
     changed("token", old.token != new.token);
     changed("protocol", old.protocol != new.protocol);
     changed("tcp_mux", old.tcp_mux != new.tcp_mux);
@@ -203,6 +221,11 @@ pub fn apply_dynamic(
     );
     changed("log_to", old.log_to != new.log_to);
     changed("max_days", old.max_days != new.max_days);
+    // `disablePrintColor` 同属日志订阅者，只能启动时固化（限制①批次1 实现）。
+    changed(
+        "disable_print_color",
+        old.disable_print_color != new.disable_print_color,
+    );
 
     out
 }

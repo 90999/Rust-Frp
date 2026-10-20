@@ -80,9 +80,6 @@ impl SeenVisitorIps {
 /// 心跳间隔必须小于它。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// 向客户端索要工作连接的等待上限。
-const WORK_CONN_WAIT: Duration = Duration::from_secs(15);
-
 /// 启动一个 UDP 代理：绑定 UDP 端口并持续维护"专用工作连接"。
 ///
 /// ★★ v0.5.9 修（第九轮审计 **E9-0**，中危）：新增 `sec` 参数。
@@ -118,7 +115,8 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let work = match client.acquire_work_conn(WORK_CONN_WAIT).await {
+            // 等待时长由服务端 `userConnTimeout`（默认 10 秒）决定。
+            let work = match client.acquire_work_conn().await {
                 Some(w) => w,
                 None => {
                     if client.is_stopped() {

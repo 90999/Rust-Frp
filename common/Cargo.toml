@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"   # 用本 crate 的 README（根 README 含相对路径，crates.io 上会破图）
 keywords = ["frp", "proxy", "tunnel", "protocol", "nat"]
 categories = ["network-programming"]
 
@@ -20,6 +20,7 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
 libc = { workspace = true }
+socket2 = { workspace = true }
 webpki-roots = { workspace = true }
 
 aes-gcm = { workspace = true }

@@ -338,11 +338,15 @@ pub async fn serve_on_with(
             (cfg.vhost_https_port, vhost::VhostKind::Https),
             (cfg.tcpmux_http_connect_port, vhost::VhostKind::TcpMux),
         ];
+        // ★ 限制①批次1：vhost 的 HTTP/HTTPS/tcpmux 监听跟随 `proxyBindAddr`
+        //   （官方 `ProxyBindAddr` 的作用范围之一就是 vhost 端口；留空时
+        //   = `bindAddr`，行为与老版本一致）。
+        let proxy_host = cfg.effective_proxy_bind_addr();
         for (port, kind) in ports {
             let Some(vport) = port else { continue };
-            let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, vport))
+            let addr = util::resolve_addr(&format!("{proxy_host}:{vport}"))
                 .await
-                .with_context(|| format!("解析 vhost 地址 {}:{} 失败", cfg.bind_addr, vport))?;
+                .with_context(|| format!("解析 vhost 地址 {proxy_host}:{vport} 失败"))?;
             let listener = vhost::bind(addr).await?;
             let mut opts = vhost::VhostOpts::new(kind, cfg.tcpmux_passthrough);
             if kind == vhost::VhostKind::Http {
@@ -560,6 +564,18 @@ pub async fn serve_on_with(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accept 失败")?;
+                // 主端口 TCP keepalive（限制①批次2，官方 `tcpKeepalive`：
+                // 官方在 `bind_port` 主监听器上 `SetKeepAlive`，作用范围一致）。
+                // `0` = 不打开（项目约定）。
+                if cfg.tcp_keepalive > 0 {
+                    if let Err(e) = util::set_tcp_keepalive(&stream, cfg.tcp_keepalive) {
+                        warn!(
+                            %peer,
+                            "设置 TCP keepalive 失败（tcpKeepalive = {} 秒）：{e}",
+                            cfg.tcp_keepalive
+                        );
+                    }
+                }
                 let cfg = cfg.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
@@ -772,8 +788,11 @@ async fn handle_stream(
         if first[0] == YAMUX_VERSION_BYTE {
             // yamux 会话：每个 stream 都是一条独立的 frp 连接
             let session_authed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-            let mut acceptor =
-                frp::mux::serve(Box::pin(PrefixedStream::new(vec![first[0]], stream)));
+            // yamux 保活（限制①批次2，官方 `tcpMuxKeepaliveInterval`）：0 = 关闭。
+            let mut acceptor = frp::mux::serve(
+                Box::pin(PrefixedStream::new(vec![first[0]], stream)),
+                frp::mux::MuxKeepalive::from_secs(cfg.tcp_mux_keepalive_interval),
+            );
             while let Some(s) = acceptor.accept().await {
                 let cfg = cfg.clone();
                 let registry = registry.clone();
@@ -1065,7 +1084,8 @@ async fn handle_control(
     // **没有上界**。于是配置里写一个极大的值（比如 `u64::MAX` 秒）
     // 就让空闲工作连接**永不回收**：
     //
-    // * 每个客户端还能开 `maxPoolCount`（默认 5）× 多条代理的空闲工作连接；
+    // * 每个客户端还能预建多条代理的空闲工作连接（官方 `maxPoolCount`
+    //   默认 5；限制①批次1 起 NFrp 同样支持该项，默认 0 = 不限）；
     // * 客户端重连后旧连接不会被及时清掉 ⇒ `idle_work_conns` 持续累积
     //   ⇒ fd / 内存缓慢增长，且它**不是**由攻击流量触发的，
     //   运维很难把它和配置项联系起来。
@@ -1086,17 +1106,25 @@ async fn handle_control(
     let idle_timeout = Duration::from_secs(idle_secs);
     let limits = registry.limits().clone();
     let (conn_limit, backlog_limit, proxy_limit) = limits.per_client();
+    // 用户连接等配工作连接的超时（`userConnTimeout`，限制①批次1）：官方语义是
+    // "等不到工作连接就放弃这条用户连接"，默认 10 秒；配 0 折算默认
+    // （官方 `EmptyOr` 口径），不会变成"无限等"。
+    let user_conn_timeout = cfg.user_conn_timeout();
     let client = Arc::new(ClientState::new(
         run_id.clone(),
         client_id.clone(),
         login.user.clone(),
         req_tx,
         idle_timeout,
+        user_conn_timeout,
         caps,
         udp_binary,
         wire_version,
         conn_limit,
         backlog_limit,
+        // 单客户端空闲工作连接池上限（`maxPoolCount`，0 = 不限；与
+        // `max_pending_per_client` 取更小者，见 `ClientState::new`）。
+        cfg.max_pool_count,
         proxy_limit,
         // 控制连接的源 IP：工作连接的空凭证回退校验要用（见 handle_work）
         peer.ip(),
@@ -1510,6 +1538,10 @@ async fn register_tcp(
     if m.remote_port == 0 {
         anyhow::bail!("tcp 代理必须指定 remote_port");
     }
+    // ★ 限制①批次1：数据面端口跟随 `proxyBindAddr`（官方
+    //   `ports.NewManager("tcp", cfg.ProxyBindAddr, ...)` 与 tcp.go 的
+    //   `net.Listen(..., ProxyBindAddr, ...)`；留空 = `bindAddr`）。
+    let proxy_host = cfg.effective_proxy_bind_addr();
     // group 共享端口时**只有第一个成员**能 bind，后来者直接复用已有监听器：
     // 再 bind 一次必然是 `Address already in use`，组里就永远只剩一个后端。
     let claim = registry
@@ -1523,9 +1555,9 @@ async fn register_tcp(
         .map_err(|e| anyhow!("{e}"))?;
 
     if claim == PortClaim::Fresh {
-        let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, m.remote_port))
+        let addr = util::resolve_addr(&format!("{proxy_host}:{}", m.remote_port))
             .await
-            .with_context(|| format!("解析 {}:{} 失败", cfg.bind_addr, m.remote_port))?;
+            .with_context(|| format!("解析 {proxy_host}:{} 失败", m.remote_port))?;
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -1545,7 +1577,7 @@ async fn register_tcp(
     }
 
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
-    Ok(format!("{}:{}", cfg.bind_addr, m.remote_port))
+    Ok(format!("{proxy_host}:{}", m.remote_port))
 }
 
 /// UDP：绑定 UDP 端口 + 维持一条专用工作连接。
@@ -1559,6 +1591,9 @@ async fn register_udp(
     if m.remote_port == 0 {
         anyhow::bail!("udp 代理必须指定 remote_port");
     }
+    // ★ 限制①批次1：数据面端口跟随 `proxyBindAddr`（官方 udp.go：
+    //   `ResolveUDPAddr(..., ProxyBindAddr, ...)`；留空 = `bindAddr`）。
+    let proxy_host = cfg.effective_proxy_bind_addr();
     // 同 tcp：只有第一个成员负责绑定，后来者复用。
     //
     // 但 UDP 的 group 负载均衡这里**明确不做**：UDP 是无连接的，一条工作连接
@@ -1582,7 +1617,7 @@ async fn register_udp(
         );
     }
 
-    let udp = match udp_proxy::bind_udp(&cfg.bind_addr, m.remote_port).await {
+    let udp = match udp_proxy::bind_udp(proxy_host, m.remote_port).await {
         Ok(u) => u,
         Err(e) => {
             registry.release_port(m.remote_port, client, &m.proxy_name);
@@ -1598,7 +1633,7 @@ async fn register_udp(
     );
     registry.attach_listener(m.remote_port, handle.abort_handle());
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
-    Ok(format!("{}:{}/udp", cfg.bind_addr, m.remote_port))
+    Ok(format!("{proxy_host}:{}/udp", m.remote_port))
 }
 
 /// http / https / tcpmux：把域名注册进虚拟主机路由表（都不需要额外端口）。
@@ -2291,11 +2326,7 @@ async fn handle_visitor(
     //   失败要手工回滚"的脆弱写法。
 
     // 7) 向 provider 要一条工作连接并配对
-    let Some(work) = entry
-        .client
-        .acquire_work_conn(Duration::from_secs(10))
-        .await
-    else {
+    let Some(work) = entry.client.acquire_work_conn().await else {
         anyhow::bail!("provider [{proxy_name}] 没有可用的工作连接，visitor 连接关闭");
     };
 
@@ -2641,11 +2672,13 @@ mod tests {
             String::new(),
             tx,
             Duration::from_secs(60),
+            Duration::from_secs(10),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             conn_limit,
             backlog,
+            0,
             proxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))

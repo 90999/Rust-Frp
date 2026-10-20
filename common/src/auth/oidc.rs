@@ -610,6 +610,20 @@ impl OidcVerifier {
         g.remove(run_id);
     }
 
+    /// ★ v0.6.1：**仅测试用** —— 直接往绑定表里塞一条，模拟"该会话登录成功过"。
+    ///
+    /// `subjects` 是私有字段，而验证"会话退出时绑定被清掉"需要先人为建立绑定。
+    /// 走 `verify_token` 造不出一条合法 token（要真的签名 + JWKS），
+    /// 所以开这个后门。
+    ///
+    /// ★ 不加 `#[cfg(test)]`：`server` crate 的测试也要用它
+    ///   （验证 `ClientGuard::drop` 确实调了 `forget_session`）。
+    ///   名字带 `_for_test` 表明意图，生产代码不该调用。
+    pub fn bind_subject_for_test(&self, run_id: &str, sub: &str) {
+        let mut g = self.subjects.write().unwrap_or_else(|e| e.into_inner());
+        g.insert(run_id.to_string(), sub.to_string());
+    }
+
     /// 校验"登录之后"的 token：必须验签通过，且 subject 与**本会话**
     /// （该 run_id）登录时用过的那个一致。
     ///

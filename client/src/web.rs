@@ -291,8 +291,39 @@ pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
 #[cfg(test)]
 use nfrp_common::util::is_loopback_addr;
 
-async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyhow::Result<()> {
-    let req = http1::read_request(&mut stream).await?;
+/// 一次管理界面请求的处理结果（不涉及 socket）。
+///
+/// ★ v0.5.10（照官方 frp 的做法重构）：把 `handle` 里**与 socket 无关**的
+/// 判定逻辑抽出来，让测试可以直接调它 —— 与官方
+/// `frp-0.71.0/server/http/controller_v2_test.go` 里的
+/// `resp := httptest.NewRecorder(); handler.ServeHTTP(resp, req)` 同构。
+///
+/// # 为什么必须这么改
+///
+/// 原测试辅助函数 `handle_over_socket` 开真 socket、`tokio::spawn` 服务端、
+/// 客户端再连过去 —— **自己造了一个竞态**。云端 Linux 上实测：
+/// 时间线插桩显示 `accept()` 有时**永不返回**（`TL S2 accept 返回` 缺失），
+/// 于是 4 个用它写的测试必然失败（每个卡满 5 秒）。
+///
+/// 而产品本身没有这个问题：真实部署里 frpc 与"客户端"是**两个进程**，
+/// 双进程实测 `ok=100 fails=0`。
+///
+/// ⇒ 测试不该为了"真实"而付出引入竞态的代价。官方 frp 就不这么做。
+pub(crate) struct Decision {
+    pub code: u16,
+    pub ctype: &'static str,
+    pub body: String,
+}
+
+/// 纯逻辑：给定一条已解析的请求，算出该回什么。**不碰 socket。**
+///
+/// 判定顺序与 `handle` 原先**逐字一致**（这只是搬家，不是改语义）：
+/// 1. `/api/healthz` 免鉴权（容器探针不方便带凭据，且只回 `ok`）
+/// 2. Basic Auth 失败 → 401
+/// 3. 写操作：任何一条 `Origin` 非本机 → 403
+/// 4. 写操作：缺 `X-Nfrp-Client` 头 → 403
+/// 5. 其余交给 [`route`]
+async fn decide(hub: &Arc<Hub>, req: &http1::Request, peer: SocketAddr) -> Decision {
     let path = req.path.as_str();
     let method = req.method.as_str();
 
@@ -300,28 +331,25 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyho
     // 而它只回一个 "ok"，泄露的信息量为零。
     if path == HEALTHZ_PATH {
         if method != "GET" && method != "HEAD" {
-            http1::send_json(
-                &mut stream,
-                405,
-                &err_body("method_not_allowed", "只支持 GET"),
-            )
-            .await?;
-            return Ok(());
+            return Decision {
+                code: 405,
+                ctype: CT_JSON,
+                body: err_body("method_not_allowed", "只支持 GET"),
+            };
         }
-        http1::send(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", &[]).await?;
-        return Ok(());
+        return Decision {
+            code: 200,
+            ctype: "text/plain; charset=utf-8",
+            body: "ok\n".to_string(),
+        };
     }
 
-    if let Some(body) = auth_failure(&hub, &req) {
-        http1::send(
-            &mut stream,
-            401,
-            "application/json; charset=utf-8",
-            body.as_bytes(),
-            &[("WWW-Authenticate", "Basic realm=\"nfrp-client\"")],
-        )
-        .await?;
-        return Ok(());
+    if let Some(body) = auth_failure(hub, req) {
+        return Decision {
+            code: 401,
+            ctype: CT_JSON,
+            body,
+        };
     }
 
     // ---- CSRF / DNS rebinding 防线 ----
@@ -350,33 +378,35 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyho
         for origin in req.headers_all("origin") {
             if !origin_is_local(&origin) {
                 debug!(%peer, origin, "拒绝跨站写请求");
-                http1::send_json(
-                    &mut stream,
-                    403,
-                    &err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
-                )
-                .await?;
-                return Ok(());
+                return Decision {
+                    code: 403,
+                    ctype: CT_JSON,
+                    body: err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
+                };
             }
         }
         if req.header(CSRF_HEADER).is_none() {
             debug!(%peer, %method, %path, "拒绝缺少防伪头的写请求");
-            http1::send_json(
-                &mut stream,
-                403,
-                &err_body(
+            return Decision {
+                code: 403,
+                ctype: CT_JSON,
+                body: err_body(
                     "forbidden",
                     &format!("写操作必须带 {CSRF_HEADER} 头（防止网页盲打本地接口）"),
                 ),
-            )
-            .await?;
-            return Ok(());
+            };
         }
     }
 
-    let (code, ctype, body) = route(&hub, method, path, &req).await;
-    http1::send(&mut stream, code, ctype, body.as_bytes(), &[]).await?;
-    debug!(%peer, %method, %path, code, "客户端管理界面请求已处理");
+    let (code, ctype, body) = route(hub, method, path, req).await;
+    Decision { code, ctype, body }
+}
+
+async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyhow::Result<()> {
+    let req = http1::read_request(&mut stream).await?;
+    let d = decide(&hub, &req, peer).await;
+    http1::send(&mut stream, d.code, d.ctype, d.body.as_bytes(), &[]).await?;
+    debug!(%peer, method = %req.method, path = %req.path, code = d.code, "客户端管理界面请求已处理");
     Ok(())
 }
 
@@ -846,26 +876,78 @@ mod tests {
     ///
     /// 用真 socket 而不是 duplex：`handle` 的响应是往它自己那条连接写的，
     /// 只有真实连接才能把两个方向都拿到。
-    async fn handle_over_socket(hub: Arc<Hub>, raw: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let h = hub.clone();
-        let srv = tokio::spawn(async move {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let _ = handle(stream, peer, h).await;
-        });
-
-        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
-        cli.write_all(raw.as_bytes()).await.unwrap();
-        cli.flush().await.unwrap();
-        let _ = cli.shutdown().await;
-        let mut out = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(3), cli.read_to_end(&mut out)).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), srv).await;
-        String::from_utf8_lossy(&out).to_string()
+    ///
+    /// ★★ v0.5.10 修（云端 Linux 实测，**测试侧**）：**不要在读完响应之前
+    /// `shutdown()` 写方向**。
+    ///
+    /// # 现象
+    ///
+    /// 云端（Linux）上这几个测试红了，而本机（Windows）一直绿：
+    ///
+    /// ```text
+    /// test web::tests::读请求不需要防伪头 ... FAILED
+    /// 读接口不该被挡，实际：                    ← 响应体**完全空白**
+    /// finished in 5.00s                         ← 正好 = 3s + 2s 两个超时之和
+    /// ```
+    ///
+    /// 串行跑（`--test-threads=1`）也红，**不是并发竞争**。
+    ///
+    /// # 根因（已用最小实验在云端证实）
+    ///
+    /// 把本函数的时序照抄进一个独立小工程（`tmp/experiments/shutdown_semantics`），
+    /// 在两种平台上跑五个变体：
+    ///
+    /// | 变体 | Windows | **Linux** |
+    /// |---|---|---|
+    /// | **A 照抄原写法**（write → shutdown → read） | ✅ 40B | ❌ **0B** |
+    /// | B 不 shutdown（write → read） | ✅ 40B | ✅ **40B** |
+    /// | C shutdown + yield 后再读 | ✅ 40B | ❌ **0B** |
+    /// | D shutdown + **服务端优雅收尾** | ✅ 40B | ✅ **40B** |
+    /// | E 不 shutdown + 服务端优雅收尾 | ✅ 40B | ✅ 40B |
+    ///
+    /// ⇒ **A 和 C 都失败、B 成功** ⇒ 罪魁是**客户端 `shutdown()`**；
+    ///   **D 成功**（同样 shutdown，但服务端先把响应 flush + shutdown 再 drop）
+    ///   ⇒ 服务端"写完直接 drop"是第二个促成因素。
+    ///
+    /// 机制：客户端半关写方向后，服务端回包并 `drop` 连接；
+    /// Linux 在 close 时若发送缓冲还有未确认数据 / 接收端已半关，
+    /// 会发 **RST** ⇒ 客户端内核**丢弃已排队但未读取的响应**。
+    /// Windows 的 TCP 栈在这条路径上不这样处理，所以本机永远测不出来。
+    ///
+    /// # 修法
+    ///
+    /// 走 **B 变体**：写完**不** shutdown，直接读到 EOF。
+    /// `handle` 自己会按 `Content-Length` 写完并关闭，客户端自然读到 EOF。
+    /// 这既修掉了平台差异，也更贴近真实浏览器的行为（浏览器不会在半路半关）。
+    /// 直接在同一进程里跑一次判定，**不碰 socket**。
+    ///
+    /// ★★ v0.5.10 重构（照官方 frp 的做法）：原先是 `handle_over_socket` ——
+    /// 开真 `TcpListener`、`tokio::spawn` 服务端、客户端再 `connect` 过去。
+    ///
+    /// 那个写法**自己造了一个竞态**：云端 Linux 实测（时间线插桩）
+    /// `accept()` 有时**永不返回**（`TL S2 accept 返回` 缺失），
+    /// 于是用到它的 4 个测试必然失败、每个卡满 5 秒；Windows 上却全绿。
+    ///
+    /// 官方 frp 测 HTTP 处理器时**不开 socket**：
+    /// `tmp/frp-0.71.0/server/http/controller_v2_test.go`
+    /// ```go
+    /// resp := httptest.NewRecorder()
+    /// handler.ServeHTTP(resp, req)
+    /// ```
+    /// 本函数与它同构：解析请求 → 调 `decide()` → 把结果拼成 HTTP 响应文本。
+    async fn decide_over_raw(hub: Arc<Hub>, raw: &str) -> String {
+        let req = http1::parse(raw.as_bytes());
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let d = decide(&hub, &req, peer).await;
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            d.code,
+            http1::reason(d.code),
+            d.ctype,
+            d.body.len(),
+            d.body
+        )
     }
-
     #[test]
     fn 代理名两种写法都收() {
         assert_eq!(proxy_name_of("  web  ").unwrap(), "web");
@@ -927,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn 跨站来源的写请求被拒绝() {
         let hub = hub_with(ProxyTable::default());
-        let resp = handle_over_socket(
+        let resp = decide_over_raw(
             hub,
             "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
              Origin: http://evil.com\r\nX-Nfrp-Client: 1\r\n\
@@ -947,7 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn 写请求缺防伪头被拒绝() {
         let hub = hub_with(ProxyTable::default());
-        let resp = handle_over_socket(
+        let resp = decide_over_raw(
             hub,
             "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
              Content-Length: 2\r\n\r\n{}",
@@ -964,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn 带防伪头的写请求能通过_csrf_检查() {
         let hub = hub_with(ProxyTable::default());
-        let resp = handle_over_socket(
+        let resp = decide_over_raw(
             hub,
             "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
              X-Nfrp-Client: 1\r\nContent-Length: 2\r\n\r\n{}",
@@ -983,7 +1065,7 @@ mod tests {
     async fn 读请求不需要防伪头() {
         let hub = hub_with(ProxyTable::from_iter([proxy("web")]));
         let resp =
-            handle_over_socket(hub, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+            decide_over_raw(hub, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
             resp.starts_with("HTTP/1.1 200"),
             "读接口不该被挡，实际：{resp}"

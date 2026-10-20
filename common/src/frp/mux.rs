@@ -69,6 +69,57 @@ const SESSION_TICK: Duration = Duration::from_secs(2);
 /// 重连逻辑重建整条连接，不会造成不可用。）
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// yamux 会话保活参数（限制①批次2，对应 frp `tcpMuxKeepaliveInterval`）。
+///
+/// 官方把间隔交给 Go yamux：每 `interval` 秒向对端发 Ping，超时收不到 Pong
+/// 就关会话。rust-yamux **没有** keepalive API（0.13 / 0.14 均无），nfrp 用
+/// 等价看门狗落地：
+/// - `tick`：驱动器的保活轮询节拍 —— 既让 crate 自带的 RTT Ping/Pong 持续
+///   流动（它只在连接被 poll 且距上次 Pong ≥ 10s 时才发 Ping），也按此节奏
+///   检查对端是否还在说话；
+/// - `deadline`：**从对端读到任何字节**的间隔超过它，即判定会话已死并关闭
+///   （所有流一起断开，上层按既有逻辑重连）。
+///
+/// 对本端与官方对端都互通：官方 yamux 的 Ping 由 crate 原生应答，crate 发的
+/// Ping 官方也会回 Pong —— 看门狗只是补上"静默即断"的判定。
+#[derive(Clone, Copy, Debug)]
+pub struct MuxKeepalive {
+    /// 驱动器保活轮询节拍。
+    pub tick: Duration,
+    /// 对端静默超过该时长即关闭会话。
+    pub deadline: Duration,
+}
+
+/// 保活判定线相对 `tcpMuxKeepaliveInterval` 的宽限（秒）。
+///
+/// 官方 Go yamux 的判定是"到点发 Ping，Pong 超时（`ConnectionWriteTimeout`
+/// = 10 秒）就关会话"，即"间隔 + 10 秒"量级。
+const KEEPALIVE_PONG_GRACE: u64 = 10;
+
+/// 判定线的下限（秒）。健康会话的对端字节间隔上限 ≈ 10~12 秒（crate 的
+/// RTT Ping/Pong 节奏，两端都有节拍驱动器保证），30 秒给出 ≥2.5 倍余量。
+const KEEPALIVE_DEADLINE_FLOOR: u64 = 30;
+
+impl MuxKeepalive {
+    /// 由 `tcpMuxKeepaliveInterval`（秒）折算；`0` = 关闭（返回 `None`）。
+    ///
+    /// - 判定线 = `secs + 10`，下限 30 秒（见上面两个常数的注释）；
+    /// - 节拍 = `secs / 2`，夹在 [2s, 30s]：下限对齐既有 `SESSION_TICK`，
+    ///   上限保证大间隔时轮询也不会迟钝（判定线始终 ≥ 2×节拍）。
+    pub fn from_secs(secs: u64) -> Option<Self> {
+        if secs == 0 {
+            return None;
+        }
+        Some(Self {
+            tick: Duration::from_millis((secs.saturating_mul(500)).clamp(2_000, 30_000)),
+            deadline: Duration::from_secs(
+                secs.saturating_add(KEEPALIVE_PONG_GRACE)
+                    .max(KEEPALIVE_DEADLINE_FLOOR),
+            ),
+        })
+    }
+}
+
 /// 会话活跃度：驱动器与交出去的流共享。
 struct SessionState {
     /// 已交出且尚未 drop 的流数量。
@@ -117,9 +168,54 @@ impl<S> Drop for CountedStream<S> {
     }
 }
 
+/// 载体流上的"最近收到对端字节"时间戳（保活看门狗用）。
+///
+/// 只加时间戳、不改变数据面行为：每次成功读到 >0 字节记一次时间。读发生在
+/// 帧粒度（几十 KiB 一次），一次 `Mutex` 的开销可忽略。
+struct TapStream {
+    inner: BoxStream,
+    last_recv: Arc<Mutex<tokio::time::Instant>>,
+}
+
+impl AsyncRead for TapStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = this.inner.as_mut().poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            if let Ok(mut t) = this.last_recv.lock() {
+                *t = tokio::time::Instant::now();
+            }
+        }
+        r
+    }
+}
+
+impl AsyncWrite for TapStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
+    }
+}
+
 /// 在已有流上建立 yamux 服务端会话。
-pub fn serve(stream: BoxStream) -> MuxAcceptor {
-    serve_with_timeouts(stream, SESSION_TICK, SESSION_IDLE_TIMEOUT)
+pub fn serve(stream: BoxStream, keepalive: Option<MuxKeepalive>) -> MuxAcceptor {
+    serve_with_timeouts(stream, SESSION_TICK, SESSION_IDLE_TIMEOUT, keepalive)
 }
 
 /// [`serve`] 的实现本体；时限参数化是为了让测试能低成本验证看门狗逻辑
@@ -128,6 +224,7 @@ fn serve_with_timeouts(
     stream: BoxStream,
     idle_tick: Duration,
     idle_timeout: Duration,
+    keepalive: Option<MuxKeepalive>,
 ) -> MuxAcceptor {
     // 通道容量 = "已创建但还没被 accept 走"的流的上限。yamux 驱动任务在
     // `send` 上被挂住后不会再从 TCP 读新帧（内核缓冲形成反压）——服务端
@@ -140,7 +237,12 @@ fn serve_with_timeouts(
         active: AtomicUsize::new(0),
         last_open: Mutex::new(tokio::time::Instant::now()),
     });
-    let mut conn = Connection::new(stream.compat(), mux_config(), Mode::Server);
+    let last_recv = Arc::new(Mutex::new(tokio::time::Instant::now()));
+    let tap = TapStream {
+        inner: stream,
+        last_recv: last_recv.clone(),
+    };
+    let mut conn = Connection::new(tap.compat(), mux_config(), Mode::Server);
     let share = state.clone();
     tokio::spawn(async move {
         loop {
@@ -149,6 +251,21 @@ fn serve_with_timeouts(
             let item = tokio::select! {
                 item = poll_fn(|cx| conn.poll_next_inbound(cx)) => item,
                 _ = &mut tick => {
+                    // 保活看门狗（限制①批次2）：静默超过判定线 = 会话已死。
+                    if let Some(ka) = keepalive {
+                        let silence = last_recv
+                            .lock()
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        if silence >= ka.deadline {
+                            tracing::warn!(
+                                "yamux 会话保活超时：{:?} 内没收到对端任何字节，断开\
+                                 （tcpMuxKeepaliveInterval 判定；设 0 可关闭）",
+                                ka.deadline
+                            );
+                            break;
+                        }
+                    }
                     let idle = share.active.load(Ordering::Relaxed) == 0;
                     let since = share
                         .last_open
@@ -199,10 +316,15 @@ pub struct MuxSession {
 }
 
 impl MuxSession {
-    pub fn new(stream: BoxStream) -> Self {
+    pub fn new(stream: BoxStream, keepalive: Option<MuxKeepalive>) -> Self {
         let (req_tx, req_rx) = mpsc::channel(64);
-        let conn = Connection::new(stream.compat(), mux_config(), Mode::Client);
-        tokio::spawn(drive_client(conn, req_rx));
+        let last_recv = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let tap = TapStream {
+            inner: stream,
+            last_recv: last_recv.clone(),
+        };
+        let conn = Connection::new(tap.compat(), mux_config(), Mode::Client);
+        tokio::spawn(drive_client(conn, req_rx, keepalive, last_recv));
         Self { req_tx }
     }
 
@@ -224,10 +346,24 @@ impl MuxSession {
 ///
 /// 两者都要独占 `&mut Connection`，所以放在同一个 `poll_fn` 里顺序处理，
 /// 用 `pending` 暂存"已经取出但还没就绪"的开流请求。
-async fn drive_client<S>(mut conn: Connection<S>, mut req_rx: mpsc::Receiver<OpenReq>)
-where
+async fn drive_client<S>(
+    mut conn: Connection<S>,
+    mut req_rx: mpsc::Receiver<OpenReq>,
+    keepalive: Option<MuxKeepalive>,
+    last_recv: Arc<Mutex<tokio::time::Instant>>,
+) where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
+    // 保活节拍（只在启用时建定时器）：它保证空闲会话也被持续 poll —— crate 的
+    // RTT Ping 只在"距上次 Pong ≥ 10s 且连接被 poll"时才发；没有节拍时，一个
+    // 无业务、无心跳写入的空闲会话可以静默很久，"对端静默"就失去了判据
+    // （server 侧本来就有 SESSION_TICK 在持续 poll）。
+    let mut ticker = keepalive.map(|ka| {
+        let mut t = tokio::time::interval(ka.tick);
+        // 忙时错过的节拍直接跳过：保活只需要"至少每 tick 醒一次"。
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    });
     let mut pending: Option<OpenReq> = None;
 
     enum Ev {
@@ -242,7 +378,7 @@ where
     }
 
     loop {
-        let ev = poll_fn(|cx| {
+        let fut = poll_fn(|cx| {
             // 1) 驱动会话，顺带取入站 stream（客户端模式下通常没有）
             match conn.poll_next_inbound(cx) {
                 std::task::Poll::Ready(Some(Ok(_))) => return std::task::Poll::Ready(Ev::Inbound),
@@ -271,8 +407,31 @@ where
                     std::task::Poll::Pending
                 }
             }
-        })
-        .await;
+        });
+        let ev = match ticker.as_mut() {
+            Some(ticker) => tokio::select! {
+                ev = fut => ev,
+                _ = ticker.tick() => {
+                    // 保活看门狗（限制①批次2）：静默超过判定线 = 会话已死。
+                    if let Some(ka) = keepalive {
+                        let dead = last_recv
+                            .lock()
+                            .map(|t| t.elapsed() >= ka.deadline)
+                            .unwrap_or(false);
+                        if dead {
+                            tracing::warn!(
+                                "yamux 会话保活超时：{:?} 内没收到对端任何字节，会话关闭\
+                                 （tcpMuxKeepaliveInterval 判定；设 0 可关闭）",
+                                ka.deadline
+                            );
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            },
+            None => fut.await,
+        };
 
         match ev {
             Ev::Inbound => {
@@ -303,6 +462,7 @@ mod tests {
             Box::pin(srv),
             Duration::from_millis(20),
             Duration::from_millis(200),
+            None,
         );
         let got = acc.accept().await;
         assert!(got.is_none(), "没有任何流的会话必须被关闭");
@@ -323,8 +483,9 @@ mod tests {
             Box::pin(srv),
             Duration::from_millis(20),
             Duration::from_millis(200),
+            None,
         );
-        let session = MuxSession::new(Box::pin(cli));
+        let session = MuxSession::new(Box::pin(cli), None);
         let mut held = session.open_stream().await.expect("开流");
         held.write_all(b"x").await.expect("写出首字节（触发 SYN）");
         let got = acc.accept().await.expect("服务端应收到流");
@@ -339,5 +500,104 @@ mod tests {
         let r2 = tokio::time::timeout(Duration::from_secs(2), acc.accept()).await;
         assert!(matches!(r2, Ok(None)), "流结束后的会话应被回收");
         drop(held);
+    }
+
+    /// `from_secs` 的折算口径：0=关；判定线 = interval+10 且 ≥30 秒；
+    /// 节拍 = interval/2 夹在 [2s, 30s]。
+    #[test]
+    fn 保活参数折算口径() {
+        assert!(MuxKeepalive::from_secs(0).is_none());
+
+        let k = MuxKeepalive::from_secs(30).expect("默认值要有");
+        assert_eq!(k.deadline, Duration::from_secs(40));
+        assert_eq!(k.tick, Duration::from_millis(15_000));
+
+        let k = MuxKeepalive::from_secs(5).expect("");
+        assert_eq!(k.deadline, Duration::from_secs(30), "判定线下限 30 秒");
+        assert_eq!(k.tick, Duration::from_millis(2_500));
+
+        let k = MuxKeepalive::from_secs(1).expect("");
+        assert_eq!(k.tick, Duration::from_millis(2_000), "节拍下限 2 秒");
+
+        let k = MuxKeepalive::from_secs(300).expect("");
+        assert_eq!(k.tick, Duration::from_millis(30_000), "节拍上限 30 秒");
+        assert_eq!(k.deadline, Duration::from_secs(310));
+    }
+
+    /// 保活看门狗（限制①批次2）：对端"TCP 活着但一声不吭"超过判定线，
+    /// 会话必须被关闭（accept 返回 None），且不能一上来就杀。
+    #[tokio::test]
+    async fn 保活看门狗关闭静默会话() {
+        // 裸 duplex 对端：不发任何 yamux 帧 —— 正是"僵连接"的形态
+        let (srv, _cli) = tokio::io::duplex(4096);
+        let mut acc = serve_with_timeouts(
+            Box::pin(srv),
+            Duration::from_millis(10),
+            Duration::from_secs(3600), // 关掉空闲看门狗，只测保活
+            Some(MuxKeepalive {
+                tick: Duration::from_millis(10),
+                deadline: Duration::from_millis(120),
+            }),
+        );
+        let started = tokio::time::Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(2), acc.accept())
+            .await
+            .expect("超过判定线还没有关闭会话");
+        assert!(got.is_none(), "会话应被关闭而不是交出流");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "不能早于判定线太多就杀（实际 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    /// 保活看门狗不得误杀"对端一直在说话"的会话：持续写入 > 3×判定线之后，
+    /// 会话必须仍然可用（还能再开流、再写）。
+    #[tokio::test]
+    async fn 保活看门狗不误杀有流量的会话() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (srv, cli) = tokio::io::duplex(64 * 1024);
+        let mut acc = serve_with_timeouts(
+            Box::pin(srv),
+            Duration::from_millis(10),
+            Duration::from_secs(3600), // 关掉空闲看门狗，只测保活
+            Some(MuxKeepalive {
+                tick: Duration::from_millis(10),
+                deadline: Duration::from_millis(120),
+            }),
+        );
+        let session = MuxSession::new(Box::pin(cli), None);
+        let mut held = session.open_stream().await.expect("开流");
+        held.write_all(b"x").await.expect("触发 SYN");
+        let _got = acc.accept().await.expect("服务端应收到流");
+
+        // 持续写 400ms（> 3×判定线）：服务端 tap 一直在回填 last_recv
+        for _ in 0..20 {
+            held.write_all(b"ping").await.expect("写");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 会话仍然活着：还能开新流并写出去（会话被误杀的话这里会失败）
+        let mut s2 = tokio::time::timeout(Duration::from_secs(2), session.open_stream())
+            .await
+            .expect("开流超时（会话可能被误杀）")
+            .expect("会话被误杀，开流失败");
+        s2.write_all(b"still alive").await.expect("写");
+        drop((held, s2));
+    }
+
+    /// `tcpMuxKeepaliveInterval = 0`（折算 `None`）时不做任何静默判定 ——
+    /// 行为回到 v0.5.10 基线。
+    #[tokio::test]
+    async fn 保活关闭时不判定静默() {
+        let (srv, _cli) = tokio::io::duplex(4096);
+        let mut acc = serve_with_timeouts(
+            Box::pin(srv),
+            Duration::from_millis(10),
+            Duration::from_secs(3600), // 关掉空闲看门狗
+            None,
+        );
+        let r = tokio::time::timeout(Duration::from_millis(300), acc.accept()).await;
+        assert!(r.is_err(), "保活关闭后，静默会话在短窗口内不得被关");
     }
 }

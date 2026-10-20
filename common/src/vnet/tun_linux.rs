@@ -433,8 +433,12 @@ mod tests {
 
     /// 没有 root / 没有 /dev/net/tun 时必须是**清晰的报错**，
     /// 而不是 panic 或者返回一个不能用的设备。
-    #[test]
-    fn 无权限时报错而不是恐慌() {
+    ///
+    /// ★ 必须开 tokio runtime：有权限的环境（例如云端 root + /dev/net/tun）
+    ///   会一路走到 `AsyncFd::new`，没有 reactor 时那里会直接 panic ——
+    ///   这正是这台云机（root）把这颗测试跑红的原因。
+    #[tokio::test]
+    async fn 无权限时报错而不是恐慌() {
         match Tun::create("nfrp-test-%d", 1400, None) {
             Ok(t) => {
                 // 有权限的环境（root）下真的建出来了，至少要能 self-consistent

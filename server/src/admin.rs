@@ -118,6 +118,15 @@ pub async fn add_proxy(
             registry.metrics().proxies_total.inc();
             registry.metrics().proxies_active.inc();
             tracing::info!(%run_id, proxy = %name, remote = %remote, "面板新增代理成功");
+            // ★★ v0.6.1 修（Shannon 审计）：**面板下发的增删也要进审计链**。
+            // 原先只有 `serve.rs` 里"客户端自己注册"那条记 `PROXY_ADD`，
+            // 面板这条路（走 `ServerCmd`）一条都没记 —— 审计里看不到管理操作。
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::ADMIN_ACTION, true)
+                    .client(run_id.to_string())
+                    .target(name.clone())
+                    .detail(format!("add_proxy：已生效 remote={remote}")),
+            );
             Ok(format!("代理 [{name}] 已生效：{remote}"))
         }
         Err(e) => {
@@ -226,6 +235,13 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     {
         Ok(()) => {
             tracing::info!(%run_id, proxy = %name, "面板移除代理成功");
+            // ★★ v0.6.1 修（Shannon 审计）：面板下发的删除也进审计链（同上）。
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::ADMIN_ACTION, true)
+                    .client(run_id.to_string())
+                    .target(name)
+                    .detail("remove_proxy：已移除"),
+            );
             Ok(format!("代理 [{name}] 已移除"))
         }
         Err(e) => Err(format!(
@@ -258,6 +274,23 @@ pub async fn kick(registry: &Arc<Registry>, run_id: &str, reason: &str) -> Admin
     client.stop();
     registry.release_ports_of(&client);
     tracing::warn!(%run_id, %reason, "面板踢出客户端");
+    // ★★ v0.6.1 修（Shannon 审计，低危）：**踢人必须进审计链**。
+    //
+    // 原先只有 `tracing::warn!` —— 日志和审计是两条不同的链：
+    // 日志会轮转/被删，审计是 `[audit]` 配置下独立的 JSONL，用于事后追责。
+    // 踢人是**不可回滚**的高危操作（客户端所有隧道立刻失效），
+    // 只留日志等于"查不到谁在什么时候踢了谁"。
+    registry.audit().record(
+        crate::audit::AuditEvent::new(crate::audit::kind::ADMIN_ACTION, true)
+            .client(run_id.to_string())
+            .user(client.user.clone())
+            .target(run_id.to_string())
+            .detail(if reason.is_empty() {
+                "kick：无理由".to_string()
+            } else {
+                format!("kick：{reason}")
+            }),
+    );
     Ok(format!(
         "客户端 [{run_id}] 已踢出（{}）",
         if reason.is_empty() {
@@ -305,11 +338,13 @@ mod tests {
             "alice".to_string(),
             tx,
             Duration::from_secs(60),
+            Duration::from_secs(10),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
+            0,
             proxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ))
@@ -363,6 +398,74 @@ mod tests {
         assert!(c.is_stopped(), "被踢的客户端必须标记为已停止");
         // 再踢一次应当是"没有这个客户端"，而不是 panic
         assert!(kick(&r, "c1", "").await.is_err());
+    }
+
+    /// ★★ v0.6.1 回归（Shannon 审计，低危）：**踢人必须写进审计链。**
+    ///
+    /// # 原先的问题
+    ///
+    /// `kick` 只调了 `tracing::warn!` —— 日志和审计是两条链：
+    /// 日志会轮转，`[audit]` 的 JSONL 才是事后追责用的。
+    /// 踢人是**不可回滚**的操作（客户端所有隧道立刻失效），
+    /// 只留日志等于"查不到谁在什么时候踢了谁"。
+    ///
+    /// 而且 `audit::kind::ADMIN_ACTION` 这个常量**定义了但全仓没有任何使用点** ——
+    /// 也就是面板的增/删/踢三个操作一条审计都没记。
+    ///
+    /// # 测试要注意
+    ///
+    /// `AuditLog::record()` 在 `enabled == false` 时**直接 return**，
+    /// 而 `Registry::unlimited()` 默认是不启用审计的 ——
+    /// 不换上下文的话，这条测试会**因为"审计没开"而不是"代码没写"** 而失败，
+    /// 那样就测不到修复点。
+    #[tokio::test]
+    async fn kick_必须写审计() {
+        let r = Arc::new(Registry::unlimited());
+        // 换一个**开启审计**的安全上下文（内存模式，不落盘）
+        let mut cfg = nfrp_common::config::ServerConfig::default();
+        cfg.audit.enable = true;
+        cfg.audit.path = String::new(); // 只留内存
+        cfg.audit.max_entries = 128;
+        r.set_security(Arc::new(
+            crate::guard::SecurityContext::from_config(&cfg).expect("构造安全上下文"),
+        ));
+
+        // 前置自检：审计必须真的在记。否则下面的断言会因"审计没开"而失败，
+        // 而不是因为"代码没写" —— 那就测不到修复点。
+        r.audit()
+            .record(crate::audit::AuditEvent::new("selftest", true));
+        assert_eq!(
+            r.audit().recent(10).len(),
+            1,
+            "前置失败：审计没启用，本测试无法验证修复"
+        );
+
+        r.insert(client("c-audit")).expect("插入");
+
+        let before = r.audit().recent(100).len();
+        kick(&r, "c-audit", "回归测试").await.expect("踢出成功");
+        let after = r.audit().recent(100);
+
+        assert!(
+            after.len() > before,
+            "踢人之后审计条目数必须增加（原先一条都不记）；before={before} after={}",
+            after.len()
+        );
+        let hit = after
+            .iter()
+            .find(|e| e.kind == crate::audit::kind::ADMIN_ACTION && e.target == "c-audit");
+        let e = hit.expect("审计里必须有这条 ADMIN_ACTION（target=被踢的 run_id）");
+        assert!(e.ok, "成功踢出应当记 ok=true");
+        assert!(
+            e.detail.contains("kick"),
+            "detail 要能看出是哪种管理操作，实际：{}",
+            e.detail
+        );
+        assert!(
+            e.detail.contains("回归测试"),
+            "理由要落进审计，实际：{}",
+            e.detail
+        );
     }
 
     // ------------------------------------------------------------------
@@ -456,11 +559,13 @@ maxProxies = 1
             "alice".to_string(), // 线上全名 = alice.{name}
             tx,
             Duration::from_secs(60),
+            Duration::from_secs(10),
             Default::default(),
             false,
             nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
+            0,
             proxy,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
         ));

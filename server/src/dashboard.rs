@@ -776,7 +776,23 @@ async function refresh(){
       ['代理名', '类型', 'provider 用户', 'allow_users'],
       (s.visitors||[]).map(v=>[v.proxy_name, v.type, v.provider_user||'-', (v.allow_users||[]).join(', ')||'同 user']));
   } catch(e) {
-    document.getElementById('cards').innerHTML = '<div class="empty">读取状态失败：'+e+'</div>';
+    // ★★ v0.6.1 修（Shannon 审计，加固）：`e` 也要过 `esc()`。
+    //
+    // 第五轮 H4 修了 `table()` / `card()` 的转义，**唯独漏了这条 catch 分支**
+    // —— 又是"防线没铺满"那个模式。
+    //
+    // # 今天为什么不可利用（如实记录）
+    //
+    // `e` 是本地 JS 的 `Error` 对象（来自 `fetch` 或 `JSON.parse` 失败），
+    // **不是服务端返回的文本**，内容由浏览器生成、攻击者控制不了。
+    //
+    // # 为什么仍然要改
+    //
+    // ① 它违反了本文件"所有动态内容一律过 `esc()`"的约定；
+    // ② 它的安全性依赖"`e` 永远不含远端文本"这个**隐含假设**——
+    //    将来谁在这里改成先 `await r.text()` 再 catch，就立刻变成存储型 XSS；
+    // ③ 转义一次的成本为零。
+    document.getElementById('cards').innerHTML = '<div class="empty">读取状态失败：'+esc(e)+'</div>';
   }
 }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -1108,6 +1124,23 @@ Authorization: Basic ",
         );
         // 按钮里的 run_id 自己仍然要转义（它进了 HTML 属性）
         assert!(html.contains("esc(c.run_id)"), "属性里的 run_id 仍须转义");
+
+        // ★★ v0.6.1（Shannon 审计，加固）：**catch 分支里的 `e` 也必须转义**。
+        //
+        // 第五轮 H4 修了 `table()` / `card()`，**唯独漏了这条 catch 分支** ——
+        // 又是"防线没铺满"那个模式。
+        //
+        // 今天不可利用（`e` 是本地 JS 的 Error，不是服务端文本），
+        // 但它违反了本文件"动态内容一律过 esc()"的约定，
+        // 而安全性只依赖"`e` 永远不含远端文本"这个隐含假设。
+        assert!(
+            html.contains("读取状态失败：'+esc(e)+'"),
+            "catch 分支里的 e 必须过 esc()"
+        );
+        assert!(
+            !html.contains("读取状态失败：'+e+'"),
+            "不得残留未转义的 catch 插值（H4 漏掉的路径）"
+        );
 
         // 卡片也一并转义（原先同样直接插值；虽然当前只喂数字，但别留地雷）
         assert!(

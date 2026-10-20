@@ -265,11 +265,6 @@ const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
     // 用户以为加密/压缩了，实际完全没生效（协议字段存在但配置层没暴露）
     "useEncryption",
     "useCompression",
-    // ---- 传输层调优 ----
-    "dialServerTimeout",
-    "dialServerKeepalive",
-    "tcpMuxKeepaliveInterval",
-    "connectServerLocalIP",
     // ---- 出站代理 ----
     "proxyURL",
     // ---- 认证 ----
@@ -279,15 +274,9 @@ const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
     "natHoleStunServer",
     "dnsServer",
     "includes",
-    // ---- 日志 ----
-    // 官方 `[log]` 段的 `disablePrintColor`（`to` / `maxDays` 已实现，见 logfile.rs）
-    "disablePrintColor",
     // ---- 管理界面 ----
     "pprofEnable",
     "assetsDir",
-    // ---- 代理级 ----
-    "enabled",
-    "annotations",
 ];
 
 /// 扫描一份配置里出现的、[`UNSUPPORTED_CLIENT_FIELDS`] 中的字段名。
@@ -306,19 +295,16 @@ pub fn unsupported_fields(root: &Value) -> Vec<String> {
 /// 官方 frps **支持**、但 nfrp **未实现**的服务端配置字段。
 ///
 /// 与 [`UNSUPPORTED_CLIENT_FIELDS`] 同样的道理：`ServerConfig` 的 serde 不拒绝
-/// 未知字段，官方 frps 配置里的这些项会被**静默忽略** —— 其中 `allowPorts`
-/// （端口白名单）和 `maxPortsPerClient` 属于**安全相关**，配了不生效尤其危险。
+/// 未知字段，官方 frps 配置里的这些项会被**静默忽略** —— 其中 `tokenSource`
+/// （从外部源取 token）、`sshTunnelGateway` / `httpPlugins`（都能开新入口）
+/// 都属于"配了不生效"会让人误判的那类，尤其值得留意。
 ///
 /// 维护规则同客户端清单：只放"官方 0.71 确认支持、且 NFrp 确实没实现"的，
 /// 实现后删掉。清单按官方 `frps_full_example.toml`（v0.71.0）逐项比对得出。
 const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     // 端口 / 监听
     "quicBindPort",
-    "proxyBindAddr",
     // 传输层调优
-    "maxPoolCount",
-    "tcpMuxKeepaliveInterval",
-    "tcpKeepalive",
     "certFile",
     "keyFile",
     "trustedCaFile",
@@ -327,10 +313,7 @@ const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     "assetsDir",
     "pprofEnable",
     "enablePrometheus",
-    // 日志（`to` / `maxDays` 已实现，见 common/src/logfile.rs）
-    "disablePrintColor",
     // 行为
-    "userConnTimeout",
     "udpPacketSize",
     "natholeAnalysisDataReserveHours",
     // 认证（结构里已声明占位，但功能未实现）
@@ -577,6 +560,14 @@ pub fn normalize_client(root: &mut toml::Value) {
             ("wireProtocol", "protocol"),
             ("heartbeatInterval", "heartbeat_interval"),
             ("heartbeatTimeout", "heartbeat_timeout"),
+            // 连接服务端的超时 / 本机出口绑定（限制①批次1 实现，语义对齐官方
+            // `connector.go`：仅走 TCP 拨号路径，KCP 不适用）。
+            ("dialServerTimeout", "dial_server_timeout"),
+            ("connectServerLocalIP", "connect_server_local_ip"),
+            // TCP keepalive / yamux 保活（限制①批次2 实现，官方同名键，
+            // 语义与落法见 config.rs 对应字段的文档）。
+            ("dialServerKeepalive", "dial_server_keepalive"),
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
         ],
     );
     hoist(
@@ -610,7 +601,8 @@ pub fn normalize_client(root: &mut toml::Value) {
     //   「token in login doesn't match token from configuration」。
     rename(t, "metadatas", "metas");
 
-    // 日志：`[log] level` 与顶层 `logLevel` 等价；`to` / `maxDays` 只在 `[log]` 里
+    // 日志：`[log] level` 与顶层 `logLevel` 等价；`to` / `maxDays` /
+    // `disablePrintColor` 只在 `[log]` 里。
     hoist(
         t,
         &["log"],
@@ -618,6 +610,7 @@ pub fn normalize_client(root: &mut toml::Value) {
             ("level", "log_level"),
             ("to", "log_to"),
             ("maxDays", "max_days"),
+            ("disablePrintColor", "disable_print_color"),
         ],
     );
 
@@ -690,6 +683,9 @@ const SERVER_TOP: Renames = &[
     ("detailedErrorsToClient", "detailed_errors_to_client"),
     ("subdomainHost", "subdomain_host"),
     ("transportProtocol", "transport_protocol"),
+    // 限制①批次1：数据面监听地址与"等用户连接配工作连接"的超时（官方顶层键）。
+    ("proxyBindAddr", "proxy_bind_addr"),
+    ("userConnTimeout", "user_conn_timeout"),
 ];
 
 /// 把一份服务端配置的键名从 frp 风格规范化成 NFrp 风格（原地修改）。
@@ -719,6 +715,11 @@ pub fn normalize_server(root: &mut toml::Value) {
             // "原版 frps 配置能直接喂进来"而接受它。
             ("wireProtocol", "protocol"),
             ("heartbeatTimeout", "heartbeat_timeout"),
+            // 空闲工作连接池上限（限制①批次1 实现；官方默认 5，nfrp 默认 0 = 不限）。
+            ("maxPoolCount", "max_pool_count"),
+            // yamux 保活间隔 + 主端口 TCP keepalive（限制①批次2 实现）。
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            ("tcpKeepalive", "tcp_keepalive"),
         ],
     );
     hoist(t, &["transport", "tls"], &[("force", "tls_force")]);
@@ -731,6 +732,7 @@ pub fn normalize_server(root: &mut toml::Value) {
             ("level", "log_level"),
             ("to", "log_to"),
             ("maxDays", "max_days"),
+            ("disablePrintColor", "disable_print_color"),
         ],
     );
 
@@ -1388,15 +1390,273 @@ enable = true
     }
 
     /// "官方支持、NFrp 未实现"的字段识别也要折叠大小写 ——
-    /// 用户写 `proxyBindAddr`（官方照样认），NFrp 的告警就不能漏。
+    /// 用户写 `QuicBindPort`（官方照样认），NFrp 的告警就不能漏。
     ///
-    /// 注意这里挑的是**至今确实没实现**的字段；`AllowPorts` 曾经是这条用例的
-    /// 主角，但它已经实现了（改用 `代理绑定地址` 这个还没做的）。
+    /// 注意这里挑的是**至今确实没实现**的字段；历史上换过两次主角：
+    /// `AllowPorts`、`ProxyBindAddr` 都实现了（凡实现的都要从清单里删掉，
+    /// 否则会出现反向的假警报 —— 说"没实现"而实际能用）。
     #[test]
     fn 未实现字段识别也要折叠大小写() {
-        let text = "bindPort = 7000\nProxyBindAddr = \"127.0.0.1\"\n";
+        let text = "bindPort = 7000\nQuicBindPort = 7001\n";
         let cfg = parse_server_toml(text).unwrap();
-        assert_eq!(cfg.unsupported_fields, vec!["ProxyBindAddr".to_string()]);
+        assert_eq!(cfg.unsupported_fields, vec!["QuicBindPort".to_string()]);
+    }
+
+    /// 限制①批次1：这批客户端字段已实现 —— 既不能再被报"未实现"，
+    /// 值也要真的落到配置里（含官方 camelCase 写法）。
+    #[test]
+    fn 批次1客户端字段读到值且不再报未实现() {
+        let raw = r#"
+serverAddr = "example.com"
+serverPort = 7000
+
+[transport]
+dialServerTimeout = 7
+connectServerLocalIP = "192.168.1.5"
+
+[log]
+disablePrintColor = true
+
+[[proxies]]
+name = "p-off"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+enabled = false
+
+[[proxies]]
+name = "p-on"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 23
+remotePort = 6001
+annotations = { "example.com/team" = "infra" }
+
+[[visitors]]
+name = "v-off"
+type = "stcp"
+serverName = "target"
+secretKey = "k"
+enabled = false
+"#;
+        let cfg = crate::config::parse_client(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.dial_server_timeout, 7);
+        assert_eq!(cfg.connect_server_local_ip, "192.168.1.5");
+        assert!(cfg.disable_print_color);
+        // enabled = false 的代理 / 访客在解析期被摘掉（官方 FilterClientConfigurers）
+        assert_eq!(cfg.proxies.len(), 1, "禁用的代理不该留下");
+        assert_eq!(cfg.proxies[0].name, "p-on");
+        assert_eq!(
+            cfg.proxies[0]
+                .annotations
+                .get("example.com/team")
+                .map(String::as_str),
+            Some("infra")
+        );
+        assert!(cfg.visitors.is_empty(), "禁用的访客不该留下");
+    }
+
+    /// 限制①批次1：服务端四个字段（proxyBindAddr / userConnTimeout /
+    /// maxPoolCount / disablePrintColor）同样要读进来且不报未实现。
+    #[test]
+    fn 批次1服务端字段读到值且不再报未实现() {
+        let raw = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "192.168.1.5"
+userConnTimeout = 3
+
+[transport]
+maxPoolCount = 4
+
+[log]
+disablePrintColor = true
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.proxy_bind_addr, "192.168.1.5");
+        assert_eq!(cfg.effective_proxy_bind_addr(), "192.168.1.5");
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(3));
+        assert_eq!(cfg.max_pool_count, 4);
+        assert!(cfg.disable_print_color);
+    }
+
+    /// 限制①批次2：keepalive 组四个字段（客户端 `dialServerKeepalive` /
+    /// `tcpMuxKeepaliveInterval`，服务端 `tcpMuxKeepaliveInterval` /
+    /// `tcpKeepalive`）既能读官方 camelCase 写法，也不再被报"未实现"。
+    #[test]
+    fn 批次2keepalive字段读到值且不再报未实现() {
+        let c = r#"
+serverAddr = "example.com"
+serverPort = 7000
+
+[transport]
+dialServerKeepalive = 111
+tcpMuxKeepaliveInterval = 22
+"#;
+        let cfg = crate::config::parse_client(c).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.dial_server_keepalive, 111);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 22);
+
+        let s = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[transport]
+tcpMuxKeepaliveInterval = 33
+tcpKeepalive = 444
+"#;
+        let cfg = parse_server_toml(s).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 33);
+        assert_eq!(cfg.tcp_keepalive, 444);
+    }
+
+    /// 限制①批次2：默认值取官方（7200 / 30 / 30 / 7200），不写就是这四档；
+    /// 显式写 `0` 保持"关闭"的原意，不被折算成官方默认。
+    #[test]
+    fn 批次2keepalive默认值与零语义() {
+        let cfg = crate::config::parse_client("serverAddr = \"x\"\n").unwrap();
+        assert_eq!(cfg.dial_server_keepalive, 7200);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+
+        let cfg = parse_server_toml("bindPort = 7000\n").unwrap();
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+        assert_eq!(cfg.tcp_keepalive, 7200);
+
+        // 0 = 关闭（不复刻官方 EmptyOr 的 0→默认 折算）
+        let cfg = crate::config::parse_client(
+            "serverAddr = \"x\"\n[transport]\ndialServerKeepalive = 0\ntcpMuxKeepaliveInterval = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.dial_server_keepalive, 0);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 0);
+        let cfg = parse_server_toml(
+            "bindPort = 7000\n[transport]\ntcpMuxKeepaliveInterval = 0\ntcpKeepalive = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 0);
+        assert_eq!(cfg.tcp_keepalive, 0);
+    }
+
+    /// `proxyBindAddr` 留空时跟随 `bind_addr`（官方 `Complete()` 语义），
+    /// 保证默认配置下行为与老版本完全一致。
+    #[test]
+    fn 代理绑定地址留空跟随_bind_addr() {
+        let cfg = parse_server_toml("bindAddr = \"10.0.0.1\"\nbindPort = 7000\n").unwrap();
+        assert_eq!(cfg.proxy_bind_addr, "");
+        assert_eq!(cfg.effective_proxy_bind_addr(), "10.0.0.1");
+    }
+
+    /// `userConnTimeout = 0` 按官方 `EmptyOr` 口径折算为默认 10 秒（不是"不限"）。
+    #[test]
+    fn user_conn_timeout_零折算为官方默认() {
+        let cfg = parse_server_toml("bindPort = 7000\n").unwrap();
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(10));
+        let cfg = parse_server_toml("bindPort = 7000\nuserConnTimeout = 0\n").unwrap();
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(10));
+    }
+
+    /// 注解键按官方 `ValidateAnnotations` 口径校验：合法键放行（大写折叠、
+    /// 前缀 `x/y` 都算合法），非法键与超限总大小报错。
+    #[test]
+    fn 注解键按官方口径校验() {
+        let ok = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = { "example.com/Team_Name" = "a", "Key" = "b" }
+"#;
+        let cfg = crate::config::parse_client(ok).unwrap();
+        assert_eq!(cfg.proxies.len(), 1);
+
+        let bad = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = { "has space" = "x" }
+"#;
+        let err = crate::config::parse_client(bad).unwrap_err().to_string();
+        assert!(err.contains("注解"), "报错应点名注解键：{err}");
+
+        let too_big = format!(
+            r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = {{ "k" = "{}" }}
+"#,
+            "a".repeat(256 * 1024)
+        );
+        let err = crate::config::parse_client(&too_big)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("256"), "超限报错要给出上限：{err}");
+    }
+
+    /// 禁用条目的校验时机与官方一致：**解码类**错误（未知类型）照旧报
+    /// （官方在解码阶段就拦），**结构化**校验（tcpmux / 注解）跳过
+    /// （官方校验发生在 enabled 过滤之后）。
+    #[test]
+    fn 禁用条目的校验时机与官方一致() {
+        // ① 禁用 + 未知代理类型 ⇒ 依然报错
+        let raw = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tunnel"
+localIP = "127.0.0.1"
+localPort = 22
+enabled = false
+"#;
+        assert!(
+            crate::config::parse_client(raw).is_err(),
+            "未知类型在官方解码阶段就报错，enabled = false 不能让它合法"
+        );
+
+        // ② 禁用 + tcpmux 缺约束 ⇒ 放行（过滤后才校验）
+        let raw = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcpmux"
+localIP = "127.0.0.1"
+localPort = 22
+enabled = false
+"#;
+        let cfg = crate::config::parse_client(raw).unwrap();
+        assert!(cfg.proxies.is_empty(), "禁用条目应被摘掉而不是报错");
     }
 
     /// 已实现的字段即使写成**别的大小写**也不能再被误报。

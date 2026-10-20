@@ -362,10 +362,14 @@ fn ansi_enabled() -> bool {
 ///
 /// 上色只在**输出是终端**时才开：写文件时开关颜色没有意义，只会往文件里
 /// 塞 `\x1b[` 转义码（官方 `disableLogColor` 的默认行为也是写文件不上色）。
-pub fn init_tracing(default_level: &str, log_to: &str, max_days: i64) {
+///
+/// `disable_print_color`（官方 `log.disablePrintColor`，限制①批次1）在终端
+/// 场景下强制关闭 ANSI 颜色；写文件场景它没有可观察影响。
+pub fn init_tracing(default_level: &str, log_to: &str, max_days: i64, disable_print_color: bool) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = ansi_enabled() && !disable_print_color;
     match crate::logfile::sink_from_config(log_to, max_days) {
         Some(sink) => tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -376,7 +380,7 @@ pub fn init_tracing(default_level: &str, log_to: &str, max_days: i64) {
         None => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
-            .with_ansi(ansi_enabled())
+            .with_ansi(ansi)
             .init(),
     }
 }
@@ -393,6 +397,7 @@ pub fn init_tracing_reloadable(
     default_level: &str,
     log_to: &str,
     max_days: i64,
+    disable_print_color: bool,
 ) -> Option<LogFilterHandle> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_level))
@@ -416,7 +421,7 @@ pub fn init_tracing_reloadable(
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_target(false)
-                    .with_ansi(ansi_enabled()),
+                    .with_ansi(ansi_enabled() && !disable_print_color),
             )
             .init(),
     }
@@ -620,6 +625,36 @@ pub async fn shutdown_signal() {
     tracing::info!("收到退出信号，开始优雅关闭");
 }
 
+/// 给一条已建立的 TCP 连接打开 keepalive，并把空闲时长设为 `secs` 秒。
+///
+/// 限制①批次2 的两个配置项都落到这里：
+/// - 客户端 `dialServerKeepalive`（官方拨号器 `libnet.WithKeepAlive`，作用于
+///   控制连接与每条新拨的工作连接）；
+/// - 服务端 `tcpKeepalive`（官方在 `bind_port` 主监听器 `SetKeepAlive`，
+///   作用于所有从主端口接下的 TCP 连接）。
+///
+/// 语义就是内核级 TCP keepalive：连接空闲 `secs` 秒后内核开始发探测包，
+/// 连续无响应时**由内核**断开连接 —— 对"对端进程已死但 TCP 还没察觉"的
+/// 僵连接，通常比应用层心跳更早清掉。
+///
+/// 调用本函数即顺带打开 `SO_KEEPALIVE`（socket2 的文档保证）。
+/// `secs = 0`（关闭）由调用方过滤 —— 项目约定"0 = 关掉这项"。
+pub fn set_tcp_keepalive(stream: &tokio::net::TcpStream, secs: u64) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(secs));
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
+
+/// 读回一条 TCP 连接是否已打开 keepalive（测试 / 排障用，全平台可用）。
+pub fn tcp_keepalive_enabled(stream: &tokio::net::TcpStream) -> std::io::Result<bool> {
+    socket2::SockRef::from(stream).keepalive()
+}
+
+/// 读回 keepalive 的空闲时长（仅 Unix：Windows 没有对应的 getsockopt）。
+#[cfg(unix)]
+pub fn tcp_keepalive_idle(stream: &tokio::net::TcpStream) -> std::io::Result<std::time::Duration> {
+    socket2::SockRef::from(stream).tcp_keepalive_time()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +849,30 @@ mod tests {
         let d4 = f4.observe();
         assert!(d4.first && d4.emit(), "首次出现的日志必须照常写出");
         assert_eq!(d4.suffix(), "", "首次出现不该带汇总后缀");
+    }
+
+    /// 限制①批次2：TCP keepalive 设置后必须真的落到 socket 上。
+    ///
+    /// 全平台断言 `SO_KEEPALIVE` 从关到开；Unix 上额外断言空闲时长读回一致
+    /// （Windows 没有对应的 getsockopt，socket2 的 `tcp_keepalive_time`
+    /// 不覆盖 Windows）。
+    #[tokio::test]
+    async fn tcp_keepalive_能设置并读回() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = tokio::spawn(async move { l.accept().await.unwrap().0 });
+        let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _s = h.await.unwrap();
+
+        // 默认是关的（两个平台的 socket 默认值都是关）
+        assert!(!tcp_keepalive_enabled(&c).unwrap(), "默认不该是开的");
+        set_tcp_keepalive(&c, 123).unwrap();
+        assert!(tcp_keepalive_enabled(&c).unwrap(), "设置后要真的开");
+        #[cfg(unix)]
+        assert_eq!(
+            tcp_keepalive_idle(&c).unwrap(),
+            std::time::Duration::from_secs(123),
+            "空闲时长读回要一致"
+        );
     }
 }

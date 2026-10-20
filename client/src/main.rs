@@ -27,7 +27,7 @@ use nfrp_common::{
         self,
         conn::{self, FrpConn},
         msg::{self, FrpMessage, NewProxy, Ping},
-        mux::MuxSession,
+        mux::{MuxKeepalive, MuxSession},
         stream::BoxStream,
         tls,
     },
@@ -35,7 +35,7 @@ use nfrp_common::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::{
-    net::{TcpStream, UdpSocket},
+    net::{TcpSocket, TcpStream, UdpSocket},
     time::interval,
 };
 use tracing::{debug, error, info, warn};
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
         .log_level
         .clone()
         .unwrap_or_else(|| cfg.log_level.clone());
-    util::init_tracing(&level, &cfg.log_to, cfg.max_days);
+    util::init_tracing(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color);
 
     // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frpc 默认 strict 解析，
     // 未知字段**直接报错**；NFrp 的 serde 不拒绝未知字段，于是它们被**静默
@@ -730,7 +730,12 @@ impl ServerLink {
 
         let mux = if quic.is_none() && cfg.tcp_mux {
             let stream = raw_connect(&cfg).await?;
-            Some(MuxSession::new(stream))
+            // yamux 保活（限制①批次2，官方 `tcpMuxKeepaliveInterval`）：
+            // 0 = 关闭看门狗（None），默认 30 秒。
+            Some(MuxSession::new(
+                stream,
+                MuxKeepalive::from_secs(cfg.tcp_mux_keepalive_interval),
+            ))
         } else {
             None
         };
@@ -764,6 +769,88 @@ async fn quic_server_addr(cfg: &ClientConfig) -> Result<std::net::SocketAddr> {
         .with_context(|| format!("解析服务端 QUIC 地址 {s} 失败"))
 }
 
+/// 带 `dialServerTimeout` / `connectServerLocalIP` 的拨号（限制①批次1）。
+///
+/// 官方语义（`pkg/config/v1/connector.go` 的建连路径）：
+/// * `dialServerTimeout`（默认 10 秒）—— 建连超时，**控制连接与每条新拨的
+///   工作连接都过这里**（`tcpMux = true` 时工作连接复用控制连接，不再拨号）；
+/// * `connectServerLocalIP` —— 拨号前把本地出口绑到指定 IP（官方注释：仅
+///   TCP / WebSocket 协议有效，KCP 不支持；nfrp 同样只在 TCP 路径用它）；
+/// * `dialServerKeepalive`（默认 7200 秒）—— 建连成功后给 socket 打开
+///   `SO_KEEPALIVE` 并把空闲时长设为该值（`0` = 不打开）。
+///
+/// `dial_server_timeout = 0` 表示**不设超时**（跟随系统默认），与项目其它
+/// 超时项"0 = 关掉这项"的约定一致（官方把 0 折算成 10，这里不复刻）。
+async fn dial_server(cfg: &ClientConfig, addr: std::net::SocketAddr) -> Result<TcpStream> {
+    let fut = async {
+        if cfg.connect_server_local_ip.trim().is_empty() {
+            return TcpStream::connect(addr).await.map_err(anyhow::Error::from);
+        }
+        let local = parse_local_bind(&cfg.connect_server_local_ip)?;
+        let socket = match (local, addr) {
+            (std::net::SocketAddr::V4(_), std::net::SocketAddr::V4(_)) => TcpSocket::new_v4(),
+            (std::net::SocketAddr::V6(_), std::net::SocketAddr::V6(_)) => TcpSocket::new_v6(),
+            _ => {
+                return Err(anyhow!(
+                    "connectServerLocalIP 与远端地址的协议族不一致：本地是 {local}，远端是 {addr}"
+                ))
+            }
+        }?;
+        // 本地端口默认取 0（让内核分配），与官方 `ResolveTCPAddr` 缺端口补 0 一致。
+        socket
+            .bind(local)
+            .with_context(|| format!("绑定本地地址 {local} 失败"))?;
+        socket.connect(addr).await.map_err(anyhow::Error::from)
+    };
+    let stream = if cfg.dial_server_timeout == 0 {
+        fut.await
+    } else {
+        let limit = Duration::from_secs(cfg.dial_server_timeout);
+        tokio::time::timeout(limit, fut).await.map_err(|_| {
+            anyhow!(
+                "等待建连超时（dialServerTimeout = {} 秒；设 0 可关闭该超时）",
+                cfg.dial_server_timeout
+            )
+        })?
+    }?;
+
+    // TCP keepalive（限制①批次2，官方 `dialServerKeepalive`）：官方挂在拨号器
+    // （`libnet.WithKeepAlive`）上，控制连接与每条新拨的工作连接都过这里，
+    // 所以放在 `dial_server` 出口处一次覆盖。`0` = 不打开（项目约定）。
+    if cfg.dial_server_keepalive > 0 {
+        if let Err(e) = util::set_tcp_keepalive(&stream, cfg.dial_server_keepalive) {
+            warn!(
+                "设置 TCP keepalive 失败（dialServerKeepalive = {} 秒）：{e}",
+                cfg.dial_server_keepalive
+            );
+        }
+    }
+    Ok(stream)
+}
+
+/// 解析 `connectServerLocalIP`：接受 `IP`（端口补 0）或 `IP:端口`。
+///
+/// 带方括号的 IPv6（`[::1]:0`）与裸 IPv6（`::1`，按整个字符串当地址解析、
+/// 端口 0）都认；解析不出来就报错，不做猜测。
+fn parse_local_bind(raw: &str) -> Result<std::net::SocketAddr> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(anyhow!("connectServerLocalIP 是空串"));
+    }
+    // 先按完整 SocketAddr 解析（`1.2.3.4:0` / `[::1]:0`）
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return Ok(sa);
+    }
+    // 再按裸 IP 解析（端口取 0）
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 0));
+    }
+    Err(anyhow!(
+        "connectServerLocalIP {s:?} 不是合法地址（应为 `IP` 或 `IP:端口`；\
+         IPv6 带端口要写方括号，如 `[::1]:0`）"
+    ))
+}
+
 /// 建立一条到服务端的底层连接（TCP，按需 TLS，按需 WebSocket）。
 ///
 /// 套壳顺序与官方 frpc 一致：`TCP -> [TLS] -> [WebSocket]`，
@@ -777,7 +864,7 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     let addr = util::resolve_addr(&server)
         .await
         .with_context(|| format!("解析服务端地址 {server} 失败"))?;
-    let stream = TcpStream::connect(addr)
+    let stream = dial_server(cfg, addr)
         .await
         .with_context(|| format!("连接 {addr} 失败"))?;
     stream.set_nodelay(true).ok();
@@ -1604,6 +1691,87 @@ mod tests {
 
     use super::*;
 
+    /// 限制①批次2：`dialServerKeepalive > 0` 时拨号成功返回的 socket 必须真的
+    /// 开上 TCP keepalive；`0` 时保持内核默认（不开）。
+    ///
+    /// ★★ v0.5.10 修（云端 Linux 实测 `Connection refused (os error 111)`）：
+    /// 原先的 accept task **只等一次连接就结束** ——
+    ///
+    /// ```rust
+    /// tokio::spawn(async move { let _ = l.accept().await; });  // ← 只 accept 一次
+    /// let s  = dial_server(&cfg,  addr)...;   // 第 1 次 OK
+    /// let s2 = dial_server(&cfg0, addr)...;   // 第 2 次：listener 已 drop ⇒ ECONNREFUSED
+    /// ```
+    ///
+    /// 本机（Windows）能过，是因为第 2 次 `connect` 恰好在 listener 被回收前
+    /// 完成了三次握手；Linux 上 listener 一 drop 端口立即失效 ⇒ 稳定失败。
+    ///
+    /// ⇒ 改成**常驻 accept 循环**（与产品 `web::run` / `serve.rs` 的写法一致）。
+    ///   本测试要验证的是 keepalive 的 setsockopt 行为，与 accept 次数无关。
+    #[tokio::test]
+    async fn dial_server_按配置开_keepalive() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 常驻：本测试会拨两次号
+            while let Ok((stream, _)) = l.accept().await {
+                drop(stream);
+            }
+        });
+
+        let cfg = ClientConfig {
+            dial_server_timeout: 5,
+            dial_server_keepalive: 321,
+            ..Default::default()
+        };
+        let s = dial_server(&cfg, addr).await.unwrap();
+        assert!(
+            util::tcp_keepalive_enabled(&s).unwrap(),
+            "dialServerKeepalive > 0 时必须开 SO_KEEPALIVE"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            util::tcp_keepalive_idle(&s).unwrap(),
+            std::time::Duration::from_secs(321),
+            "空闲时长要等于 dialServerKeepalive"
+        );
+
+        // 0 = 不打开
+        let cfg0 = ClientConfig {
+            dial_server_timeout: 5,
+            dial_server_keepalive: 0,
+            ..Default::default()
+        };
+        let s2 = dial_server(&cfg0, addr).await.unwrap();
+        assert!(
+            !util::tcp_keepalive_enabled(&s2).unwrap(),
+            "dialServerKeepalive = 0 时不得开"
+        );
+    }
+
+    /// `connectServerLocalIP` 的解析：`IP`、`IP:端口`、带方括号的 IPv6 都要认，
+    /// 垃圾输入要明确报错（限制①批次1）。
+    #[test]
+    fn connect_server_local_ip_解析() {
+        let a = parse_local_bind("192.168.1.5").unwrap();
+        assert_eq!(a.ip().to_string(), "192.168.1.5");
+        assert_eq!(a.port(), 0);
+
+        let a = parse_local_bind("192.168.1.5:1234").unwrap();
+        assert_eq!(a.port(), 1234);
+
+        let a = parse_local_bind("::1").unwrap();
+        assert!(a.is_ipv6());
+        assert_eq!(a.port(), 0);
+
+        let a = parse_local_bind("[::1]:0").unwrap();
+        assert!(a.is_ipv6());
+        assert_eq!(a.port(), 0);
+
+        assert!(parse_local_bind("not-an-ip").is_err());
+        assert!(parse_local_bind("").is_err());
+    }
+
     /// 测试里统一用的 `user`（真实场景就是 Lolia 那份配置里的 `user = '2569'`）。
     const USER: &str = "alice";
 
@@ -1663,6 +1831,13 @@ mod tests {
             bandwidth_limit: "1MB".into(),
             bandwidth_limit_mode: "server".into(),
             metas: [("pk".to_string(), "pv".to_string())].into_iter().collect(),
+            // 限制①批次1：注解要随 NewProxy 透传（官方 `m.Annotations = c.Annotations`）
+            annotations: [("example.com/team".to_string(), "infra".to_string())]
+                .into_iter()
+                .collect(),
+            // `enabled` 不参与注册报文：`Some(false)` 的条目在解析期就被摘掉了
+            //（官方 FilterClientConfigurers），注册时恒为 None。
+            enabled: None,
             group: "web".into(),
             group_key: "gk".into(),
             health_check_type: "http".into(),
@@ -1967,6 +2142,8 @@ bandwidthLimitMode = 'server'
         assert_eq!(tcp.bandwidth_limit, c.bandwidth_limit);
         assert_eq!(tcp.bandwidth_limit_mode, c.bandwidth_limit_mode);
         assert_eq!(tcp.metas, c.metas);
+        // 限制①批次1：注解必须跟着走（服务端只存不查，但报文要逐字段对齐官方）
+        assert_eq!(tcp.annotations, c.annotations);
 
         // 用 http 分支检查「路由类」字段
         let http = NewProxy::from_config(
