@@ -1,4 +1,4 @@
-﻿/* ===========================================================================
+/* ===========================================================================
    NFrp 文档站点样式
    ---------------------------------------------------------------------------
    设计取向：
@@ -347,24 +347,93 @@ a:hover {
   margin: 0 auto;
 }
 
-/* 页面切换动画 */
-.page {
-  animation: pageIn 300ms var(--ease);
-}
+/* 页面切换：顺序交接
+   为什么不用"两页叠加的交叉淡入淡出"：
+   两页内容结构完全不同（表格 / 代码块 / 卡片各不一样），
+   叠加时会在交叉点形成两层文字重影，观感比直接闪切更差。
+   （第一版就是这么做的，截图里能明显看到标题互相压着。）
 
-@keyframes pageIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
+   改成顺序交接：旧页 140ms 退场 → 新页 240ms 入场。
+   总时长约 380ms，眼睛感受到的是"翻页"，不是"闪一下"。
+   动画只用 transform + opacity（GPU 合成，不触发 reflow）。 */
 
 .page[hidden] {
   display: none;
+}
+
+/* 进入：从下方 8px 淡入 */
+.page-enter {
+  animation: pageEnter 240ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* 退出：向上 6px 淡出。用 absolute 保持原位，
+   避免退场期间内容高度变化导致页面跳动 */
+.page-exit {
+  position: absolute;
+  top: calc(var(--header-h) + 38px);
+  left: var(--sidebar-w);
+  right: 40px;
+  width: min(var(--content-max), calc(100% - var(--sidebar-w) - 80px));
+  margin: 0 auto;
+  pointer-events: none;
+  animation: pageExit 140ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+@keyframes pageExit {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0);
+  }
+}
+
+/* 减少动态偏好：不做位移，只保留极短淡入 */
+@media (prefers-reduced-motion: reduce) {
+  .page-enter {
+    animation: pageFade 120ms ease both;
+  }
+  .page-exit {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+@keyframes pageFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 960px) {
+  .page-exit {
+    left: 0;
+    right: 20px;
+    width: auto;
+  }
+}
+
+@media (max-width: 960px) {
+  .page-exit {
+    left: 0;
+    padding: 0 20px;
+  }
 }
 
 /* ---------- 排版 ---------- */

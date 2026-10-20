@@ -62,6 +62,15 @@
     return h.replace(/\/$/, '') || 'home';
   }
 
+  /* ---------- 页面切换：交叉过渡 ---------- */
+  // 当前正在显示的页面（用于撤销上一次未完成的过渡）
+  let activeEl = null;
+  let switchTimer = null;
+
+  const REDUCED = window.matchMedia
+    ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    : false;
+
   function activate(id) {
     // 找不到就退回首页
     let target = $('#page-' + id);
@@ -70,30 +79,71 @@
       target = $('#page-home');
     }
 
-    $$('.page').forEach(function (p) {
-      p.hidden = p !== target;
-    });
-
-    // 重新触发进场动画
-    target.classList.remove('page');
-    void target.offsetWidth;
-    target.classList.add('page');
-
-    // 侧栏高亮
+    // 1) 侧栏高亮立刻更新（用户最先看的是这里，不该等动画）
     $$('.nav-link').forEach(function (a) {
       const href = (a.getAttribute('href') || '').replace(/^#\/?/, '') || 'home';
       a.classList.toggle('active', href === id);
     });
 
+    // 2) 滚动到顶部（在切换前做，避免动画期间跳动）
+    if (!location.hash.includes('#', 2)) {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+
+    const old = activeEl;
+    activeEl = target;
+
+    // 同一个页面重复点击：不重播动画
+    if (old === target) {
+      return;
+    }
+
+    clearTimeout(switchTimer);
+
+    // 3) 新页面先占位但不显示；旧页面淡出后再入场
+    //    不用"两页叠加"的交叉 —— 因为两页内容结构完全不同，
+    //    叠加会形成两层文字重影，观感比闪切更差。
+    //    这里做的是"顺序交接"：旧页 140ms 退场 → 新页 240ms 入场。
+    target.classList.remove('page-exit');
+    target.classList.remove('page-enter');
+
+    if (old && old !== target && !REDUCED) {
+      // 旧页还在：让它淡出，退场结束才显示新页
+      old.classList.add('page-exit');
+      old.hidden = false;
+
+      switchTimer = setTimeout(function () {
+        old.hidden = true;
+        old.classList.remove('page-exit');
+        target.hidden = false;
+        target.classList.add('page-enter');
+        void target.offsetWidth;
+        window.clearTimeout(switchTimer);
+        switchTimer = setTimeout(function () {
+          target.classList.remove('page-enter');
+        }, 300);
+      }, 140);
+    } else {
+      // 首次进入 / 减少动态偏好：直接显示并淡入
+      if (old && old !== target) {
+        old.hidden = true;
+        old.classList.remove('page-exit');
+      }
+      target.hidden = false;
+      if (!REDUCED) {
+        target.classList.add('page-enter');
+        void target.offsetWidth;
+        switchTimer = setTimeout(function () {
+          target.classList.remove('page-enter');
+        }, 300);
+      }
+    }
+
+    // 6) 内容增强（这些与动画无关，立即做）
     buildPager(target, id);
     decorateCodeBlocks(target);
     observeReveals(target);
     closeDrawer();
-
-    // 滚动到顶部（除非是页内锚点）
-    if (!location.hash.includes('#', 2)) {
-      window.scrollTo({ top: 0, behavior: 'auto' });
-    }
 
     document.title =
       (ORDER.find(function (o) { return o.id === id; }) || { title: '文档' }).title +
