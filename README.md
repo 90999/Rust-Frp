@@ -26,6 +26,10 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 资源占用很小：服务端常驻内存约 3.5 MB（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无运行时依赖。
 
+> **完整文档**：<https://nu0vo1212.github.io/Rust-Frp/>
+> 涵盖安装、全部配置项、八种代理类型、线协议（v1 / v2）详解、ACL / RBAC、审计日志、HTTP API 与安全修复史。
+> 源文件在 [`docs/`](docs/)，本地预览：`python -m http.server -d docs 8899`
+
 ## 安装
 
 ### 方式一：crates.io（推荐 Rust 用户）
