@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NFrp 文档 · Rust 实现的内网穿透工具</title>
+<meta name="description" content="NFrp —— Rust 重实现的内网穿透工具，完整兼容官方 frp 协议 v1/v2。配置、协议、安全、API 与变更记录。">
+<meta name="color-scheme" content="dark light">
+<meta property="og:title" content="NFrp 文档">
+<meta property="og:description" content="Rust 实现的内网穿透工具，完整兼容官方 frp 协议 v1 / v2">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
+<link rel="icon" type="image/png" sizes="128x128" href="assets/icon-128.png">
+<link rel="apple-touch-icon" href="assets/icon-256.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- ====================== 顶部栏 ====================== -->
+<header class="header">
+  <button class="icon-btn menu-btn" id="menuBtn" aria-label="打开导航" aria-expanded="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+
+  <a class="brand" href="#/">
+    <img class="brand-mark" src="assets/icon-128.png" alt="NFrp" width="26" height="26">
+    <span>NFrp</span>
+    <span class="brand-sub" id="verBadge">0.6.1</span>
+  </a>
+
+  <div class="header-spacer"></div>
+
+  <div class="header-actions">
+    <a class="icon-btn" id="ghLink" href="https://github.com/Nu0vo1212/Rust-Frp" target="_blank" rel="noopener" aria-label="GitHub 仓库">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.55v-1.94c-3.2.7-3.88-1.54-3.88-1.54-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.41-2.69 5.38-5.25 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+    </a>
+    <button class="icon-btn" id="themeBtn" aria-label="切换主题">
+      <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+    </button>
+  </div>
+</header>
+
+<div class="scrim" id="scrim"></div>
+
+<!-- ====================== 侧栏导航 ====================== -->
+<nav class="sidebar" id="sidebar" aria-label="文档导航">
+  <div class="nav-group">
+    <div class="nav-title">开始</div>
+    <a class="nav-link" href="#/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>概览</a>
+    <a class="nav-link" href="#/install"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>安装</a>
+    <a class="nav-link" href="#/quickstart"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg>快速开始</a>
+  </div>
+
+  <div class="nav-group">
+    <div class="nav-title">配置</div>
+    <a class="nav-link" href="#/config-server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg>服务端</a>
+    <a class="nav-link" href="#/config-client"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>客户端</a>
+    <a class="nav-link" href="#/proxies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>代理类型</a>
+    <a class="nav-link" href="#/plugins"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5M9 7V2M15 7V2"/><path d="M6 7h12a1 1 0 0 1 1 1v4a6 6 0 0 1-6 6h-2a6 6 0 0 1-6-6V8a1 1 0 0 1 1-1z"/></svg>插件</a>
+    <a class="nav-link" href="#/transports"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22v-7"/></svg>传输层</a>
+  </div>
+
+  <div class="nav-group">
+    <div class="nav-title">协议</div>
+    <a class="nav-link" href="#/protocol"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>线协议总览</a>
+    <a class="nav-link" href="#/protocol-v1"><svg viewBox="0 0 24 24" fill="none" stroke="#currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>v1 与加密</a>
+    <a class="nav-link" href="#/protocol-v2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>v2 与 AEAD</a>
+    <a class="nav-link" href="#/messages"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>消息类型</a>
+  </div>
+
+  <div class="nav-group">
+    <div class="nav-title">安全</div>
+    <a class="nav-link" href="#/security"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>安全模型</a>
+    <a class="nav-link" href="#/acl-rbac"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg>ACL 与 RBAC</a>
+    <a class="nav-link" href="#/audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>审计日志</a>
+    <a class="nav-link" href="#/changes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="10"/></svg>安全修复史</a>
+  </div>
+
+  <div class="nav-group">
+    <div class="nav-title">参考</div>
+    <a class="nav-link" href="#/api"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>HTTP API</a>
+    <a class="nav-link" href="#/library"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>作为库使用</a>
+    <a class="nav-link" href="#/compat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>与官方 frp 互通</a>
+  </div>
+</nav>
+
+<!-- ====================== 主内容 ====================== -->
+<main class="main">
+<div class="content">
+
+<!-- ============ 概览 ============ -->
+<section class="page" id="page-home" hidden>
+  <div class="hero">
+    <span class="hero-badge"><span class="dot"></span>v0.6.1 · 协议与 frp 0.71.0 实测互通</span>
+    <h1>把内网服务<span class="grad">安全地</span>带到公网</h1>
+    <p class="lead">
+      Nfrp 是 <a href="https://github.com/fatedier/frp" target="_blank" rel="noopener">fatedier/frp</a>
+      的 Rust 重实现，完整兼容官方 line protocol v1 与 v2。
+      官方 frpc / frps 不需要改任何配置就能连上，而服务端常驻内存只有单个数字兆字节。
+    </p>
+    <div class="hero-actions">
+      <a class="btn primary" href="#/quickstart">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        快速开始
+      </a>
+      <a class="btn" href="#/protocol">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+        线协议
+      </a>
+      <a class="btn" href="https://github.com/Nu0vo1212/Rust-Frp/releases" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg>
+        下载
+      </a>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat reveal"><div class="stat-value">3.5 MB</div><div class="stat-label">服务端常驻内存</div></div>
+    <div class="stat reveal"><div class="stat-value">140</div><div class="stat-label">已修复安全问题</div></div>
+    <div class="stat reveal"><div class="stat-value">757</div><div class="stat-label">自动化测试</div></div>
+    <div class="stat reveal"><div class="stat-value">8</div><div class="stat-label">代理类型</div></div>
+  </div>
+
+  <h2>为什么用它</h2>
+  <div class="cards">
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
+      <h4>零配置互通</h4>
+      <p>与官方 frps / frpc 0.71.0 实测互通。默认走 v1，与服务端默认值一致，官方客户端不用改一个字段就能连上。</p>
+    </div>
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg></div>
+      <h4>内存占用低一个数量级</h4>
+      <p>同负载下 Go 版 frps 为 28.8~31.8 MB，Nfrp 约 3.5 MB。单文件部署，无运行时依赖。</p>
+    </div>
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+      <h4>按安全产品的标准做</h4>
+      <p>十轮安全审计、140 项修复、每项都带回归测试与退回验证。ACL 覆盖全部数据面入口。</p>
+    </div>
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></div>
+      <h4>八种代理类型齐全</h4>
+      <p>tcp / udp / http / https / tcpmux / stcp / sudp / xtcp，与官方清单完全一致，含 UDP 打洞直连。</p>
+    </div>
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div>
+      <h4>也能当库用</h4>
+      <p>nfrp-common 已发布到 crates.io。只想要协议解析、配置读写、加密实现时，不必跑整个穿透服务。</p>
+    </div>
+    <div class="card reveal">
+      <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg></div>
+      <h4>四种传输层</h4>
+      <p>TCP、KCP、QUIC、WebSocket，外加 TLS 封装。弱网可以用 KCP，被墙可以用 WebSocket。</p>
+    </div>
+  </div>
+
+  <h2>这份文档怎么读</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>你想做的事</th><th>看哪里</th></tr></thead>
+      <tbody>
+        <tr><td>先把它跑起来</td><td><a href="#/install">安装</a> → <a href="#/quickstart">快速开始</a></td></tr>
+        <tr><td>改配置</td><td><a href="#/config-server">服务端配置</a> · <a href="#/config-client">客户端配置</a></td></tr>
+        <tr><td>选代理类型 / 传什么流量</td><td><a href="#/proxies">代理类型</a> · <a href="#/transports">传输层</a></td></tr>
+        <tr><td>理解它怎么和 frp 通信</td><td><a href="#/protocol">线协议</a> · <a href="#/protocol-v1">v1</a> · <a href="#/protocol-v2">v2</a></td></tr>
+        <tr><td>限制谁能连、能做什么</td><td><a href="#/acl-rbac">ACL 与 RBAC</a> · <a href="#/security">安全模型</a></td></tr>
+        <tr><td>在代码里用它的协议实现</td><td><a href="#/library">作为库使用</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 安装 ============ -->
+<section class="page" id="page-install" hidden>
+  <h1>安装</h1>
+  <p class="lead">三种方式，按你的场景选。</p>
+
+  <h2>方式一：下载预编译二进制</h2>
+  <p>从 <a href="https://github.com/Nu0vo1212/Rust-Frp/releases" target="_blank" rel="noopener">Releases</a> 取对应平台的包：</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>平台</th><th>文件</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>Windows amd64</td><td><code>nfrp-windows-amd64.zip</code></td><td>frps.exe / frpc.exe</td></tr>
+        <tr><td>Linux amd64</td><td><code>nfrp-linux-amd64.tar.gz</code></td><td>动态链接 glibc</td></tr>
+        <tr><td>Linux arm64</td><td><code>nfrp-linux-arm64.tar.gz</code></td><td>全静态，无 glibc 依赖</td></tr>
+        <tr><td>Android</td><td><code>nfrp-android-v0.6.1.zip</code></td><td>aarch64 + x86_64</td></tr>
+        <tr><td>源码</td><td><code>nfrp-src-v0.6.1.tar.gz</code></td><td>完整源码快照</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>方式二：通过 crates.io</h2>
+  <p>已装 Rust 工具链的话最省事：</p>
+  <pre><code>cargo install nfrp-server nfrp-client</code></pre>
+
+  <div class="callout">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <div>
+      <strong>版本号是分开的</strong>
+      <p>crates.io 上的版本与本页 Release 的版本相互独立。比如 Release 是 <code>v0.6.1</code> 而 crates.io 上可能是 <code>0.6.2</code> —— 因为 crates.io 不允许重发同一版本号，连修个 README 也得升版本。<strong>功能以 Release 为准</b></strong>。</p>
+    </div>
+  </div>
+
+  <h2>方式三：从源码构建</h2>
+  <pre><code>git clone https://github.com/Nu0vo1212/Rust-Frp
+cd Rust-Frp
+cargo build --release
+# 产物在 target/release/ 下</code></pre>
+
+  <h2>验证安装</h2>
+  <pre><code>nfrp-server -V     # nfrp-server 0.6.1
+nfrp-server -v     # 0.71.0    ← 输出 frp 协议版本，便于按版本号判断的客户端/面板识别
+nfrp-client -V     # nfrp-client 0.6.1</code></pre>
+
+  <div class="callout">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <div>
+      <strong><code>-v</code> 为什么输出 0.71.0</strong>
+      <p>这是刻意的。很多管理面板会读 <code>-v</code> 判断对端版本，输出成 <code>0.71.0</code> 才会被当成"正常的 frp"对待。要看 Nfrp 自己的版本用 <code>-V</code>。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 快速开始 ============ -->
+<section class="page" id="page-quickstart" hidden>
+  <h1>快速开始</h1>
+  <p class="lead">两分钟跑通一条隧道：把内网的 SSH 服务暴露到公网。</p>
+
+  <h2>第一步：在公网服务器上启动 frps</h2>
+  <pre><code>cat &gt; frps.toml &lt;&lt;'EOF'
+bind_addr = "0.0.0.0"
+bind_port = 7000
+
+[auth]
+token = "换成你自己的长口令"
+EOF
+
+nfrp-server -c frps.toml</code></pre>
+
+  <div class="callout warn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+    <div>
+      <strong>一定要配 <code>auth.token</code></strong>
+      <p>不配 token 又绑在对外地址上，服务端会<strong>拒绝启动</strong> —— 因为那等于对外开放一个无认证的穿透节点。这是刻意的。</p>
+    </div>
+  </div>
+
+  <h2>第二步：在内网机器上启动 frpc</h2>
+  <pre><code>cat &gt; frpc.toml &lt;&lt;'EOF'
+server_addr = "你的服务器 IP"
+server_port = 7000
+
+[auth]
+token = "与上面一致的口令"
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 6000
+EOF
+
+nfrp-client -c frpc.toml</code></pre>
+
+  <h2>第三步：连</h2>
+  <pre><code>ssh -p 6000 你的用户名@你的服务器IP</code></pre>
+  <p>流量路径是：你的终端 → 服务器 6000 端口 → 加密隧道 → 内网机器的 22 端口。</p>
+
+  <h2>如果用的是官方 frpc</h2>
+  <p>什么都不用改。Nfrp 的 frps 默认走 v1，与官方默认值一致，官方 frpc 直接连就行：</p>
+  <pre><code># 官方 frpc 直接指向 nfrp-server 的端口即可
+./frpc -c frpc.toml</code></pre>
+
+  <h2>下一步</h2>
+  <ul>
+    <li>要按域名访问 HTTP 服务 → 看 <a href="#/proxies">http / https 代理</a></li>
+    <li>要做点对点直连（不经服务端） → 看 <a href="#/proxies">xtcp</a></li>
+    <li>要限制来源 IP → 看 <a href="#/acl-rbac">ACL</a></li>
+    <li>要开管理面板 → 看 <a href="#/config-server">服务端配置</a></li>
+  </ul>
+</section>
+
+<!-- 其余页面由 pages.html.js 注入 -->
+<div id="dynamicPages"></div>
+
+</div>
+</main>
+
+<script src="assets/pages.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
