@@ -286,6 +286,16 @@ pub async fn serve_on_with(
     //   "没有访问控制"，那比起不来危险得多。
     let security = Arc::new(crate::guard::SecurityContext::from_config(&cfg)?);
     registry.set_security(security.clone());
+
+    // group 负载均衡策略：默认 roundrobin（与官方 frp 的 channel fan-out 行为一致）。
+    let lb = crate::registry::LbPolicy::parse(&cfg.lb_policy);
+    registry.set_lb_policy(lb);
+    if lb != crate::registry::LbPolicy::RoundRobin {
+        info!(
+            policy = lb.as_str(),
+            "已启用非默认的 group 负载均衡策略（官方 frp 为 roundrobin）"
+        );
+    }
     // OIDC 模式下顺带拉一次 JWKS。拉不到只告警、不拦启动
     // （IdP 可能只是暂时不可达），期间登录会被明确拒绝而不是放行。
     if let Err(e) = security.refresh_oidc().await {
@@ -526,10 +536,24 @@ pub async fn serve_on_with(
         let kaddr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, kport))
             .await
             .with_context(|| format!("解析 KCP 地址 {}:{} 失败", cfg.bind_addr, kport))?;
+        // ★ v0.6.2：会话上限可配（默认 1024，约 15 MB 峰值）。
+        //
+        // 这是内存上界的**唯一**决定因素：KCP 每会话约 15.3 KB。
+        // 超大规模部署应该拆实例或改用 TCP/QUIC 承载控制连接，
+        // 而不是无限调大这个值。
+        let max_sess = if cfg.kcp_max_sessions == 0 {
+            nfrp_common::frp::kcp::MAX_KCP_SESSIONS
+        } else {
+            cfg.kcp_max_sessions
+        };
         let listener = frp::kcp::KcpListener::bind(kaddr)
             .await
-            .with_context(|| format!("监听 KCP {kaddr} 失败（端口可能被占用）"))?;
-        info!("KCP 传输已启用，UDP {kaddr}（TCP {addr} 照旧可用）");
+            .with_context(|| format!("监听 KCP {kaddr} 失败（端口可能被占用）"))?
+            .with_max_sessions(max_sess);
+        info!(
+            "KCP 传输已启用，UDP {kaddr}（TCP {addr} 照旧可用），会话上限 {}",
+            listener.max_sessions()
+        );
         let cfg2 = cfg.clone();
         let registry2 = registry.clone();
         tokio::spawn(async move {

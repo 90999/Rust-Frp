@@ -118,8 +118,52 @@ vhostHTTPSPort = 443    # https 代理入口</code></pre>
 <tr><td><code>max_conns_per_client</code></td><td>单客户端连接上限</td></tr>
 <tr><td><code>max_proxies_per_client</code></td><td>单客户端代理数上限</td></tr>
 <tr><td><code>allow_ports</code></td><td>允许申请的远端端口范围，如 <code>["20000-30000"]</code></td></tr>
+<tr><td><code>kcp_max_sessions</code></td><td>KCP 会话表上限，默认 1024（约 15 MB 峰值）</td></tr>
 </tbody>
 </table>
+</div>
+
+<h2>group 负载均衡策略</h2>
+<p>同 <code>group</code> 的多个代理共享一个公网端口，用户连接在它们之间分摊。策略由 <code>lb_policy</code> 决定：</p>
+<pre><code>lb_policy = "roundrobin"   # 默认</code></pre>
+<div class="table-wrap">
+<table>
+<thead><tr><th>值</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td><code>roundrobin</code>（默认）</td><td>严格 1/N 轮询，<strong>与官方 frp 一致</strong></td></tr>
+<tr><td><code>leastconn</code></td><td>优先给在途连接最少的后端，能力不均时更优</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+<div>
+<strong>为什么默认是轮询</strong>
+<p>官方 <code>server/group/*.go</code> 用 channel fan-out 实现：真实监听器把连接丢进共享 <code>acceptCh</code>，哪个代理先 <code>Accept()</code> 谁拿到，效果就是无状态轮询。它行为可预测，把"谁不健康"交给健康检查去处理，而不是让调度器猜。</p>
+<p><code>leastconn</code> 是本项目的超集能力，调度完全发生在服务端内部，开它不影响与官方客户端的互通。</p>
+</div>
+</div>
+
+<h2>KCP 会话上限</h2>
+<pre><code>kcp_max_sessions = 1024   # 默认</code></pre>
+<p>KCP 是"每个 UDP 源端口一个会话"的模型，每会话约占 15.3 KB。<strong>这个值直接决定内存上界</strong>：值 × 15.3 KB。</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>值</th><th>峰值内存</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>1024（默认）</td><td>≈ 15 MB</td><td>绝大多数部署</td></tr>
+<tr><td>4096</td><td>≈ 62 MB</td><td>数千客户端的单实例</td></tr>
+<tr><td>16384</td><td>≈ 250 MB</td><td>需确认内存充足</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warn">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+<div>
+<strong>超大规模不要靠调大这个值</strong>
+<p>正确做法是：① 用 TCP 或 QUIC 承载控制连接（KCP 只在两者都走不通时才需要）；② 或在前面挂负载均衡，把客户端拆到多个 frps 实例上。</p>
+<p>低于 64 会被自动抬到安全下限 —— 配成 0 等于关掉 KCP，那属于静默失效，比拒绝启动更难排查。</p>
+</div>
 </div>
 
 <h2>VirtualNet 与 xtcp</h2>
@@ -958,7 +1002,7 @@ PAGES_ZH['changes'] = `
 <div class="stats">
 <div class="stat"><div class="stat-value">10</div><div class="stat-label">轮审计</div></div>
 <div class="stat"><div class="stat-value">140</div><div class="stat-label">修复项</div></div>
-<div class="stat"><div class="stat-value">757</div><div class="stat-label">测试</div></div>
+<div class="stat"><div class="stat-value">766</div><div class="stat-label">测试</div></div>
 <div class="stat"><div class="stat-value">0</div><div class="stat-label">未修复高危</div></div>
 </div>
 
@@ -977,6 +1021,9 @@ PAGES_ZH['changes'] = `
 <tr><td>八</td><td>v0.5.8</td><td>收尾第七轮遗留：xtcp 牵线 / 面板鉴权 / TLS 入站插件</td><td>5 项（1 高危）</td></tr>
 <tr><td>九</td><td>v0.5.9</td><td><strong>拿上一版自己写的"未覆盖面"当任务书</strong></td><td>9 项（4 中危）+ 1 加固</td></tr>
 <tr><td>十</td><td>v0.5.10</td><td>对已发布产物做全量复扫</td><td>0 新漏洞 / 8 处测试缺陷</td></tr>
+<tr><td>十一</td><td>v0.6.0</td><td>引入 Shannon 自主渗透测试器做外部复核</td><td>3 项（其余为对齐官方而保留）</td></tr>
+<tr><td>十二</td><td>v0.6.1</td><td>补齐面板管理操作的审计链</td><td>3 项</td></tr>
+<tr><td>十三</td><td>v0.6.3</td><td><strong>负载均衡 / KCP / 健康检查与官方 frp 对齐</strong></td><td>特性对齐 + 1 处调度缺陷</td></tr>
 </tbody>
 </table>
 </div>
@@ -990,7 +1037,7 @@ PAGES_ZH['changes'] = `
 <p>上一版的发版总结自己写着"UDP 代理端口、xtcp 牵线 UDP、管理面板不在 ACL 内"。第九轮就把这三条全修了，实测证据是"只改源地址，配置完全相同"的对照实验。</p>
 
 <h3>第九轮：KCP 放大 312 倍（中危）</h3>
-<p>代码注释原本写着"1:1 占用，非放大"。实测发现那个算法<strong>只算了会话里堆的数据，漏掉了会话本身的开销</strong>：757 KB 上行能让内存涨 238 MB。<br>
+<p>代码注释原本写着"1:1 占用，非放大"。实测发现那个算法<strong>只算了会话里堆的数据，漏掉了会话本身的开销</strong>：766 KB 上行能让内存涨 238 MB。<br>
 修法是给会话表加 1024 条上限。真正让它不到高危的理由是 KCP 默认不启用。</p>
 
 <h3>第十一轮：三条真发现</h3>

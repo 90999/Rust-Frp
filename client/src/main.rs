@@ -1845,6 +1845,10 @@ mod tests {
             health_check_max_failed: 5,
             health_check_interval_s: 11,
             health_check_url: "/healthz".into(),
+            health_check_http_headers: vec![nfrp_common::config::HttpHeader {
+                name: "Authorization".into(),
+                value: "Bearer x".into(),
+            }],
             plugin: "http_proxy".into(),
             plugin_local_path: "/tmp/x".into(),
             plugin_strip_prefix: "/p".into(),

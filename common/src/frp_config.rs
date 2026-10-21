@@ -1,4 +1,4 @@
-//! 原版 frp（Go 版）TOML 配置兼容层。
+﻿//! 原版 frp（Go 版）TOML 配置兼容层。
 //!
 //! # 为什么需要
 //!
@@ -639,6 +639,10 @@ pub fn normalize_client(root: &mut toml::Value) {
                 ("maxFailed", "health_check_max_failed"),
                 ("intervalSeconds", "health_check_interval_s"),
                 ("path", "health_check_url"),
+                // ★ v0.6.3：官方 `healthCheck.httpHeaders` ——
+                //   `[{ name = "Authorization", value = "Bearer x" }]`
+                //   整个数组搬过来，serde 按 `Vec<HttpHeader>` 解析。
+                ("httpHeaders", "health_check_http_headers"),
             ],
         );
 
@@ -1164,6 +1168,77 @@ intervalSeconds = 7
         assert_eq!(p.health_check_timeout_s, 5);
         assert_eq!(p.health_check_max_failed, 2);
         assert_eq!(p.health_check_interval_s, 7);
+    }
+
+    /// ★ v0.6.3 对齐官方：`healthCheck.httpHeaders` 必须被识别。
+    ///
+    /// 官方 `HealthCheckConfig.HTTPHeaders` 用于需要鉴权的健康检查端点。
+    /// 在支持它之前，这类端点一律探测失败 —— 表现为"服务明明活着，
+    /// 客户端却判定它不健康、把流量摘掉"。
+    #[test]
+    fn 官方的_healthcheck_httpheaders_能被解析() {
+        let text = r#"
+serverAddr = "127.0.0.1"
+serverPort = 17000
+
+[[proxies]]
+name = "api"
+type = "tcp"
+localIP = "10.0.0.5"
+localPort = 8080
+
+[proxies.healthCheck]
+type = "http"
+path = "/healthz"
+intervalSeconds = 5
+
+[[proxies.healthCheck.httpHeaders]]
+name = "Authorization"
+value = "Bearer secret-token"
+
+[[proxies.healthCheck.httpHeaders]]
+name = "X-Health-Source"
+value = "nfrp"
+"#;
+        let cfg = parse_client_toml(text).expect("官方写法应当能解析");
+        let p = &cfg.proxies[0];
+
+        assert_eq!(p.health_check_type, "http");
+        assert_eq!(p.health_check_url, "/healthz");
+        assert_eq!(
+            p.health_check_http_headers.len(),
+            2,
+            "两个 httpHeaders 都该被搬过来，实际：{:?}",
+            p.health_check_http_headers
+        );
+        assert_eq!(p.health_check_http_headers[0].name, "Authorization");
+        assert_eq!(p.health_check_http_headers[0].value, "Bearer secret-token");
+        assert_eq!(p.health_check_http_headers[1].name, "X-Health-Source");
+        assert_eq!(p.health_check_http_headers[1].value, "nfrp");
+    }
+
+    /// 不配 `httpHeaders` 时应当是空表，而不是报错。
+    #[test]
+    fn 没配_httpheaders_时是空表() {
+        let text = r#"
+serverAddr = "127.0.0.1"
+serverPort = 17000
+
+[[proxies]]
+name = "api"
+type = "tcp"
+localIP = "10.0.0.5"
+localPort = 8080
+
+[proxies.healthCheck]
+type = "http"
+path = "/healthz"
+"#;
+        let cfg = parse_client_toml(text).expect("应当能解析");
+        assert!(
+            cfg.proxies[0].health_check_http_headers.is_empty(),
+            "没配 httpHeaders 时必须是空表"
+        );
     }
 
     #[test]

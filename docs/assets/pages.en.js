@@ -1,4 +1,4 @@
-﻿/* ===========================================================================
+/* ===========================================================================
    NFrp Docs · Content pages
    ---------------------------------------------------------------------------
    Injected as HTML by app.js instead of being inlined in index.html,
@@ -120,8 +120,52 @@ vhostHTTPSPort = 443    # https proxy entry</code></pre>
 <tr><td><code>max_conns_per_client</code></td><td>Per-client connection cap</td></tr>
 <tr><td><code>max_proxies_per_client</code></td><td>Per-client proxy cap</td></tr>
 <tr><td><code>allow_ports</code></td><td>Allowed remote port ranges, e.g. <code>["20000-30000"]</code></td></tr>
+<tr><td><code>kcp_max_sessions</code></td><td>KCP session table cap, default 1024 (about 15 MB peak)</td></tr>
 </tbody>
 </table>
+</div>
+
+<h2>Group load balancing</h2>
+<p>Proxies sharing a <code>group</code> share one public port, and visitor connections are spread across them. The strategy is chosen by <code>lb_policy</code>:</p>
+<pre><code>lb_policy = "roundrobin"   # default</code></pre>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Value</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>roundrobin</code> (default)</td><td>Strict 1/N rotation, <strong>identical to the official frp</strong></td></tr>
+<tr><td><code>leastconn</code></td><td>Prefers the backend with the fewest in-flight connections; better when capacities differ</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+<div>
+<strong>Why round robin is the default</strong>
+<p>The official <code>server/group/*.go</code> uses channel fan-out: the real listener pushes connections into a shared <code>acceptCh</code>, and whichever proxy calls <code>Accept()</code> first gets it. That is stateless round robin. It is predictable, and it leaves "who is unhealthy" to the health check instead of guessing inside a scheduler.</p>
+<p><code>leastconn</code> is a superset capability of this project. Scheduling happens entirely inside the server, so enabling it does not affect interoperability with official clients.</p>
+</div>
+</div>
+
+<h2>KCP session cap</h2>
+<pre><code>kcp_max_sessions = 1024   # default</code></pre>
+<p>KCP keeps one session per UDP source port, and each session costs roughly 15.3 KB. <strong>This value is the memory ceiling</strong>: value times 15.3 KB.</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Value</th><th>Peak memory</th><th>Suited to</th></tr></thead>
+<tbody>
+<tr><td>1024 (default)</td><td>about 15 MB</td><td>Almost every deployment</td></tr>
+<tr><td>4096</td><td>about 62 MB</td><td>A single instance with thousands of clients</td></tr>
+<tr><td>16384</td><td>about 250 MB</td><td>Only with memory to spare</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warn">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+<div>
+<strong>Do not solve very large deployments by raising this</strong>
+<p>The right answers are: carry the control connection over TCP or QUIC, since KCP is only needed when neither of those works; or put a load balancer in front and spread clients across several frps instances.</p>
+<p>Values below 64 are raised to a safe floor automatically. Setting 0 would switch KCP off while the process keeps reporting itself healthy, which is far harder to diagnose than a refusal to start.</p>
+</div>
 </div>
 
 <h2>VirtualNet and xtcp</h2>
@@ -960,7 +1004,7 @@ PAGES_EN['changes'] = `
 <div class="stats">
 <div class="stat"><div class="stat-value">10</div><div class="stat-label">Audit rounds</div></div>
 <div class="stat"><div class="stat-value">140</div><div class="stat-label">Fixes</div></div>
-<div class="stat"><div class="stat-value">757</div><div class="stat-label">Tests</div></div>
+<div class="stat"><div class="stat-value">766</div><div class="stat-label">Tests</div></div>
 <div class="stat"><div class="stat-value">0</div><div class="stat-label">Open high severity</div></div>
 </div>
 
@@ -979,6 +1023,9 @@ PAGES_EN['changes'] = `
 <tr><td>8</td><td>v0.5.8</td><td>Close out round seven leftovers: xtcp rendezvous, dashboard auth, TLS inbound plugins</td><td>5 items (1 high)</td></tr>
 <tr><td>9</td><td>v0.5.9</td><td><strong>Treat the previous version's own uncovered-areas list as the task sheet</strong></td><td>9 items (4 medium) plus 1 hardening</td></tr>
 <tr><td>10</td><td>v0.5.10</td><td>Full rescan of the shipped artifacts</td><td>0 new vulnerabilities, 8 test defects</td></tr>
+<tr><td>11</td><td>v0.6.0</td><td>External review with the Shannon autonomous pentester</td><td>3 items (the rest kept for compatibility)</td></tr>
+<tr><td>12</td><td>v0.6.1</td><td>Audit trail for dashboard admin actions</td><td>3 items</td></tr>
+<tr><td>13</td><td>v0.6.3</td><td><strong>Load balancing, KCP and health checks aligned with the official frp</strong></td><td>Alignment plus one scheduler defect</td></tr>
 </tbody>
 </table>
 </div>
@@ -992,7 +1039,7 @@ The fix has two layers: the provider answers with a <strong>derived response tok
 <p>The previous release notes admitted that UDP proxy ports, xtcp rendezvous UDP and the admin dashboard sat outside ACL. Round nine fixed all three, with evidence from a controlled experiment holding the config identical and changing only the source address.</p>
 
 <h3>Round 9: KCP amplification of 312x (medium)</h3>
-<p>A code comment claimed one-to-one memory use and no amplification. Measurement showed the calculation <strong>counted only data queued inside a session and missed the session overhead itself</strong>: 757 KB of upstream traffic grew memory by 238 MB.<br>
+<p>A code comment claimed one-to-one memory use and no amplification. Measurement showed the calculation <strong>counted only data queued inside a session and missed the session overhead itself</strong>: 766 KB of upstream traffic grew memory by 238 MB.<br>
 The fix caps the session table at 1024 entries. What kept this from being high severity is that KCP is not enabled by default.</p>
 
 <h3>Round 11: three genuine findings</h3>

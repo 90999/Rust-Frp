@@ -1037,6 +1037,13 @@ type SessionTable = Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, SessionTx
 ///   按 IP 限会误伤。按**总量**限才只影响"超出容量的那部分"。
 pub const MAX_KCP_SESSIONS: usize = 1024;
 
+/// 会话表上限的**安全下限**。
+///
+/// 这个值直接决定内存上界（`max × 15.3 KB`），配得过低会让 KCP 立刻不可用：
+/// 第 N+1 条连接会被静默丢弃，表现为"配了 KCP 但客户端连不上"。
+/// 64 条 ≈ 1 MB 峰值，是任何真实部署都够用的最小值。
+pub const MIN_KCP_SESSIONS: usize = 64;
+
 /// ★ v0.5.9 收尾（C9-1）：会话表打满后"丢弃新会话"日志的折叠器。
 ///
 /// 该分支**按被丢弃的数据报数触发**、与 `max_sessions` **无关** —— 不折叠
@@ -1063,7 +1070,39 @@ impl KcpListener {
     }
 
     /// ★ v0.5.9（C9-1）：覆盖会话数上限（测试与特殊部署用）。
+    ///
+    /// ★ v0.6.2：加**安全下限**。这个值直接决定内存上界
+    /// （`max × 15.3 KB`），配成 0 或极小值会让 KCP 完全不可用 ——
+    /// 那是"服务静默失效"，比拒绝启动更危险。
+    /// 低于 [`MIN_KCP_SESSIONS`] 时抬到下限并告警，而不是照用。
     pub fn with_max_sessions(mut self, max: usize) -> Self {
+        if max < MIN_KCP_SESSIONS {
+            tracing::warn!(
+                requested = max,
+                floor = MIN_KCP_SESSIONS,
+                "KCP 会话上限配置过低，已抬到安全下限（0 会让 KCP 完全不可用）"
+            );
+            self.max_sessions = MIN_KCP_SESSIONS;
+        } else {
+            self.max_sessions = max;
+        }
+        self
+    }
+
+    /// 当前会话数上限（面板 / 日志用）。
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    /// 测试专用：**绕过安全下限**直接设上限。
+    ///
+    /// 为什么需要它：测"上限真的会丢弃超额会话"必须用一个很小的值
+    /// （否则要造几百个源端口），而 `with_max_sessions` 会把小值抬到
+    /// 下限 64 —— 那时这条测试就测不到"超额被拒"这个行为了。
+    ///
+    /// 生产路径只用 `with_max_sessions`，下限对配置始终生效。
+    #[cfg(test)]
+    pub fn force_max_sessions_for_test(mut self, max: usize) -> Self {
         self.max_sessions = max;
         self
     }
@@ -1487,7 +1526,11 @@ mod tests {
             KcpListener::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap()
-                .with_max_sessions(LIMIT),
+                // ★ v0.6.2：用 force_* 绕开安全下限。
+                //   with_max_sessions 会把 8 抬到 MIN_KCP_SESSIONS=64，
+                //   那样这条测试永远造不满会话表，也就测不到
+                //   "超额会被丢弃"这个核心行为。
+                .force_max_sessions_for_test(LIMIT),
         );
         let listen_addr = listener.local_addr().unwrap();
 
@@ -1552,6 +1595,48 @@ mod tests {
             "默认上限应当是个合理值（当前 {MAX_KCP_SESSIONS}）"
         );
         drop(held);
+    }
+
+    /// ★ v0.6.2 回归：会话上限有**安全下限**，配成 0 不会把 KCP 关掉。
+    ///
+    /// 这个值直接决定内存上界（`max × 15.3 KB`）。如果允许配 0 并照用，
+    /// 表现就是"第 1 条连接就被丢弃" —— KCP 完全不可用，而进程不报错。
+    /// 那种"静默失效"比拒绝启动更难排查。
+    #[tokio::test]
+    async fn kcp_session_cap_has_a_floor() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // ① 配 0：抬到下限，而不是关掉 KCP
+        let l = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(0);
+        assert_eq!(
+            l.max_sessions(),
+            MIN_KCP_SESSIONS,
+            "配 0 必须抬到安全下限 {MIN_KCP_SESSIONS}，否则 KCP 会静默不可用"
+        );
+
+        // ② 配得比下限还小：同样抬上去
+        let l2 = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(1);
+        assert_eq!(l2.max_sessions(), MIN_KCP_SESSIONS, "低于下限也要抬上去");
+
+        // ③ 正常值原样保留
+        let l3 = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(4096);
+        assert_eq!(l3.max_sessions(), 4096, "正常配置不该被改动");
+
+        // ④ 下限本身要合理：内存上界 = 值 × 15.3 KB，64 条约 1 MB
+        assert!(
+            (32..=4096).contains(&MIN_KCP_SESSIONS),
+            "下限本身要是个合理值（当前 {MIN_KCP_SESSIONS}），\
+             太小 KCP 不可用，太大会让「配错」变成内存风险"
+        );
     }
 
     #[test]

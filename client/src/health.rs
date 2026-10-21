@@ -60,7 +60,15 @@ impl Monitor {
                 loop {
                     tokio::time::sleep(interval).await;
                     let ok = match p.health_check_type.as_str() {
-                        "http" => probe_http(&p.local_addr, &p.health_check_url, timeout).await,
+                        "http" => {
+                            probe_http(
+                                &p.local_addr,
+                                &p.health_check_url,
+                                &p.health_check_http_headers,
+                                timeout,
+                            )
+                            .await
+                        }
                         _ => probe_tcp(&p.local_addr, timeout).await,
                     };
                     mon.record(&wire, &p.name, ok, p.health_check_max_failed.max(1));
@@ -125,23 +133,39 @@ async fn probe_tcp(addr: &str, timeout: Duration) -> bool {
         .unwrap_or(false)
 }
 
-/// HTTP 探测：拿到 2xx/3xx 才算活着。
-async fn probe_http(addr: &str, path: &str, timeout: Duration) -> bool {
+/// HTTP 探测：**只有 2xx 才算活着**。
+///
+/// ★ v0.6.2 对齐官方：官方 `client/health/health.go` 的 `doHTTPCheck` 用的是
+/// `if resp.StatusCode/100 != 2 { return error }` —— **严格 2xx**。
+///
+/// 原先这里判的是 `code < 400`，把 3xx 也算健康。差别在真实场景里很明显：
+///
+/// * 服务配了强制 HTTPS 跳转（301/302）时，探测请求永远拿到 301，
+///   旧判据会认为它**一直健康** —— 但那个端口其实没在提供内容；
+/// * 反向代理返回 404 时同理（404 在旧判据里也是"健康"）。
+///
+/// 对齐官方之后，这类部署需要把 `healthCheckPath` 指到一个真的返回 2xx
+/// 的路径上 —— 这正是官方文档要求的行为。
+async fn probe_http(
+    addr: &str,
+    path: &str,
+    headers: &[nfrp_common::config::HttpHeader],
+    timeout: Duration,
+) -> bool {
     let Ok(resolved) = util::resolve_addr(addr).await else {
         return false;
     };
     let fut = async {
         let mut s = TcpStream::connect(resolved).await.ok()?;
-        let path = if path.is_empty() { "/" } else { path };
-        // 不带 Host 的话很多服务直接 400，所以随便填一个
-        let req = format!("GET {path} HTTP/1.1\r\nHost: healthcheck\r\nConnection: close\r\n\r\n");
+        let req = build_probe_request(path, headers);
         s.write_all(req.as_bytes()).await.ok()?;
         let mut buf = [0u8; 64];
         // 只读状态行就够了，没必要把整个响应读完
         let n = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await.ok()?;
         let head = String::from_utf8_lossy(&buf[..n]).to_string();
         let code = head.split_whitespace().nth(1)?.parse::<u16>().ok()?;
-        Some(code < 400)
+        // 严格 2xx，与官方 doHTTPCheck 一致
+        Some((200..300).contains(&code))
     };
     tokio::time::timeout(timeout, fut)
         .await
@@ -149,9 +173,180 @@ async fn probe_http(addr: &str, path: &str, timeout: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// 拼一次 HTTP 探测请求。
+///
+/// ★ v0.6.3（对齐官方 `HealthCheckConfig.HTTPHeaders`）：
+///   官方在 `doHTTPCheck` 里把配置的 header 全设进 `req.Header`，再用
+///   `req.Host = header.Get("Host")` 单独覆盖 Host。这里照做：
+///   配置里有 `Host` 就用它，没有才用兜底值 `healthcheck`。
+///
+/// # 头注入防护
+///
+/// 这里是**手写**请求，不像 Go 的 `http.Header` 会替我们校验，
+/// 所以必须自己挡：头名和头值里都不能出现 CR / LF。
+/// 否则配一个含 `\r\n` 的值就能往探测请求里插入任意额外的头，
+/// 甚至拼出第二条请求（请求走私）。
+fn build_probe_request(path: &str, headers: &[nfrp_common::config::HttpHeader]) -> String {
+    let path = if path.is_empty() { "/" } else { path };
+    let mut req = format!("GET {path} HTTP/1.1\r\n");
+    let mut host_written = false;
+
+    for h in headers {
+        // 头名同样要清洗：`X-A: 1\r\nInjected` 这种形态会被当成两行
+        let name = h.name.trim().replace(['\r', '\n'], "");
+        if name.is_empty() {
+            continue;
+        }
+        let value = h.value.replace(['\r', '\n'], "");
+        if name.eq_ignore_ascii_case("host") {
+            req.push_str(&format!("Host: {value}\r\n"));
+            host_written = true;
+        } else {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+
+    if !host_written {
+        req.push_str("Host: healthcheck\r\n");
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    req
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // v0.6.3：探测请求构造（对齐官方 HTTPHeaders）
+    // ------------------------------------------------------------------
+
+    fn hdr(name: &str, value: &str) -> nfrp_common::config::HttpHeader {
+        nfrp_common::config::HttpHeader {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    /// 不配 header 时用兜底 Host，且请求形态完整。
+    #[test]
+    fn probe_request_defaults() {
+        let req = build_probe_request("", &[]);
+        assert!(
+            req.starts_with("GET / HTTP/1.1\r\n"),
+            "空路径应当用 /：{req:?}"
+        );
+        assert!(req.contains("Host: healthcheck\r\n"), "应当有兜底 Host");
+        assert!(req.ends_with("\r\n\r\n"), "请求头必须以空行结束");
+    }
+
+    /// 配置的 header 全部出现在请求里。
+    #[test]
+    fn probe_request_includes_configured_headers() {
+        let req = build_probe_request(
+            "/healthz",
+            &[hdr("Authorization", "Bearer t0ken"), hdr("X-Src", "nfrp")],
+        );
+        assert!(req.starts_with("GET /healthz HTTP/1.1\r\n"), "{req:?}");
+        assert!(req.contains("Authorization: Bearer t0ken\r\n"), "{req:?}");
+        assert!(req.contains("X-Src: nfrp\r\n"), "{req:?}");
+        // 没配 Host 时仍要有兜底
+        assert!(req.contains("Host: healthcheck\r\n"), "{req:?}");
+    }
+
+    /// 配了 Host 就用配置的，不重复写。
+    #[test]
+    fn probe_request_honours_configured_host() {
+        let req = build_probe_request("/", &[hdr("Host", "api.internal:8080")]);
+        assert!(req.contains("Host: api.internal:8080\r\n"), "{req:?}");
+        assert!(
+            !req.contains("Host: healthcheck"),
+            "配了 Host 就不该再写兜底值：{req:?}"
+        );
+        // 整个请求里只能出现一个 Host 行
+        assert_eq!(req.matches("Host:").count(), 1, "Host 头必须唯一：{req:?}");
+    }
+
+    /// ★ 头注入：值里的 CR/LF 必须被剥掉，不能让配置伪造出额外请求头。
+    ///
+    /// 手写 HTTP 请求不像 Go 的 `http.Header` 会替我们校验，
+    /// 一个含 `\r\n` 的值就能插进任意头、甚至拼出第二条请求。
+    ///
+    /// ★ 判据要精确：剥掉 CR/LF 之后，攻击者控制的**字符串本身**仍会出现在
+    ///   请求里（被压进上一个头的值），那是无害的 —— 关键是它**不能构成
+    ///   独立的头行**。所以这里验"请求行的结构"，而非"某串字面量不存在"。
+    #[test]
+    fn probe_request_strips_crlf_from_values() {
+        let req = build_probe_request(
+            "/",
+            &[hdr(
+                "X-Evil",
+                "a\r\nX-Injected: yes\r\n\r\nGET /admin HTTP/1.1",
+            )],
+        );
+
+        let lines: Vec<&str> = req.split("\r\n").collect();
+
+        // ① 每个非空行都必须以已知的请求行/头名开头，不能凭空多一行
+        for line in &lines {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(
+                line.starts_with("GET ")
+                    || line.starts_with("Host:")
+                    || line.starts_with("Connection:")
+                    || line.starts_with("X-Evil:"),
+                "出现了非预期的请求行（注入成功）：{line:?}"
+            );
+        }
+
+        // ② 注入的头不能变成独立行
+        assert!(
+            !lines.iter().any(|l| l.starts_with("X-Injected:")),
+            "注入的头不能被拆成独立行：{req:?}"
+        );
+
+        // ③ 不能拼出第二条请求
+        assert!(
+            !lines.iter().any(|l| l.starts_with("GET /admin")),
+            "不能拼出第二条请求行：{req:?}"
+        );
+
+        // ④ 整个请求只有一个空行（结尾那个）
+        assert_eq!(
+            req.matches("\r\n\r\n").count(),
+            1,
+            "请求里只能有一个空行（结尾）：{req:?}"
+        );
+
+        // ⑤ 注入内容被压成了同一个头的值
+        assert!(
+            req.contains("X-Evil: aX-Injected: yesGET /admin HTTP/1.1\r\n"),
+            "CR/LF 应被剥掉、内容压进同一个头的值里：{req:?}"
+        );
+    }
+
+    /// 头名里的 CR/LF 同样要剥掉。
+    #[test]
+    fn probe_request_strips_crlf_from_names() {
+        let req = build_probe_request("/", &[hdr("X-Bad\r\nX-Leak", "v")]);
+
+        let lines: Vec<&str> = req.split("\r\n").collect();
+        assert!(
+            !lines.iter().any(|l| l.starts_with("X-Leak:")),
+            "头名里的注入不能被拆成独立行：{req:?}"
+        );
+        assert_eq!(req.matches("\r\n\r\n").count(), 1, "{req:?}");
+    }
+
+    /// 空头名的条目直接跳过，不要产出 `: value` 这种非法行。
+    #[test]
+    fn probe_request_skips_empty_names() {
+        let req = build_probe_request("/", &[hdr("   ", "v"), hdr("", "v2")]);
+        assert!(!req.contains(": v"), "空头名不该产出非法请求行：{req:?}");
+        assert!(req.contains("Host: healthcheck\r\n"), "{req:?}");
+    }
 
     fn mon() -> Monitor {
         Monitor {
@@ -231,7 +426,7 @@ mod tests {
             }
         });
         assert!(
-            !probe_http(&addr.to_string(), "/", Duration::from_secs(2)).await,
+            !probe_http(&addr.to_string(), "/", &[], Duration::from_secs(2)).await,
             "500 不能算健康"
         );
     }
@@ -250,6 +445,6 @@ mod tests {
                     .await;
             }
         });
-        assert!(probe_http(&addr.to_string(), "/healthz", Duration::from_secs(2)).await);
+        assert!(probe_http(&addr.to_string(), "/healthz", &[], Duration::from_secs(2)).await);
     }
 }

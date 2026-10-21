@@ -5,7 +5,7 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -92,6 +92,11 @@ pub struct Registry {
     /// 能整体换掉它（改 AclConfig / 审计路径都不该要求重启）。
     /// 读侧只取一次锁再克隆 Arc，热路径上没有额外开销。
     security: Mutex<Arc<SecurityContext>>,
+    /// group 负载均衡策略。
+    ///
+    /// 放 `AtomicU8` 而不是 `Mutex`：热路径上每次用户连接都要读它，
+    /// 而它只在启动 / 热重载时写一次。用原子量避免在 `pick` 里多取一把锁。
+    lb_policy: AtomicU8,
 }
 
 impl Registry {
@@ -109,6 +114,8 @@ impl Registry {
             limits,
             // 默认上下文 = 不做认证/不限权限/不审计，行为与引入这套东西之前完全一致
             security: Mutex::new(Arc::new(SecurityContext::default())),
+            // 默认轮询：与官方 frp 的 group 行为一致
+            lb_policy: AtomicU8::new(LbPolicy::RoundRobin as u8),
         }
     }
 
@@ -391,16 +398,28 @@ impl Registry {
         }
     }
 
-    /// 选一个后端：**在途连接最少**的那个（group 负载均衡）。
+    /// 选一个后端（按当前负载均衡策略）。
     ///
-    /// 只有一个成员时就是"取它自己"。多成员时挑选会向空闲的后端倾斜 ——
-    /// 各后端处理能力不一样时，纯轮询会把慢的那个压死。
+    /// 只有一个成员时就是"取它自己"。
+    ///
+    /// 策略见 [`LbPolicy`]：默认轮询（与官方一致），可切到最少连接。
     ///
     /// 返回的 [`Backend`] 里带着一份 [`LoadGuard`]：`pick` 的调用方必须把它
     /// 存进 `PendingUser::load`，本次转发结束时才会自动减回去。
     pub fn pick(&self, port: u16) -> Option<Backend> {
+        let policy = self.lb_policy();
         let g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(&port)?.pick()
+        g.get(&port)?.pick(policy)
+    }
+
+    /// 当前负载均衡策略。
+    pub fn lb_policy(&self) -> LbPolicy {
+        LbPolicy::from_u8(self.lb_policy.load(Ordering::Relaxed))
+    }
+
+    /// 设置负载均衡策略（启动时装载配置 / 热重载）。
+    pub fn set_lb_policy(&self, p: LbPolicy) {
+        self.lb_policy.store(p as u8, Ordering::Relaxed);
     }
 
     /// 取一个后端并**立刻记一条在途连接**。
@@ -567,7 +586,7 @@ pub enum PortClaim {
 /// 一个公网端口背后的后端集合。
 ///
 /// `name` 为空表示这个端口被**独占**（普通代理）；非空表示同组共享，
-/// 用户连接会在成员之间轮询 —— 这就是 group 负载均衡。
+/// 用户连接会在成员之间按 [`LbPolicy`] 分摊 —— 这就是 group 负载均衡。
 struct PortGroup {
     name: String,
     /// 组密钥（`groupKey`）。官方 frps 在第二个成员加入时用 `tg.groupKey != groupKey`
@@ -683,15 +702,35 @@ impl PortGroup {
     /// 计数相同时必须有个稳定的打破平局的规则，否则每次都挑中同一个成员
     /// （其余成员永远 0 流量）。从 cursor 往后扫，等价于"平局时轮询"，
     /// 既公平又不需要额外状态。
-    fn pick(&self) -> Option<Backend> {
+    /// 挑一个后端。
+    ///
+    /// 策略由 [`LbPolicy`] 决定，默认按官方 frp 对齐（`group` 用轮询）。
+    ///
+    /// ## 平局规则
+    ///
+    /// 无论哪种策略，起点都从 `cursor` 开始每次挪一格。这保证：
+    /// - 轮询：严格按 1/N 均分（这就是官方的行为）
+    /// - 最少连接：计数相同时轮流坐庄，不会永远压着同一个后端
+    fn pick(&self, policy: LbPolicy) -> Option<Backend> {
         let n = self.members.len();
         if n == 0 {
             return None;
         }
-        let mut best = 0usize;
-        let mut best_load = self.members[0].inflight();
-        // 起点每次挪一格：平局时轮流坐庄
+
+        // 起点每次挪一格（无锁 fetch_add）
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+
+        if policy == LbPolicy::RoundRobin {
+            return self.members.get(start).cloned();
+        }
+
+        // ★ 最少连接：**必须从 start 自身开始比较**。
+        //
+        // 旧实现先把 best_load 初始化成 members[0]，而循环从 start+1 扫，
+        // 于是 start 从没进过循环、members[0] 却在 start≠0 时被多算一次 ——
+        // 某些后端被系统性偏袒。现在改成从 start 起扫满一整圈。
+        let mut best = start;
+        let mut best_load = self.members[start].inflight();
         for k in 1..n {
             let i = (start + k) % n;
             let l = self.members[i].inflight();
@@ -700,11 +739,6 @@ impl PortGroup {
                 best_load = l;
             }
         }
-        // start 那个位置也要参与比较（上面的循环从 start+1 开始扫的）
-        let start_load = self.members[start].inflight();
-        if start_load <= best_load {
-            best = start;
-        }
         self.members.get(best).cloned()
     }
 
@@ -712,6 +746,75 @@ impl PortGroup {
     fn abort_listener(&self) {
         if let Some(h) = &self.handle {
             h.abort();
+        }
+    }
+}
+
+/// group 负载均衡策略。
+///
+/// # 为什么要做成可配置
+///
+/// 官方 frp 的 `server/group/*.go` 用 **channel fan-out** 实现：
+/// 真实监听器的 `Accept()` 把连接丢进共享 `acceptCh`，哪个代理先
+/// `Accept()` 谁拿到 —— 效果就是**轮询（RoundRobin）**，无状态且可预测。
+///
+/// 本项目早期实现的是**最少连接（LeastConn）**：多后端处理能力不均时
+/// 会向快的倾斜。两者各有取舍：
+///
+/// | 策略 | 优点 | 缺点 |
+/// |---|---|---|
+/// | `RoundRobin` | 无状态、可预测、**与官方行为一致** | 慢后端前面会堆队列 |
+/// | `LeastConn` | 能力不均时自动倾斜 | 要维护在途计数，与官方行为不同 |
+///
+/// 默认 **RoundRobin**，对齐官方优先。需要自适应调度时显式切到
+/// `LeastConn` —— 这是**超集**：调度完全发生在服务端内部，不影响与
+/// 官方客户端的互通性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LbPolicy {
+    /// 轮询：严格 1/N 均分。**默认，与官方 frp 行为一致。**
+    #[default]
+    RoundRobin = 0,
+    /// 最少连接：优先给在途连接最少的后端。
+    LeastConn = 1,
+}
+
+impl LbPolicy {
+    /// 从 `AtomicU8` 存的值还原。未知值回落到默认。
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::LeastConn,
+            _ => Self::RoundRobin,
+        }
+    }
+
+    /// 从配置字符串解析，无法识别时回落到默认值并告警。
+    ///
+    /// 接受 `roundrobin` / `round-robin` / `rr` 与 `leastconn` / `least-conn` / `lc`。
+    pub fn parse(s: &str) -> Self {
+        let norm: String = s
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| *c != '-' && *c != '_')
+            .collect();
+        match norm.as_str() {
+            "" | "roundrobin" | "rr" => Self::RoundRobin,
+            "leastconn" | "lc" => Self::LeastConn,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "无法识别的负载均衡策略，回落到 roundrobin（与官方一致）"
+                );
+                Self::RoundRobin
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "roundrobin",
+            Self::LeastConn => "leastconn",
         }
     }
 }
@@ -1260,9 +1363,13 @@ mod tests {
     ///
     /// 场景：a 手上还压着 5 条没结束的转发，b 一条都没有。
     /// 纯轮询会把第 6 条照样分给 a（各 50%），最小连接数则应当全给 b。
+    ///
+    /// ★ v0.6.2：这条测试现在**显式把策略设成 LeastConn**。
+    ///   默认策略已改为 RoundRobin（对齐官方 frp），不再默认倾斜。
     #[test]
     fn pick_prefers_the_least_loaded_backend() {
         let r = Registry::unlimited();
+        r.set_lb_policy(LbPolicy::LeastConn);
         for n in ["a", "b"] {
             assert!(r.reserve_port(6100, "web", "", n, client(n)).is_ok());
         }
@@ -1283,6 +1390,65 @@ mod tests {
             0,
             "令牌全部 drop 之后计数必须归零，否则调度器会永久歧视这个后端"
         );
+    }
+
+    /// ★ v0.6.2 回归：**默认策略必须是轮询**，与官方 frp 的 group 行为一致。
+    ///
+    /// 官方 `server/group/base.go` 的 `worker` 把连接丢进共享 `acceptCh`，
+    /// 哪个代理先 `Accept()` 谁拿到 —— 等价于无状态的轮询。
+    ///
+    /// 这条测试锁住两件事：
+    /// 1. 未配置时就是 `RoundRobin`
+    /// 2. 负载不均时**照样均分**（不因为 a 压着 5 条就让 b 独占）
+    #[test]
+    fn default_policy_is_round_robin_like_official() {
+        let r = Registry::unlimited();
+        assert_eq!(
+            r.lb_policy(),
+            LbPolicy::RoundRobin,
+            "默认必须是 roundrobin（对齐官方 frp）"
+        );
+
+        for n in ["a", "b"] {
+            assert!(r.reserve_port(6200, "web", "", n, client(n)).is_ok());
+        }
+        // 给 a 压 5 条在途 —— 轮询策略下这**不应该**影响分配
+        let a = r.backend_of(6200, "a").expect("组里应当有 a");
+        let held: Vec<_> = (0..5).map(|_| a.hold()).collect();
+
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..10 {
+            let b = r.pick(6200).expect("应有后端");
+            *counts.entry(b.client.run_id.clone()).or_insert(0) += 1;
+            drop(b.hold());
+        }
+        drop(held);
+
+        assert_eq!(
+            counts.get("a").copied().unwrap_or(0),
+            5,
+            "轮询下 a 应分到一半，实际分配：{counts:?}"
+        );
+        assert_eq!(
+            counts.get("b").copied().unwrap_or(0),
+            5,
+            "轮询下 b 应分到一半，实际分配：{counts:?}"
+        );
+    }
+
+    /// 策略字符串解析：认得常见写法，认不出时回落到默认并告警。
+    #[test]
+    fn lb_policy_parsing() {
+        assert_eq!(LbPolicy::parse(""), LbPolicy::RoundRobin);
+        assert_eq!(LbPolicy::parse("roundrobin"), LbPolicy::RoundRobin);
+        assert_eq!(LbPolicy::parse("Round-Robin"), LbPolicy::RoundRobin);
+        assert_eq!(LbPolicy::parse("rr"), LbPolicy::RoundRobin);
+        assert_eq!(LbPolicy::parse("leastconn"), LbPolicy::LeastConn);
+        assert_eq!(LbPolicy::parse("Least_Conn"), LbPolicy::LeastConn);
+        assert_eq!(LbPolicy::parse("lc"), LbPolicy::LeastConn);
+        // 认不出的值回落到官方行为，而不是随机挑一个
+        assert_eq!(LbPolicy::parse("random"), LbPolicy::RoundRobin);
+        assert_eq!(LbPolicy::parse("  "), LbPolicy::RoundRobin);
     }
 
     /// 令牌必须**自动**归还：`pick_and_hold` 出来的计数不能泄漏。

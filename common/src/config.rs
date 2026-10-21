@@ -539,6 +539,52 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_proxies_per_client: usize,
 
+    /// group 负载均衡策略（**Nfrp 扩展**，官方 frp 没有这个配置项）。
+    ///
+    /// 同 `group` 的多个代理共享一个公网端口，用户连接在它们之间分摊。
+    ///
+    /// | 值 | 行为 |
+    /// |---|---|
+    /// | `roundrobin`（默认） | 严格 1/N 轮询，**与官方 frp 一致** |
+    /// | `leastconn` | 优先给在途连接最少的后端，能力不均时更优 |
+    ///
+    /// 默认选 `roundrobin` 是刻意的：官方 `server/group/*.go` 用 channel
+    /// fan-out 实现，效果就是轮询 —— 它无状态、可预测，把"谁不健康"交给
+    /// 健康检查去处理，而不是让调度器猜。
+    ///
+    /// `leastconn` 是本项目的超集能力，开它不影响与官方客户端的互通
+    /// （调度完全发生在服务端内部）。
+    ///
+    /// ```toml
+    /// lbPolicy = "leastconn"
+    /// ```
+    #[serde(default)]
+    pub lb_policy: String,
+
+    /// KCP 会话表条数上限（**Nfrp 扩展**，默认 1024）。
+    ///
+    /// KCP 是"每个 UDP 源端口一个会话"的模型，每个会话约占 15.3 KB。
+    /// 上限直接决定内存上界：`值 × 15.3 KB`。
+    ///
+    /// | 值 | 峰值内存 | 适用 |
+    /// |---|---|---|
+    /// | 1024（默认） | ≈ 15 MB | 绝大多数部署 |
+    /// | 4096 | ≈ 62 MB | 数千客户端的单实例 |
+    /// | 16384 | ≈ 250 MB | 需要确认内存充足 |
+    ///
+    /// ★ 超大规模部署的正确做法**不是无限调大**，而是：
+    /// 1. 用 TCP / QUIC 承载控制连接（KCP 只在这些都走不通时才需要）；
+    /// 2. 或者在前面挂负载均衡，把客户端拆到多个 frps 实例上。
+    ///
+    /// 低于 64 会被抬到安全下限（配成 0 等于关掉 KCP）。
+    /// 0 或未配置表示用默认值 1024。
+    ///
+    /// ```toml
+    /// kcpMaxSessions = 4096
+    /// ```
+    #[serde(default)]
+    pub kcp_max_sessions: usize,
+
     /// **端口白名单**（对应 frp `allowPorts`）：客户端能申请的**公网远端端口**。
     ///
     /// 空 = 不限制（与官方一致）。这是一项**安全**配置 —— 不配的话任何拿到 token
@@ -1066,6 +1112,10 @@ impl Default for ServerConfig {
             max_conns_per_client: 0,
             max_pending_per_client: 0,
             max_proxies_per_client: 0,
+            // 空串 = roundrobin（与官方 frp 的 group 行为一致）
+            lb_policy: String::new(),
+            // 0 = 用默认值 1024
+            kcp_max_sessions: 0,
             allow_ports: Vec::new(),
             max_ports_per_client: 0,
             detailed_errors_to_client: true,
@@ -1191,6 +1241,26 @@ vhost_http_timeout = 60          # 等内网服务**响应头**的秒数（0 = �
 // ---------------------------------------------------------------------------
 // 客户端配置
 // ---------------------------------------------------------------------------
+
+/// 一个 HTTP 请求头键值对，用于健康检查探测。
+///
+/// 对应官方 frp 的 `pkg/config/v1/proxy.go`：
+///
+/// ```go
+/// type HTTPHeader struct {
+///     Name  string `json:"name"`
+///     Value string `json:"value"`
+/// }
+/// ```
+///
+/// 字段名保持一致（`name` / `value`），所以官方配置可以直接搬过来。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpHeader {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
 
 /// 单个代理的传输层配置（官方 frp 的 `[proxies.transport]`）。
 ///
@@ -1363,6 +1433,19 @@ pub struct ProxyConfig {
     /// `http` 检查用的路径，例如 `/healthz`；留空则用 `/`。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub health_check_url: String,
+    /// `http` 检查时额外发送的请求头（对应官方 `healthCheck.httpHeaders`）。
+    ///
+    /// 官方 `pkg/config/v1/proxy.go` 的 `HealthCheckConfig.HTTPHeaders` 就是
+    /// 这个字段。需要鉴权的健康检查端点（带 `Authorization`、内部
+    /// `X-Health-Token` 等）靠它才能探测通。
+    ///
+    /// ```toml
+    /// [[proxies.healthCheck.httpHeaders]]
+    /// name = "Authorization"
+    /// value = "Bearer xxx"
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_check_http_headers: Vec<HttpHeader>,
 
     // ---- 客户端插件 ----
     /// 插件类型：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket`。
