@@ -157,7 +157,7 @@
     const old = activePage;
     activePage = target;
 
-    document.title = t('t-' + route.title) + ' | NFRp Docs';
+    document.title = t('t-' + route.title) + ' | NFrp Docs';
 
     if (old === target) {
       buildPager(route);
