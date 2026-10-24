@@ -1,0 +1,76 @@
+name: build-arm64
+
+# 为什么单独用一个 workflow 编 arm64：
+#
+# 本机与自建云主机都编不出来 —— arm64 的 LTO 链接峰值超过 2 GB，
+# 而可用的机器只有 786 MB ~ 1.87 GB 内存，内核会直接把 rustc 杀掉
+# （`signal: 9, SIGKILL`）。GitHub 的 runner 有 7 GB 内存，编得动。
+#
+# 产物只是 artifact，不直接发 Release —— 上传 Release 的凭据留在本地，
+# 不让它进仓库。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    name: linux-arm64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 装交叉工具链
+        run: |
+          sudo apt-get update
+          # aarch64 的 gcc 与静态 glibc（+crt-static 需要后者的 .a）
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 装 Rust target
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          rustc --version
+          cargo --version
+
+      - name: 编译（静态链接）
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # 与本地发版口径一致：优化尺寸 + 全静态，产物不依赖目标机 glibc
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p nfrp-server -p nfrp-client
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          D=target/aarch64-unknown-linux-gnu/release
+          file "$D/nfrp-server" "$D/nfrp-client"
+          "$D/nfrp-server" -V
+          "$D/nfrp-client" -V
+          # -v 必须输出裸协议版本 0.71.0（对齐官方 frp）
+          "$D/nfrp-server" -v | grep -q '^0\.71\.0$' \
+            || { echo "协议版本输出不对"; exit 1; }
+          # 必须是 aarch64 且静态链接
+          file "$D/nfrp-server" | grep -q 'ARM aarch64' \
+            || { echo "架构不对"; exit 1; }
+          file "$D/nfrp-server" | grep -q 'statically linked' \
+            || { echo "不是静态链接"; exit 1; }
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfrp-linux-arm64
+          path: |
+            target/aarch64-unknown-linux-gnu/release/nfrp-server
+            target/aarch64-unknown-linux-gnu/release/nfrp-client
+          if-no-files-found: error
+          retention-days: 30
