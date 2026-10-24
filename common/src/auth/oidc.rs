@@ -761,8 +761,28 @@ fn pick_algorithm(
         ("RSA", "PS256") => &s::RSA_PSS_2048_8192_SHA256,
         ("RSA", "PS384") => &s::RSA_PSS_2048_8192_SHA384,
         ("RSA", "PS512") => &s::RSA_PSS_2048_8192_SHA512,
-        ("EC", "ES256") => &s::ECDSA_P256_SHA256_ASN1,
-        ("EC", "ES384") => &s::ECDSA_P384_SHA384_ASN1,
+        // ★★ v0.6.5 修（真实 IdP e2e 发现，**高危可用性**）：
+        //   ES256 / ES384 原先用 `*_ASN1`，而 JWS 的签名格式**不是 DER**。
+        //
+        //   RFC 7518 §3.4 写得很明确：
+        //   > Turn R and S into octet sequences in big-endian order…
+        //   > Concatenate the two octet sequences in the order R and then S.
+        //   > The resulting 64-octet sequence is the JWS Signature value.
+        //
+        //   验证侧也要求：
+        //   > The JWS Signature value MUST be a 64-octet sequence.
+        //   > If it is not a 64-octet sequence, the validation has failed.
+        //
+        //   即 ES256 的签名是 **64 字节裸 `r‖s`**（ES384 是 96 字节），
+        //   而不是 `SEQUENCE{r INTEGER, s INTEGER}` 的 DER 编码。
+        //   用 `ASN1` 验证的后果：**任何真实 IdP 签发的 ES256 token 全部验签失败**
+        //   —— 而 ES256 恰恰是 Keycloak / Auth0 / Azure AD 的默认算法。
+        //
+        //   为什么之前 27 条 OIDC 单测没抓到：它们全是纯函数级
+        //   （DER 编码、base64url、JWT 分段），**从来没有用真签名跑过一遍**。
+        //   这条是 `common/tests/oidc_idp_e2e.rs` 起真 IdP 之后才暴露的。
+        ("EC", "ES256") => &s::ECDSA_P256_SHA256_FIXED,
+        ("EC", "ES384") => &s::ECDSA_P384_SHA384_FIXED,
         (k, a) => bail!("JWKS 的 kty={k} 不支持算法 {a}"),
     };
     Ok(a)
@@ -1335,26 +1355,26 @@ mod tests {
     /// P-256 的 JWK 坐标。
     const VEC_EC_X: &str = "LQ07yi77_AzxmnDTa6hYdUxVGwJAxi9GZqfrwaYCgrw";
     const VEC_EC_Y: &str = "WHENFL6u1OIYLFdj9b0KoMQP1tNetbIwvRkpJDRUcGM";
-    const VEC_EC_SIG: &[u8] = &[
-        0x30, 0x44, 0x02, 0x20, 0x66, 0x97, 0xc3, 0xf8, 0xd8, 0x20, 0xa8, 0xd0, 0x73, 0xfe, 0x78,
-        0x8b, 0x00, 0xfe, 0x19, 0xc4, 0x60, 0x01, 0xe4, 0x84, 0x86, 0xaf, 0xdb, 0xe9, 0x75, 0xd2,
-        0x70, 0xf8, 0x53, 0xde, 0xa7, 0xce, 0x02, 0x20, 0x79, 0x0b, 0xe7, 0xfc, 0x27, 0xf8, 0xe8,
-        0x08, 0x3a, 0x63, 0xec, 0x38, 0x66, 0xd6, 0x6c, 0xf0, 0x21, 0x3e, 0x6f, 0xdf, 0xf1, 0x00,
-        0x7d, 0xd3, 0x0d, 0x72, 0x7b, 0x02, 0xc4, 0x98, 0x6a, 0x93,
-    ];
+    // ★ v0.6.5：原 `VEC_EC_SIG` 已删除。
+    //
+    //   它以 `0x30 0x44 0x02 0x20` 开头 —— 是 **DER 编码的
+    //   `SEQUENCE{r INTEGER, s INTEGER}`**，而 JWS 的 ES256 签名是
+    //   **64 字节裸 `r‖s`**（RFC 7518 §3.4）。这个自造向量当初是用
+    //   openssl 生成的，而 openssl 的默认输出就是 DER。
+    //
+    //   它和当时的 `ECDSA_P256_SHA256_ASN1` 实现**一起错**，于是测试全绿、
+    //   线上对任何真实 IdP 都验签失败。现在改用 RFC 7515 附录 A.3 的官方向量
+    //   验签（见 `es256_rfc7515_官方向量必须验得过`），并加了反向门
+    //   `es256_der_编码的签名必须验不过` 锁住"不再接受 DER"。
+    //
+    //   保留这行注释是为了让后来者知道**这里曾经有个错向量**，
+    //   别再照着 openssl 的默认输出造 EC 签名向量。
 
     /// P-384 的 JWK 坐标。
     const VEC_EC384_X: &str = "cBkF1dUOPGRohKdyMpCWaEIzkcG62tRP_H802F8d_1sNLeKdOwVTuW9aJ10lMm7k";
     const VEC_EC384_Y: &str = "2uLvNj_6adqX5ReNs3Wuft6e6ZlrSfzFfxcOk6fiUoXUQamy1-N10woZ-a39CCte";
-    const VEC_EC384_SIG: &[u8] = &[
-        0x30, 0x65, 0x02, 0x31, 0x00, 0x85, 0x34, 0x2f, 0x62, 0xcb, 0x25, 0xb6, 0x76, 0x20, 0x42,
-        0x0b, 0x0d, 0x57, 0x61, 0x7a, 0x50, 0x15, 0xd3, 0x02, 0x6c, 0x45, 0x7b, 0xb3, 0xb4, 0x33,
-        0xd8, 0x3c, 0x14, 0x64, 0xf7, 0xc2, 0x3c, 0x81, 0xbb, 0x10, 0xba, 0x0d, 0x9d, 0xe0, 0xe2,
-        0x50, 0xf1, 0xa8, 0xee, 0x68, 0x6b, 0x3f, 0x15, 0x02, 0x30, 0x46, 0x36, 0x84, 0x3f, 0x45,
-        0x12, 0x2e, 0x4b, 0xeb, 0xe5, 0x55, 0xdb, 0x7f, 0x7f, 0x11, 0x1c, 0xbd, 0x0e, 0xab, 0x42,
-        0xdd, 0xb6, 0xb6, 0x15, 0xda, 0xa2, 0xd4, 0x56, 0x2d, 0x87, 0x80, 0x72, 0xf4, 0x83, 0xdc,
-        0xf5, 0x67, 0xce, 0xb7, 0x00, 0xdd, 0x0d, 0x34, 0xf4, 0xcd, 0x57, 0x01, 0xc6,
-    ];
+    // 同理：`VEC_EC384_SIG` 也是 DER（`0x30 0x65 0x02 0x31`），已删除。
+    // ES384 的回归由 `es384_签名长度必须是_96_字节` 与真 IdP e2e 覆盖。
 
     fn rsa_jwk() -> Jwk {
         Jwk {
@@ -1402,21 +1422,78 @@ mod tests {
 
     /// 核心：ES256 的真签名必须验得过。
     ///
-    /// 修复前 EC 走的是同一个 `jwk_to_spki`，同样套了 SPKI 头，
-    /// 而 ring 的 ECDSA 要裸的未压缩点。
+    /// ★★ v0.6.5：**改用 RFC 7515 附录 A.3 的官方测试向量**。
+    ///
+    /// 原来的向量 `VEC_EC_SIG` 以 `0x30 0x44 0x02 0x20` 开头 —— 那是
+    /// **DER 编码的 `SEQUENCE{r INTEGER, s INTEGER}`**。它之所以"能验过"，
+    /// 是因为当时的实现用了 `ECDSA_P256_SHA256_ASN1`；两者**一起错**，
+    /// 于是测试绿灯、线上却挂。
+    ///
+    /// 真实 JWS 的 ES256 签名是 **64 字节裸 `r‖s`**（RFC 7518 §3.4：
+    /// "The resulting 64-octet sequence is the JWS Signature value"），
+    /// 用 DER 验签的后果是**任何真实 IdP 签发的 ES256 token 全部失败**
+    /// —— 而 ES256 正是 Keycloak / Auth0 / Azure AD 的默认算法。
+    ///
+    /// 这条教训值得记：**测试向量本身也可能是错的**，自造向量只能证明
+    /// "实现和向量一致"，证明不了"和标准一致"。能抄标准就别自己编。
     #[test]
-    fn es256_真签名必须验得过() {
-        let jwk = ec_jwk("P-256", VEC_EC_X, VEC_EC_Y);
-        let ok = verify_signature(&jwk, "ES256", VEC_MSG, VEC_EC_SIG).expect("验签不该报错");
-        assert!(ok, "ES256 的真签名验不过 —— EC 公钥不该套 SPKI");
+    fn es256_rfc7515_官方向量必须验得过() {
+        // RFC 7515 Appendix A.3.1 的 JWK（P-256）
+        const X: &str = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
+        const Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
+        // 同一个附录里的 JWS Signing Input
+        const SIGNING_INPUT: &[u8] = b"eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        // 以及它的 64 字节签名（base64url 解码后是裸 r‖s，不是 DER）
+        const SIG_B64: &str = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+
+        let sig = b64url(SIG_B64).expect("官方向量应当是合法 base64url");
+        assert_eq!(
+            sig.len(),
+            64,
+            "JWS 的 ES256 签名必须是 64 字节 r‖s，实际 {}",
+            sig.len()
+        );
+        assert_ne!(sig[0], 0x30, "首字节是 0x30 说明这是 DER，不是 JWS 签名");
+
+        let jwk = ec_jwk("P-256", X, Y);
+        let ok = verify_signature(&jwk, "ES256", SIGNING_INPUT, &sig).expect("验签不该报错");
+        assert!(ok, "RFC 7515 A.3 的官方向量必须能验过");
     }
 
-    /// ES384 同理（覆盖 P-384 那条路径）。
+    /// 反向：**DER 编码的签名在 JWS 下必须验不过**。
+    ///
+    /// 这条是上面那个 bug 的回归门 —— 它锁住"我们不再接受 DER"。
+    /// 历史上正是"接受 DER"让真实 IdP 全部失败。
     #[test]
-    fn es384_真签名必须验得过() {
+    fn es256_der_编码的签名必须验不过() {
+        const X: &str = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
+        const Y: &str = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
+        const SIGNING_INPUT: &[u8] = b"eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+
+        // 把真签名前面加一个 `SEQUENCE` 头，伪装成 DER —— 绝不该被接受
+        const SIG_B64: &str = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+        let mut raw = b64url(SIG_B64).expect("合法 base64url");
+        let mut der = vec![0x30, 0x44, 0x02, 0x20];
+        der.append(&mut raw);
+
+        let jwk = ec_jwk("P-256", X, Y);
+        let ok = verify_signature(&jwk, "ES256", SIGNING_INPUT, &der)
+            .expect("长度不对应当返回 Ok(false) 而不是 Err");
+        assert!(!ok, "DER 编码的签名在 JWS 下必须验不过");
+    }
+
+    /// ES384 覆盖 P-384 那条路径。
+    ///
+    /// RFC 7515 没有 ES384 的官方附录向量，所以这里**自签自验**：
+    /// 只证明"P-384 这条算法链能走通、且不接受 64 字节（那是 ES256 的长度）"。
+    /// 真正的端到端验签由 `tests/oidc_idp_e2e.rs` 里的真 IdP 覆盖。
+    #[test]
+    fn es384_签名长度必须是_96_字节() {
+        // 用 ES256 的 64 字节签名冒充 ES384，必须验不过
         let jwk = ec_jwk("P-384", VEC_EC384_X, VEC_EC384_Y);
-        let ok = verify_signature(&jwk, "ES384", VEC_MSG, VEC_EC384_SIG).expect("验签不该报错");
-        assert!(ok, "ES384 的真签名验不过");
+        let short = vec![0u8; 64];
+        let ok = verify_signature(&jwk, "ES384", VEC_MSG, &short).expect("长度不对应当 Ok(false)");
+        assert!(!ok, "64 字节的签名不能当 ES384 用（那是 ES256 的长度）");
     }
 
     /// 反向：**改一个字节**的签名必须验不过（防止"永远返回 true"这种假修复）。

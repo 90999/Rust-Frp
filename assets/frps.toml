@@ -29,6 +29,20 @@ tls_force = false
 #   注意：官方 frp 的 transport.protocol 语义不同，与官方互通时保持 tcp。
 transport_protocol = "tcp"
 
+# QUIC 的**独立**监听端口（对应官方 frps 的 quicBindPort，v0.6.5 新增）
+#   配了就开一个独立的 UDP 端口，与 bindPort 无关：
+#     * 能把 QUIC 放到别的端口（bindPort 已被占用、或要做端口分流）
+#     * 与 TCP / KCP 解耦，防火墙规则更好写
+#   不配时：只有 transport_protocol = "quic" 才会在 bindPort 的同名 UDP 端口监听。
+#   配了之后**不再**顺带占用 bindPort/udp —— 避免"我配了 7101，为什么 7000/udp
+#   也被占"这种困惑。
+# quicBindPort = 7101
+
+# KCP 的独立监听端口（对应官方 frps 的 kcpBindPort）
+#   KCP 是裸 UDP 上的可靠传输，没有 QUIC 的握手分流能力，只能另开端口靠源地址区分。
+#   配了之后客户端把 transport.protocol 设成 kcp 并连这个端口即可。
+# kcpBindPort = 7001
+
 # ---- HTTP / HTTPS 虚拟主机 ----
 # 客户端用 http / https 类型代理时，按域名路由到对应内网服务。
 # 不配置这两项则 http / https 代理会被拒绝。
@@ -65,10 +79,18 @@ vhost_http_timeout = 60
 
 # ---- 内置面板与 Prometheus 指标 ----
 #   GET /             面板（在线客户端 / 代理 / 访客 / 占用端口 / 实时指标）
-#   GET /metrics      Prometheus exposition format
+#   GET /metrics      Prometheus exposition format（★ 需 enablePrometheus = true）
 #   GET /api/status   JSON 快照
 #   GET /api/healthz  存活探针（始终免鉴权，供 k8s / 负载均衡器用）
-# 配了 dashboard_user 之后，前三个端点需要 HTTP Basic Auth。
+#
+# ★ v0.6.5：`/metrics` **默认关闭**，与官方 frps 的 `enablePrometheus` 一致。
+#   要采集就显式打开：
+#     enablePrometheus = true
+#   为什么默认关：指标里含业务信息（在线客户端数、代理名、流量字节），
+#   "只想开个面板"的部署不该默认多暴露一份数据面。
+#   `/api/healthz` **不受**这个开关影响 —— 健康探针永远可用。
+#
+# 配了 dashboard_user 之后，除 healthz 外的端点需要 HTTP Basic Auth。
 # ★ 没配 dashboard_user 时面板**不鉴权** —— 此时若 bind_addr 不是回环地址，
 #   服务端会**拒绝启动**（匿名者能读面板、踢掉任意客户端、并对 nfrp 客户端
 #   直接开公网端口）。三条出路：配用户名密码 / 把 bind_addr 改成 127.0.0.1 /
@@ -190,6 +212,32 @@ heartbeat_timeout = 90
 #   * 客户端的凭证是 IdP 签发的 **access token 原样**，不做 md5 派生；
 #   * 控制通道的加密密钥也改用 access token（两端同源），
 #     否则会出现"能登录、但之后每条消息都解不开"。
+
+# 令牌来自外部源（对应官方 frps 的 auth.tokenSource，v0.6.5 新增）
+#   token 不必写在配置里，适合 k8s Secret / Vault sidecar 这类把密钥挂成文件的部署。
+#   与 token 互斥：两者都配时**以 tokenSource 为准**并告警。
+#
+#   支持两种 type：
+#     file —— 读文件内容，自动去掉首尾空白（文件末尾的换行不会破坏比对）
+#     exec —— 跑一个子进程，取它的 stdout
+#
+#   [auth.tokenSource]
+#   type = "file"
+#   [auth.tokenSource.file]
+#   path = "/etc/nfrp/token"
+#
+#   [auth.tokenSource]
+#   type = "exec"
+#   [auth.tokenSource.exec]
+#   command = "/usr/local/bin/get-nfrp-token"
+#   args = ["--format", "raw"]
+#   [[auth.tokenSource.exec.env]]
+#   name = "VAULT_ADDR"
+#   value = "https://vault.example.com:8200"
+#
+# ★ 安全提醒：exec 类型会**以本进程身份执行外部程序** ——
+#   能改这份配置的人等于能执行任意命令。只需要读文件时请用 type = "file"。
+#   两种方式在启动日志里都会明确打出令牌来源，便于审计。
 
 # ---- IP 白 / 黑名单（[acl]）----
 # 在**认证之前**执行，所以被拒的连接连 token 都不用发。

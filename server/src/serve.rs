@@ -484,11 +484,28 @@ pub async fn serve_on_with(
         tokio::spawn(vnet::run(listener, hub, registry.clone()));
     }
 
-    // QUIC 传输：在同一个端口号上额外监听 UDP。
+    // QUIC 传输。
     //
-    // 保留 TCP 监听是有意的 —— 这样老客户端照旧能连，切换传输协议不会一刀切。
-    if is_quic(&cfg.transport_protocol) {
-        let qport = addr.port();
+    // ★ v0.6.5：**优先用独立的 `quicBindPort`**（对齐官方 frps 语义）。
+    //
+    // 旧行为是"`transport_protocol = quic` 时在 `bindPort` 的同名 UDP 端口
+    // 上额外监听"，客户端没法指定别的端口。现在：
+    //
+    // * 配了 `quicBindPort` ⇒ 只在那个端口开 UDP，**不再**顺带占 `bindPort/udp`
+    //   （避免"我配了 7101，为什么 7000/udp 也被占"这种困惑）；
+    // * 没配 `quicBindPort` 且 `transport_protocol = quic` ⇒ 退回旧行为
+    //   （`bindPort` 同名 UDP），保持老部署不变。
+    //
+    // 两种情况都**保留 TCP 监听**：老客户端照旧能连，切传输协议不会一刀切。
+    let quic_port = cfg.quic_bind_port.or_else(|| {
+        if is_quic(&cfg.transport_protocol) {
+            Some(addr.port())
+        } else {
+            None
+        }
+    });
+
+    if let Some(qport) = quic_port {
         let qaddr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, qport))
             .await
             .with_context(|| format!("解析 QUIC 地址 {}:{} 失败", cfg.bind_addr, qport))?;
@@ -496,12 +513,17 @@ pub async fn serve_on_with(
             .await
             .with_context(|| format!("监听 QUIC {qaddr} 失败"))?;
         info!(
-            "QUIC 传输已启用，UDP {}",
+            "QUIC 传输已启用，UDP {}（来自 {}）",
             endpoint
                 .local_addr()
                 .ok()
                 .map(|a| a.to_string())
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if cfg.quic_bind_port.is_some() {
+                "quicBindPort"
+            } else {
+                "transport_protocol = quic"
+            }
         );
         let cfg2 = cfg.clone();
         let registry2 = registry.clone();

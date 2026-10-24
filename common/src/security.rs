@@ -82,15 +82,19 @@ pub struct ServerAuthConfig {
     pub oidc: ServerOidcConfig,
     /// 令牌来源（官方 frps 的 `auth.tokenSource`）。
     ///
-    /// ★ 官方支持、nfrp **未实现**：声明只为"官方配置能解析通过"——
-    /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会直接解析失败。
-    /// 值不会被使用。
+    /// ★ v0.6.5 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
+    ///
+    /// 服务端用它做**期望 token** 的来源：从文件或外部命令读，再与客户端
+    /// 送来的 token 比对。这样 token 不必写在配置里，适合 k8s Secret /
+    /// Vault sidecar 这类把密钥挂成文件的部署。
+    ///
+    /// 与 `token` 互斥：两者都配时以 `tokenSource` 为准并告警。
     #[serde(
         default,
         rename = "tokenSource",
         skip_serializing_if = "Option::is_none"
     )]
-    pub token_source: Option<toml::Value>,
+    pub token_source: Option<ValueSource>,
 }
 
 /// 官方 frp 的默认 `additionalScopes`：两个都开。
@@ -177,15 +181,26 @@ pub struct ClientAuthConfig {
     pub oidc: ClientOidcConfig,
     /// 令牌来源（官方 frpc 的 `auth.tokenSource`：从文件 / 外部命令读 token）。
     ///
-    /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
-    /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会**直接解析失败**。
-    /// 值不会被使用，启动时会明确告警（见 `UNSUPPORTED_CLIENT_FIELDS`）。
+    /// 令牌来源（官方 frpc 的 `auth.tokenSource`：从文件 / 外部命令读 token）。
+    ///
+    /// ★ v0.6.5 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
+    ///
+    /// 与 `token` 字段**互斥**：两者都配时以 `tokenSource` 为准并告警
+    /// （官方 `AuthClientConfig` 的注释写的就是 "mutually exclusive with
+    /// Token field"）。
+    ///
+    /// ```toml
+    /// [auth.tokenSource]
+    /// type = "file"
+    /// [auth.tokenSource.file]
+    /// path = "/etc/nfrp/token"
+    /// ```
     #[serde(
         default,
         rename = "tokenSource",
         skip_serializing_if = "Option::is_none"
     )]
-    pub token_source: Option<toml::Value>,
+    pub token_source: Option<ValueSource>,
 }
 
 impl std::fmt::Debug for ClientAuthConfig {
@@ -201,6 +216,7 @@ impl std::fmt::Debug for ClientAuthConfig {
             .field("token", &token)
             .field("additional_scopes", &self.additional_scopes)
             .field("oidc", &self.oidc)
+            .field("token_source", &self.token_source)
             .finish()
     }
 }
@@ -211,6 +227,194 @@ impl ClientAuthConfig {
             self.oidc.validate()?;
         }
         Ok(())
+    }
+}
+
+// ===========================================================================
+// tokenSource：动态令牌来源（官方 frp 的 `ValueSource`）
+// ===========================================================================
+
+/// 动态取值来源。严格对齐官方 `pkg/config/v1/transport_config.go` 的
+/// `ValueSource` / `FileSource` / `ExecSource`。
+///
+/// 官方只支持两种 `type`：
+/// * `file` —— 读文件内容，**去掉首尾空白**（配置文件末尾常有换行，
+///   不去掉 token 就对不上，这是官方明确写过的重要细节）；
+/// * `exec` —— 跑一个子进程，取它的 stdout（同样去首尾空白）。
+///
+/// # 安全说明（`exec` 类型）
+///
+/// `exec` 会在客户端启动时**执行一个外部程序**。这与官方行为一致，
+/// 但风险要说清：**能改配置文件的人等于能执行任意命令**（以 nfrp 的运行
+/// 身份）。因此：
+///
+/// * 不经 shell 执行（直接 spawn，`command` 与 `args` 不拼接）；
+/// * 有超时上限，防止挂死整个启动流程；
+/// * 启动日志会明确打出"令牌来自外部命令"，便于审计。
+///
+/// 只需要"从文件读 token"时请优先用 `type = "file"`，它没有执行风险。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueSource {
+    /// `"file"` 或 `"exec"`。
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ExecSource>,
+}
+
+/// 从文件取值的配置（官方 `FileSource`）。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSource {
+    #[serde(default)]
+    pub path: String,
+}
+
+/// 从子进程取值的配置（官方 `ExecSource`）。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecSource {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<ExecEnvVar>,
+}
+
+/// `exec` 的附加环境变量（官方 `ExecEnvVar`）。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecEnvVar {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// `exec` 类型的执行超时。官方没有显式上限（跟着 ctx 走），
+/// 这里必须有 —— 否则一个卡住的子进程会让客户端**永远起不来**。
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl ValueSource {
+    /// 校验配置本身是否自洽。启动时先调它，把配置错误报在**取 token 之前**。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.kind.as_str() {
+            "file" => {
+                let f = self
+                    .file
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tokenSource type=file 时必须配 [file] 段"))?;
+                if f.path.trim().is_empty() {
+                    anyhow::bail!("tokenSource.file.path 不能为空");
+                }
+            }
+            "exec" => {
+                let e = self
+                    .exec
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tokenSource type=exec 时必须配 [exec] 段"))?;
+                if e.command.trim().is_empty() {
+                    anyhow::bail!("tokenSource.exec.command 不能为空");
+                }
+            }
+            "" => anyhow::bail!("tokenSource 缺少 type（只支持 \"file\" / \"exec\"）"),
+            other => {
+                anyhow::bail!("tokenSource.type = [{other}] 不支持，只支持 \"file\" / \"exec\"")
+            }
+        }
+        Ok(())
+    }
+
+    /// 真正去取值。返回的是**已去掉首尾空白**的字符串（官方同样处理）。
+    ///
+    /// ★ 返回值**绝不能进日志** —— 它是 token 本身。
+    pub fn resolve(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        match self.kind.as_str() {
+            "file" => {
+                let path = &self.file.as_ref().expect("validate 已保证").path;
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("读取 tokenSource 文件 [{path}] 失败：{e}"))?;
+                let t = raw.trim().to_string();
+                if t.is_empty() {
+                    anyhow::bail!("tokenSource 文件 [{path}] 是空的（或只有空白）");
+                }
+                Ok(t)
+            }
+            "exec" => {
+                let e = self.exec.as_ref().expect("validate 已保证");
+                self.run_exec(e)
+            }
+            _ => unreachable!("validate 已排除"),
+        }
+    }
+
+    /// 跑子进程取 stdout。**不经 shell**（`command` 与 `args` 分开传）。
+    fn run_exec(&self, e: &ExecSource) -> anyhow::Result<String> {
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new(&e.command);
+        cmd.args(&e.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for kv in &e.env {
+            if kv.name.trim().is_empty() {
+                anyhow::bail!("tokenSource.exec.env 里有空名字的环境变量");
+            }
+            cmd.env(&kv.name, &kv.value);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| anyhow::anyhow!("tokenSource 命令 [{}] 启动失败：{err}", e.command))?;
+
+        // 带超时地等：用线程轮询 `try_wait`，超时直接 kill。
+        // 不用 `wait_timeout` 之类要额外依赖的写法。
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if started.elapsed() > EXEC_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!(
+                            "tokenSource 命令 [{}] 超过 {} 秒未结束，已强制终止",
+                            e.command,
+                            EXEC_TIMEOUT.as_secs()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => {
+                    anyhow::bail!("等待 tokenSource 命令 [{}] 失败：{err}", e.command);
+                }
+            }
+        }
+
+        let out = child.wait_with_output().map_err(|err| {
+            anyhow::anyhow!("读取 tokenSource 命令 [{}] 输出失败：{err}", e.command)
+        })?;
+        if !out.status.success() {
+            // 只截断打尾部，避免把巨量 stderr 灌进日志
+            let err_text = String::from_utf8_lossy(&out.stderr);
+            let brief: String = err_text.chars().take(300).collect();
+            anyhow::bail!(
+                "tokenSource 命令 [{}] 退出码非 0（{}）：{brief}",
+                e.command,
+                out.status
+            );
+        }
+        let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if t.is_empty() {
+            anyhow::bail!("tokenSource 命令 [{}] 没有输出任何内容", e.command);
+        }
+        Ok(t)
     }
 }
 
@@ -1649,5 +1853,186 @@ deny = ["10.1.0.0/16"]
     fn 空_acl_段仍然合法() {
         let c: AclConfig = toml::from_str("").expect("空表必须合法");
         assert!(c.is_empty());
+    }
+
+    // ==================================================================
+    // v0.6.5：tokenSource（官方 ValueSource）
+    // ==================================================================
+
+    #[test]
+    fn tokensource_能解析官方写法() {
+        let t = r#"
+type = "file"
+[file]
+path = "/etc/nfrp/token"
+"#;
+        let v: ValueSource = toml::from_str(t).unwrap();
+        assert_eq!(v.kind, "file");
+        assert_eq!(v.file.as_ref().unwrap().path, "/etc/nfrp/token");
+        v.validate().unwrap();
+
+        let t2 = r#"
+type = "exec"
+[exec]
+command = "/usr/local/bin/get-token"
+args = ["--json"]
+[[exec.env]]
+name = "VAULT_ADDR"
+value = "https://vault:8200"
+"#;
+        let v2: ValueSource = toml::from_str(t2).unwrap();
+        assert_eq!(v2.kind, "exec");
+        let e = v2.exec.as_ref().unwrap();
+        assert_eq!(e.command, "/usr/local/bin/get-token");
+        assert_eq!(e.args, vec!["--json"]);
+        assert_eq!(e.env[0].name, "VAULT_ADDR");
+        v2.validate().unwrap();
+    }
+
+    /// 各种写错的配置要在 `validate` 阶段被拒，且错误信息说清哪儿错了。
+    #[test]
+    fn tokensource_配置错误必须明确报出() {
+        // 缺 type
+        let v: ValueSource = toml::from_str("[file]\npath = \"x\"\n").unwrap();
+        let e = v.validate().unwrap_err().to_string();
+        assert!(e.contains("type"), "要提示缺 type：{e}");
+
+        // type 不认识
+        let v = ValueSource {
+            kind: "vault".into(),
+            ..Default::default()
+        };
+        let e = v.validate().unwrap_err().to_string();
+        assert!(e.contains("vault"), "要回显用户写的类型：{e}");
+
+        // type=file 但没写 [file]
+        let v = ValueSource {
+            kind: "file".into(),
+            ..Default::default()
+        };
+        assert!(v.validate().unwrap_err().to_string().contains("file"));
+
+        // type=file 但 path 为空
+        let v = ValueSource {
+            kind: "file".into(),
+            file: Some(FileSource { path: "   ".into() }),
+            ..Default::default()
+        };
+        assert!(v.validate().unwrap_err().to_string().contains("path"));
+
+        // type=exec 但没写 command
+        let v = ValueSource {
+            kind: "exec".into(),
+            exec: Some(ExecSource::default()),
+            ..Default::default()
+        };
+        assert!(v.validate().unwrap_err().to_string().contains("command"));
+    }
+
+    /// ★ file 类型：要去掉首尾空白（文件末尾常有换行，不 trim 就对不上）。
+    #[test]
+    fn tokensource_file_会去掉首尾空白() {
+        let d = std::env::temp_dir().join(format!("nfrp-ts-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("token.txt");
+        // 故意带前后空白与换行
+        std::fs::write(&p, "  s3cret-token\n\n").unwrap();
+
+        let v = ValueSource {
+            kind: "file".into(),
+            file: Some(FileSource {
+                path: p.to_string_lossy().into_owned(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(v.resolve().unwrap(), "s3cret-token");
+
+        // 空文件要报错，不能返回空 token（那等于把认证关了）
+        std::fs::write(&p, "  \n\t\n").unwrap();
+        let e = v.resolve().unwrap_err().to_string();
+        assert!(e.contains("空"), "空文件必须明确报错：{e}");
+
+        // 文件不存在也要报错
+        std::fs::remove_file(&p).unwrap();
+        assert!(v.resolve().is_err());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ exec 类型：取 stdout 并 trim；非 0 退出码要报错。
+    #[cfg(unix)]
+    #[test]
+    fn tokensource_exec_取_stdout() {
+        let v = ValueSource {
+            kind: "exec".into(),
+            exec: Some(ExecSource {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf '  from-exec \\n'".into()],
+                env: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(v.resolve().unwrap(), "from-exec");
+
+        // 非 0 退出码
+        let bad = ValueSource {
+            kind: "exec".into(),
+            exec: Some(ExecSource {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo boom >&2; exit 3".into()],
+                env: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let e = bad.resolve().unwrap_err().to_string();
+        assert!(e.contains("退出码"), "要报退出码非 0：{e}");
+
+        // 命令不存在
+        let missing = ValueSource {
+            kind: "exec".into(),
+            exec: Some(ExecSource {
+                command: "/nonexistent/nfrp-no-such-cmd".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(missing.resolve().is_err());
+    }
+
+    /// exec 的环境变量要真的传给子进程。
+    #[cfg(unix)]
+    #[test]
+    fn tokensource_exec_传环境变量() {
+        let v = ValueSource {
+            kind: "exec".into(),
+            exec: Some(ExecSource {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf '%s' \"$NFRP_TEST_TOKEN\"".into()],
+                env: vec![ExecEnvVar {
+                    name: "NFRP_TEST_TOKEN".into(),
+                    value: "env-token-xyz".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(v.resolve().unwrap(), "env-token-xyz");
+    }
+
+    /// ★ 安全：`ValueSource` 的 Debug 输出**不能**包含 token 本身。
+    ///
+    /// 它只含配置（路径 / 命令名），不含取到的值 —— 但这条测试是防止
+    /// 以后有人把"解析结果"缓存进结构体里又让它进日志。
+    #[test]
+    fn tokensource_debug_不含取值() {
+        let v = ValueSource {
+            kind: "file".into(),
+            file: Some(FileSource {
+                path: "/etc/nfrp/token".into(),
+            }),
+            ..Default::default()
+        };
+        let s = format!("{v:?}");
+        assert!(s.contains("/etc/nfrp/token"), "路径可以出现：{s}");
+        assert!(s.contains("file"), "类型可以出现：{s}");
     }
 }

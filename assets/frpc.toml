@@ -28,6 +28,19 @@ token = "your_secret_token"
 # stcp / xtcp 的 allow_users 比对的就是这个值，不是 [[visitors]] 的 name。
 # user = "alice"
 
+# ---- 额外配置文件（对应官方 frpc 的 includes，v0.6.5 新增）----
+# 每一项是路径或 glob 模式；命中的文件里**只取 [[proxies]] 与 [[visitors]]**，
+# 追加到本配置后面。各文件的其它字段（serverAddr / token…）一律忽略 ——
+# 它不是"配置继承/覆盖"，而是**批量追加代理定义**。
+#
+# 相对路径按**本文件所在目录**解析。
+# 目录下命中的文件会按文件名排序后依次加载，顺序是确定的。
+#
+# includes = ["conf.d/*.toml"]
+#
+# 合并后代理名 / 访客名必须唯一，重名会直接报错（服务端按 name 定位代理，
+# 重名会让"踢掉一个"变成"随机踢掉其中一个"，排查极其费劲）。
+
 # ---- 传输层 ----
 # yamux 多路复用：控制连接和所有工作连接复用同一条 TCP，能显著减少连接数
 # 需要服务端允许 yamux（frps 的 tcp_mux）
@@ -277,6 +290,29 @@ log_level = "info"
 #
 # 客户端会在**每次（重）连之前**用 Client Credentials 换一次 access token
 # （带缓存），所以 token 过期不会变成"重连时拿着旧 token 再失败一次"。
+
+# 令牌来自外部源（对应官方 frpc 的 auth.tokenSource，v0.6.5 新增）
+#   token 不必写死在配置里，适合 k8s Secret / Vault sidecar 这类部署。
+#   与 token 互斥：两者都配时**以 tokenSource 为准**并告警；
+#   命令行 -t / --token 优先级最高（那是用户的即时意图）。
+#
+#   [auth.tokenSource]
+#   type = "file"
+#   [auth.tokenSource.file]
+#   path = "/etc/nfrp/token"
+#
+#   [auth.tokenSource]
+#   type = "exec"
+#   [auth.tokenSource.exec]
+#   command = "/usr/local/bin/get-nfrp-token"
+#   args = ["--format", "raw"]
+#   [[auth.tokenSource.exec.env]]
+#   name = "VAULT_ADDR"
+#   value = "https://vault.example.com:8200"
+#
+# ★ 安全提醒：exec 会**以本进程身份执行外部程序** ——
+#   能改这份配置的人等于能执行任意命令。只需要读文件时请用 type = "file"。
+#   读到的值只用于登录，**不会进日志**；启动时会打出令牌来源便于审计。
 
 # ---- 动态代理落盘（[store]）----
 # 面板 / 本地管理界面上临时加的代理默认只活在内存里，进程一重启就没了。

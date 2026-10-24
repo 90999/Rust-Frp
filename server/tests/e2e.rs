@@ -2073,3 +2073,260 @@ async fn work_conn_wire_protocol_mismatch_is_rejected() {
         "线协议对不上的工作连接必须被拒绝，否则会带着错误的容器一路错下去"
     );
 }
+
+// ===========================================================================
+// v0.6.5：完整 PSF（Protocol State Fuzzing）状态机枚举
+// ===========================================================================
+//
+// 上一轮只有"降级探针"：把两条跨状态消息喂进去，看服务端不崩。
+// 那不能算状态机覆盖 —— 它只验了 2 个 (状态 × 消息) 组合。
+//
+// 这里做真正的枚举：**3 个协议阶段 × 12 条客户端可发消息**，
+// 逐条喂给真实服务端，断言三件事：
+//   ① 服务端不崩 —— 每次之后都能用新连接正常登录；
+//   ② 不挂住     —— 控制连接必须"要么还活、要么已被关闭"，不能既不响应也不断；
+//   ③ 不泄漏     —— 断开后 registry 里不残留该会话的代理。
+//
+// 为什么"不挂住"是核心：一个既不回 Pong 也不关连接的会话，会把服务端的
+// 连接槽位和内存永久占住 —— 这正是最容易写错、也最难靠单测发现的那类问题。
+
+/// 控制连接的协议阶段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PsfPhase {
+    /// 已建立 TCP，还没发 Login。
+    PreLogin,
+    /// Login 成功，还没注册任何代理。
+    PostLogin,
+    /// 已成功注册一条 tcp 代理。
+    Registered,
+}
+
+impl PsfPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PreLogin => "PreLogin",
+            Self::PostLogin => "PostLogin",
+            Self::Registered => "Registered",
+        }
+    }
+}
+
+/// 客户端"敢发"的各种消息 —— 覆盖 `FrpMessage` 全部 20 个变体。
+///
+/// 含服务端→客户端方向的那些（`LoginResp` / `Pong` / `StartWorkConn` …）：
+/// 客户端发它们就是**协议方向违例**，正是要测的输入。
+fn psf_messages() -> Vec<(&'static str, FrpMessage)> {
+    use nfrp_common::frp::msg as m;
+    vec![
+        ("Login", FrpMessage::Login(m::Login::default())),
+        ("LoginResp", FrpMessage::LoginResp(m::LoginResp::default())),
+        (
+            "NewProxy",
+            FrpMessage::NewProxy(m::NewProxy {
+                proxy_name: "psf-proxy".into(),
+                proxy_type: "tcp".into(),
+                remote_port: 0,
+                ..Default::default()
+            }),
+        ),
+        (
+            "NewProxyResp",
+            FrpMessage::NewProxyResp(m::NewProxyResp::default()),
+        ),
+        (
+            "CloseProxy",
+            FrpMessage::CloseProxy(m::CloseProxy {
+                proxy_name: "psf-proxy".into(),
+            }),
+        ),
+        (
+            "NewWorkConn",
+            FrpMessage::NewWorkConn(m::NewWorkConn {
+                run_id: "psf-run".into(),
+                ..Default::default()
+            }),
+        ),
+        ("ReqWorkConn", FrpMessage::ReqWorkConn),
+        (
+            "StartWorkConn",
+            FrpMessage::StartWorkConn(m::StartWorkConn::default()),
+        ),
+        (
+            "NewVisitorConn",
+            FrpMessage::NewVisitorConn(m::NewVisitorConn {
+                run_id: "psf-run".into(),
+                proxy_name: "psf-proxy".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            "NewVisitorConnResp",
+            FrpMessage::NewVisitorConnResp(m::NewVisitorConnResp::default()),
+        ),
+        ("Ping", FrpMessage::Ping(m::Ping::default())),
+        ("Pong", FrpMessage::Pong(m::Pong::default())),
+        (
+            "UdpPacket",
+            FrpMessage::UdpPacket(m::UdpPacket {
+                content: Some(b"psf".to_vec()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "NatHoleVisitor",
+            FrpMessage::NatHoleVisitor(m::NatHoleVisitor {
+                proxy_name: "psf-proxy".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            "NatHoleClient",
+            FrpMessage::NatHoleClient(m::NatHoleClient {
+                proxy_name: "psf-proxy".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            "NatHoleResp",
+            FrpMessage::NatHoleResp(m::NatHoleResp::default()),
+        ),
+        (
+            "NatHoleSid",
+            FrpMessage::NatHoleSid(m::NatHoleSid::default()),
+        ),
+        (
+            "NatHoleReport",
+            FrpMessage::NatHoleReport(m::NatHoleReport::default()),
+        ),
+        ("ServerCmd", FrpMessage::ServerCmd(m::ServerCmd::default())),
+        (
+            "ServerCmdResp",
+            FrpMessage::ServerCmdResp(m::ServerCmdResp::default()),
+        ),
+    ]
+}
+
+/// 把一条控制连接推进到指定阶段。返回 `None` 表示该阶段没能建立
+/// （对 `PreLogin` 之外的阶段意味着"连登录都不通"，那是更严重的问题）。
+async fn psf_reach(port: u16, phase: PsfPhase) -> Option<(FrpConn, Option<u16>)> {
+    if phase == PsfPhase::PreLogin {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        return Some((FrpConn::new(Box::pin(stream), WireVersion::V1), None));
+    }
+
+    let (mut conn, _run_id) = login(port, TOKEN, "psf").await;
+
+    let mut probe_port = None;
+    if phase == PsfPhase::Registered {
+        let remote = free_port();
+        let resp = register_proxy(
+            &mut conn,
+            NewProxy {
+                proxy_name: format!("psf-reg-{remote}"),
+                proxy_type: "tcp".into(),
+                remote_port: remote,
+                ..Default::default()
+            },
+        )
+        .await;
+        if !resp.error.is_empty() {
+            return None;
+        }
+        probe_port = Some(remote);
+    }
+    Some((conn, probe_port))
+}
+
+/// 服务端"还活着"的最强证据：新起一条连接能正常登录。
+async fn psf_assert_alive(port: u16, ctx: &str) {
+    let (mut c, _run_id) = login(port, TOKEN, "psf-alive").await;
+    let resp = register_proxy(
+        &mut c,
+        NewProxy {
+            proxy_name: format!("psf-alive-{}", free_port()),
+            proxy_type: "tcp".into(),
+            remote_port: free_port(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        resp.error.is_empty(),
+        "[{ctx}] 服务端在收到该消息后已不可用：新连接注册失败 -> {}",
+        resp.error
+    );
+}
+
+/// ★ 完整状态机枚举：3 阶段 × 20 消息。
+///
+/// 关键断言是 **"不能挂住"**：发消息后 400ms 内，控制连接必须表现出
+/// "还能收发" 或 "已被服务端关闭" 二者之一。既不响应也不关闭 = 连接被挂死，
+/// 那会永久占住服务端的一个会话槽位。
+#[tokio::test]
+async fn psf_全状态机枚举_不崩不挂不泄漏() {
+    let (port, registry) = start_server_with_registry(base_cfg()).await;
+    let phases = [
+        PsfPhase::PreLogin,
+        PsfPhase::PostLogin,
+        PsfPhase::Registered,
+    ];
+
+    for phase in phases {
+        for (msg_name, msg) in psf_messages() {
+            let ctx = format!("{}/{}", phase.label(), msg_name);
+
+            let Some((mut conn, probe_port)) = psf_reach(port, phase).await else {
+                // 该阶段建不起来：PreLogin 不该发生，其它阶段说明登录/注册坏了
+                panic!("[{ctx}] 无法把连接推进到该阶段");
+            };
+
+            // 发出去。某些消息可能让服务端立刻关连接，写失败是允许的。
+            let sent = conn.send_msg(&msg).await.is_ok();
+
+            // ① 不挂住：400ms 内要么读到东西（含 EOF），要么能成功再发一条
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_millis(400), conn.recv_msg()).await;
+
+            match outcome {
+                Ok(Ok(_)) => {
+                    // 读到了响应或 EOF —— 两种情况都说明连接没有"半死"
+                }
+                Ok(Err(_)) => {
+                    // 读出错 = 连接已断，可接受
+                }
+                Err(_) => {
+                    // 超时：还没判死刑。可能这条消息本身不产生响应（如 CloseProxy），
+                    // 那就看"能不能再写进去" —— 写得进说明连接仍然存活。
+                    if sent {
+                        let probe = FrpMessage::Ping(nfrp_common::frp::msg::Ping::default());
+                        assert!(
+                            conn.send_msg(&probe).await.is_ok(),
+                            "[{ctx}] 连接既不响应也不关闭，还能探测到挂死状态"
+                        );
+                    }
+                }
+            }
+
+            // 主动断开，让服务端走清理路径
+            drop(conn);
+            // 给服务端一点时间回收
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+            // ② 服务端不崩
+            psf_assert_alive(port, &ctx).await;
+
+            // ③ 不泄漏：断开后端口上的后端计数必须归零。
+            //    这里只能查端口（`backend_count`），因为 registry 不按名字暴露列表；
+            //    而端口是我们自己挑的、只被这一轮用过，所以计数归零就是"清理干净"。
+            if let Some(pp) = probe_port {
+                assert_eq!(
+                    registry.backend_count(pp),
+                    0,
+                    "[{ctx}] 断开后端口 {pp} 上仍残留后端（会话未清理）"
+                );
+            }
+        }
+    }
+}

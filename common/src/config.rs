@@ -660,6 +660,27 @@ pub struct ServerConfig {
     #[serde(default, alias = "kcpBindPort", alias = "kcp_bind_port")]
     pub kcp_bind_port: Option<u16>,
 
+    /// QUIC 传输的**独立**监听端口（官方 frps 的 `quicBindPort`）。
+    ///
+    /// # 与 `transport_protocol = "quic"` 的区别
+    ///
+    /// 后者是"服务端说自己也走 QUIC"，但旧实现只在 `bindPort` 的**同名 UDP
+    /// 端口**上额外监听 —— 客户端没法指定别的端口。
+    ///
+    /// 官方语义是：`quicBindPort` **配了就开**一个独立 UDP 端口，与 `bindPort`
+    /// 无关。好处是能把 QUIC 放到另一个端口（`bindPort` 已被占用、或要做端口
+    /// 分流），防火墙规则也更好写。
+    ///
+    /// ★ v0.6.5：配了它之后，QUIC 监听**只**在这个端口上开，**不再**顺带占用
+    /// `bindPort` 的同名 UDP 端口。那是旧行为的隐式副作用，会让
+    /// "我明明配了 quicBindPort=7101，为什么 7000/udp 也被占了" 变成谜。
+    ///
+    /// ```toml
+    /// quicBindPort = 7101
+    /// ```
+    #[serde(default, alias = "quicBindPort", alias = "quic_bind_port")]
+    pub quic_bind_port: Option<u16>,
+
     // ---- xtcp 真 P2P ----
     /// 牵线（rendezvous）用的 UDP 端口。
     ///
@@ -672,6 +693,28 @@ pub struct ServerConfig {
     /// 内置面板 + `/metrics` 端点的监听端口（留空则不启用）。
     #[serde(default)]
     pub dashboard_port: Option<u16>,
+
+    /// 是否在面板端口上导出 Prometheus 指标（官方 frps 的 `enablePrometheus`）。
+    ///
+    /// ★ v0.6.5：**默认关闭**，与官方一致。此前是无条件开放 `/metrics`。
+    ///
+    /// 为什么默认关：
+    /// * 官方默认就不开（`server.go` 的注释写明"配了才导出"），
+    ///   照官方文档部署的人会以为它关着；
+    /// * 指标里含业务信息（在线客户端数、代理名、流量字节），
+    ///   在"只想开个面板看看"的部署里等于**默认多暴露一份数据面**。
+    ///
+    /// 要采集就显式打开：
+    ///
+    /// ```toml
+    /// enablePrometheus = true
+    /// ```
+    ///
+    /// `/api/healthz` 不受这个开关影响 —— 健康探针永远可用，
+    /// 否则 k8s / docker 的探针会因为"没开指标"而反复重启容器。
+    #[serde(default, rename = "enablePrometheus", alias = "enable_prometheus")]
+    pub enable_prometheus: bool,
+
     /// 面板用户名（留空表示**不做鉴权**）。
     ///
     /// ★ 留空只在 `bind_addr` 是回环时被接受（本机自用）。配了
@@ -1129,6 +1172,7 @@ impl Default for ServerConfig {
             disable_print_color: false,
             transport_protocol: default_transport_protocol(),
             kcp_bind_port: None,
+            quic_bind_port: None,
             max_total_conns: 0,
             max_clients: 0,
             max_conns_per_client: 0,
@@ -1143,6 +1187,7 @@ impl Default for ServerConfig {
             detailed_errors_to_client: true,
             p2p_port: None,
             dashboard_port: None,
+            enable_prometheus: false,
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
@@ -1973,6 +2018,32 @@ pub struct ClientConfig {
     #[serde(default)]
     pub visitors: Vec<VisitorConfig>,
 
+    /// 额外配置文件（官方 frpc 的 `includes`）。
+    ///
+    /// # 官方语义（`pkg/config/load.go` 的 `LoadAdditionalClientConfigs`）
+    ///
+    /// 每一项是一个**路径或 glob 模式**。加载时逐个处理：
+    ///
+    /// 1. 取该路径的**目录**，遍历目录下所有普通文件；
+    /// 2. 用 `filepath.Match` 拿「目录 + basename」与候选文件比对；
+    /// 3. 命中的文件当作一份完整 frpc 配置解析，**只取它的 `proxies` 与
+    ///    `visitors`**，追加到主配置的对应列表；
+    /// 4. 各文件的其它字段（`serverAddr` / `token`…）**一律忽略**。
+    ///
+    /// ★ 第 4 点最容易误解：`includes` 不是"配置继承/覆盖"，而是**批量追加
+    ///   代理定义**。用一个 `[proxies]` 都没写的文件配进 includes 等于什么也
+    ///   不做。
+    ///
+    /// ```toml
+    /// includes = ["conf.d/*.toml"]
+    /// ```
+    ///
+    /// 相对路径按**主配置文件所在目录**解析 —— 官方用的是 `filepath.Dir(path)`，
+    /// 这样 `--config /etc/nfrp/frpc.toml` 里的相对 includes 会落在
+    /// `/etc/nfrp/` 下，符合直觉。
+    #[serde(default, alias = "include", alias = "IncludeConfigFiles")]
+    pub includes: Vec<String>,
+
     // ================= 以下为 v0.3.4 新增 =================
     // 同样全部默认关闭，老的 client.toml 行为不变。
     /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
@@ -2061,6 +2132,7 @@ impl Default for ClientConfig {
             private_caps: true,
             proxies: Vec::new(),
             visitors: Vec::new(),
+            includes: Vec::new(),
             auth: Default::default(),
             store: Default::default(),
             web_server: Default::default(),
@@ -2233,7 +2305,128 @@ impl ClientConfig {
     /// `frpc -v` 的版本协商结果决定下发哪一种）。
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(crate::error::Error::Io)?;
-        parse_client(&raw)
+        let mut cfg = parse_client(&raw)?;
+        // ★ v0.6.5：`includes` 合并（官方 `LoadAdditionalClientConfigs`）
+        cfg.merge_includes(path.as_ref())?;
+        Ok(cfg)
+    }
+
+    /// 把 `includes` 里各文件的 `proxies` / `visitors` 追加进本配置。
+    ///
+    /// 语义严格对齐官方 `pkg/config/load.go`：
+    /// * 每项是路径或 glob（`*` / `?` 由 [`glob_match`] 处理）；
+    /// * 只取**目录**下的普通文件参与匹配；
+    /// * 命中文件只贡献 `proxies` 与 `visitors`，其它字段全部忽略；
+    /// * 相对路径以**主配置文件所在目录**为基准。
+    ///
+    /// 空列表时直接返回，不碰文件系统 —— 绝大多数部署不走这个分支。
+    pub fn merge_includes(&mut self, main_path: &Path) -> Result<()> {
+        if self.includes.is_empty() {
+            return Ok(());
+        }
+
+        // 主配置所在目录；拿不到就用当前目录（比如传的是相对文件名）
+        let base = main_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // 收集所有待追加的代理 / 访客
+        let mut extra_proxies: Vec<ProxyConfig> = Vec::new();
+        let mut extra_visitors: Vec<VisitorConfig> = Vec::new();
+
+        for pattern in &self.includes {
+            let full = if Path::new(pattern).is_absolute() {
+                PathBuf::from(pattern)
+            } else {
+                base.join(pattern)
+            };
+
+            // 目录与 basename（glob 只作用在文件名上，与官方 filepath.Match 一致）
+            let dir = full
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| base.clone());
+            let name_pat = full
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            if name_pat.is_empty() {
+                return Err(crate::error::Error::Protocol(format!(
+                    "includes 里的 [{pattern}] 没有文件名部分"
+                )));
+            }
+
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(crate::error::Error::Protocol(format!(
+                        "includes 里的 [{pattern}] 打不开目录 {}：{e}",
+                        dir.display()
+                    )))
+                }
+            };
+
+            // 目录内容排序后处理：让"哪个文件先加载"是确定的，
+            // 否则两台机器上同名代理的报错顺序都可能不同。
+            let mut names: Vec<String> = Vec::new();
+            for ent in rd.flatten() {
+                if ent.path().is_file() {
+                    names.push(ent.file_name().to_string_lossy().into_owned());
+                }
+            }
+            names.sort();
+
+            for fname in names {
+                if !glob_match(&name_pat, &fname) {
+                    continue;
+                }
+                let fpath = dir.join(&fname);
+                let raw = std::fs::read_to_string(&fpath).map_err(|e| {
+                    crate::error::Error::Protocol(format!(
+                        "读取 includes 文件 {} 失败：{e}",
+                        fpath.display()
+                    ))
+                })?;
+                let sub = parse_include_file(&raw).map_err(|e| {
+                    crate::error::Error::Protocol(format!(
+                        "解析 includes 文件 {} 失败：{e}",
+                        fpath.display()
+                    ))
+                })?;
+                extra_proxies.extend(sub.proxies);
+                extra_visitors.extend(sub.visitors);
+            }
+        }
+
+        self.proxies.append(&mut extra_proxies);
+        self.visitors.append(&mut extra_visitors);
+
+        // 名字必须唯一 —— 服务端按 name 定位代理，重名会让"踢掉一个"
+        // 变成"随机踢掉其中一个"，排查起来极其费劲。
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in &self.proxies {
+            if !seen.insert(p.name.as_str()) {
+                return Err(crate::error::Error::Protocol(format!(
+                    "代理名 [{}] 重复（主配置与 includes 合并后）",
+                    p.name
+                )));
+            }
+        }
+        let mut seen_v: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for v in &self.visitors {
+            if !seen_v.insert(v.name.as_str()) {
+                return Err(crate::error::Error::Protocol(format!(
+                    "访客名 [{}] 重复（主配置与 includes 合并后）",
+                    v.name
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// 写入一份带注释的示例配置。
@@ -2511,6 +2704,166 @@ pub fn default_config_path(file_name: impl AsRef<Path>) -> PathBuf {
 /// 之所以不能只看扩展名：各种面板 / 启动器把配置写到哪个后缀是它们自己的事
 /// （樱花就把同一份隧道同时给 `.ini` 和 `.toml` 两份），而官方 frp 也确实是
 /// 按**内容**判定的。
+///
+/// ---
+///
+/// shell 风格的通配匹配，语义对齐 Go 的 `filepath.Match`（只处理文件名，不含路径）。
+///
+/// 支持：
+/// * `*` —— 匹配任意长度（含空）的字符序列，**不跨** `/`（这里只看文件名，不含 `/`）；
+/// * `?` —— 匹配恰好一个字符；
+/// * `[...]` —— 字符集（`[abc]` / `[a-z]` / `[^abc]`），与 Go 一致；
+/// * 其余字符按字面匹配。
+///
+/// 为什么不引 `glob` crate：这里只需要"文件名级"匹配（官方也是
+/// `filepath.Match(目录+basename, 候选文件)`，跨目录的递归由调用方遍历完成），
+/// 为了这一个函数拉一个新依赖不划算 —— 而且自己写才能精确复刻 Go 的边界行为
+/// （比如 `*` 不匹配 `/`、`[` 未闭合时按字面处理）。
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    glob_inner(&p, &n)
+}
+
+/// 解析一份 `includes` 引用的配置文件。
+///
+/// # 为什么不能直接用 [`parse_client`]
+///
+/// `parse_client` 对主配置要求 `serverAddr` 必填（合理的：客户端总得知道连
+/// 哪儿）。但 `includes` 文件**通常只写 `[[proxies]]`** —— 按官方语义它的
+/// 其它字段本来就该被忽略（`LoadAdditionalClientConfigs` 只取
+/// `cfg.Proxies` / `cfg.Visitors`）。
+///
+/// 所以这里先补一个占位 `serverAddr` 再走正常解析，解析完把占位值连同
+/// 其它字段一起丢掉 —— 调用方只取 `proxies` / `visitors`。
+///
+/// 用"补占位"而不是"另写一套宽松解析器"：`parse_client` 里还有
+/// `enabled` 过滤、未实现类型拒绝、结构化校验等一整套逻辑，
+/// 复制一份迟早两边走偏（本项目已经吃过"同一语义写两遍只加固一遍"的亏）。
+fn parse_include_file(raw: &str) -> Result<ClientConfig> {
+    // legacy INI 的 includes 由它自己的 `[common]` 段承载，这里只处理 TOML。
+    if crate::frp_legacy::is_legacy_ini(raw) {
+        return parse_client(raw);
+    }
+
+    let mut value: toml::Value = toml::from_str(raw)?;
+    let has_server = value.as_table().is_some_and(|t| {
+        t.keys()
+            .any(|k| k.eq_ignore_ascii_case("server_addr") || k.eq_ignore_ascii_case("serverAddr"))
+    });
+    if !has_server {
+        if let Some(t) = value.as_table_mut() {
+            // 占位值只为过 serde 的必填校验，解析完不会有人用它
+            t.insert(
+                "server_addr".to_string(),
+                toml::Value::String("include-placeholder".to_string()),
+            );
+        }
+    }
+    let text = toml::to_string(&value)?;
+    parse_client(&text)
+}
+
+fn glob_inner(p: &[char], n: &[char]) -> bool {
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // 记录最近一个 `*` 的位置，用于失配回溯
+    let mut star: Option<(usize, usize)> = None;
+
+    while ni < n.len() {
+        if pi < p.len() {
+            match p[pi] {
+                '*' => {
+                    // 连续的多个 `*` 视同一个
+                    while pi + 1 < p.len() && p[pi + 1] == '*' {
+                        pi += 1;
+                    }
+                    star = Some((pi, ni));
+                    pi += 1;
+                    continue;
+                }
+                '?' => {
+                    pi += 1;
+                    ni += 1;
+                    continue;
+                }
+                '[' => {
+                    if let Some((matched, next_pi)) = match_class(p, pi, n[ni]) {
+                        if matched {
+                            pi = next_pi;
+                            ni += 1;
+                            continue;
+                        }
+                    } else if p[pi] == n[ni] {
+                        // `[` 未闭合：Go 报 ErrBadPattern，这里按字面处理（更宽容）
+                        pi += 1;
+                        ni += 1;
+                        continue;
+                    }
+                }
+                c => {
+                    if c == n[ni] {
+                        pi += 1;
+                        ni += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 走到这里说明当前字符不匹配：回溯到上一个 `*`，让它多吃一个字符
+        match star {
+            Some((sp, sn)) => {
+                pi = sp + 1;
+                ni = sn + 1;
+                star = Some((sp, sn + 1));
+            }
+            None => return false,
+        }
+    }
+
+    // 名字吃完后，模式剩下的必须全是 `*`
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 尝试匹配一个 `[...]` 字符集。
+///
+/// 返回 `Some((是否匹配, 字符集之后的模式下标))`；
+/// 返回 `None` 表示这个 `[` 没有闭合（调用方按字面处理）。
+fn match_class(p: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+    debug_assert_eq!(p[start], '[');
+    let mut i = start + 1;
+    let negate = i < p.len() && (p[i] == '^' || p[i] == '!');
+    if negate {
+        i += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while i < p.len() {
+        // `]` 作为字符集第一个字符时是字面量（Go 的行为）
+        if p[i] == ']' && !first {
+            return Some((hit != negate, i + 1));
+        }
+        first = false;
+
+        // 区间 a-z
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            let (lo, hi) = (p[i], p[i + 2]);
+            if lo <= c && c <= hi {
+                hit = true;
+            }
+            i += 3;
+            continue;
+        }
+        if p[i] == c {
+            hit = true;
+        }
+        i += 1;
+    }
+    None
+}
 pub fn parse_client(raw: &str) -> Result<ClientConfig> {
     let mut cfg = if crate::frp_legacy::is_legacy_ini(raw) {
         let value = crate::frp_legacy::legacy_client_to_value(raw)?;
@@ -4143,5 +4496,176 @@ tcpmuxPassthrough = true
              我们只**告警**，不替用户改语义"
         );
         assert!(c5.tls_verify_server_cert, "该字段本身要如实解析");
+    }
+
+    // ==================================================================
+    // v0.6.5：`includes`（客户端配置包含）与 `glob_match`
+    // ==================================================================
+
+    #[test]
+    fn glob_匹配语义对齐_go_filepath_match() {
+        // `*` 匹配任意长度（含空）
+        assert!(glob_match("*.toml", "a.toml"));
+        assert!(glob_match("*.toml", ".toml"), "`*` 要能匹配空串");
+        assert!(!glob_match("*.toml", "a.yaml"));
+        assert!(glob_match("a*", "abc"));
+        assert!(glob_match("*", "anything"));
+
+        // `?` 恰好一个字符
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"), "`?` 不能匹配空");
+        assert!(!glob_match("a?c", "abbc"));
+
+        // 字符集
+        assert!(glob_match("a[bc]d", "abd"));
+        assert!(glob_match("a[bc]d", "acd"));
+        assert!(!glob_match("a[bc]d", "aed"));
+        assert!(glob_match("a[a-c]d", "abd"), "区间要生效");
+        assert!(!glob_match("a[a-c]d", "azd"));
+        assert!(glob_match("a[^bc]d", "aed"), "^ 取反");
+        assert!(!glob_match("a[^bc]d", "abd"));
+
+        // `[` 未闭合：按字面处理（比 Go 的报错更宽容，不会让配置直接失败）
+        assert!(glob_match("a[b", "a[b"));
+
+        // 字面量
+        assert!(glob_match("frpc.toml", "frpc.toml"));
+        assert!(!glob_match("frpc.toml", "frpc.toml.bak"));
+
+        // 多个 `*` 与回溯：a*b*c 要能匹配 aXXbYYc
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
+    }
+
+    /// 造一个临时目录；返回目录路径。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nfrp-inc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★ includes：命中文件的 `proxies` 要真的追加进来。
+    #[test]
+    fn includes_会合并_proxies() {
+        let d = tmp_dir("merge");
+        std::fs::write(
+            d.join("frpc.toml"),
+            "serverAddr = \"example.com\"\nincludes = [\"conf.d/*.toml\"]\n\
+             [[proxies]]\nname = \"main\"\ntype = \"tcp\"\nlocalPort = 1000\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("conf.d")).unwrap();
+        std::fs::write(
+            d.join("conf.d/a.toml"),
+            "[[proxies]]\nname = \"extra-a\"\ntype = \"tcp\"\nlocalPort = 2001\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("conf.d/b.toml"),
+            "[[proxies]]\nname = \"extra-b\"\ntype = \"udp\"\nlocalPort = 2002\n",
+        )
+        .unwrap();
+        // 不匹配扩展名的文件不能被加载
+        std::fs::write(
+            d.join("conf.d/c.yaml"),
+            "[[proxies]]\nname = \"should-not-load\"\ntype = \"tcp\"\nlocalPort = 2003\n",
+        )
+        .unwrap();
+
+        let cfg = ClientConfig::load(d.join("frpc.toml")).unwrap();
+        let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["main", "extra-a", "extra-b"],
+            "主配置在前，includes 按文件名排序追加；c.yaml 不该被加载"
+        );
+        // 只取 proxies —— includes 文件里的 serverAddr 不能覆盖主配置
+        assert_eq!(cfg.server_addr, "example.com");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// includes 里各文件的**其它字段一律忽略**（不是配置继承）。
+    #[test]
+    fn includes_不覆盖主配置的其它字段() {
+        let d = tmp_dir("noovr");
+        std::fs::write(
+            d.join("frpc.toml"),
+            "serverAddr = \"main.example\"\nserverPort = 7000\nincludes = [\"*.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("extra.toml"),
+            "serverAddr = \"evil.example\"\nserverPort = 9999\ntoken = \"hacked\"\n\
+             [[proxies]]\nname = \"p1\"\ntype = \"tcp\"\nlocalPort = 3000\n",
+        )
+        .unwrap();
+
+        let cfg = ClientConfig::load(d.join("frpc.toml")).unwrap();
+        assert_eq!(
+            cfg.server_addr, "main.example",
+            "includes 不能覆盖 serverAddr"
+        );
+        assert_eq!(cfg.server_port, 7000, "includes 不能覆盖 serverPort");
+        assert_eq!(cfg.token, "", "includes 不能覆盖 token");
+        assert_eq!(cfg.proxies.len(), 1, "只取 proxies");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 合并后重名要**明确报错**，不能静默放过。
+    #[test]
+    fn includes_重名代理必须报错() {
+        let d = tmp_dir("dup");
+        std::fs::write(
+            d.join("frpc.toml"),
+            "serverAddr = \"x\"\nincludes = [\"*.toml\"]\n\
+             [[proxies]]\nname = \"same\"\ntype = \"tcp\"\nlocalPort = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("dup.toml"),
+            "[[proxies]]\nname = \"same\"\ntype = \"tcp\"\nlocalPort = 2\n",
+        )
+        .unwrap();
+
+        let err = ClientConfig::load(d.join("frpc.toml")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("same"), "错误里要指出哪个名字：{msg}");
+        assert!(msg.contains("重复"), "要说清是重名：{msg}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 目录不存在时要报错，且回显用户写的那条模式。
+    #[test]
+    fn includes_目录不存在时报错() {
+        let d = tmp_dir("nodir");
+        std::fs::write(
+            d.join("frpc.toml"),
+            "serverAddr = \"x\"\nincludes = [\"missing_dir/*.toml\"]\n",
+        )
+        .unwrap();
+
+        let err = ClientConfig::load(d.join("frpc.toml")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing_dir"),
+            "要回显用户写的 includes：{msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 没配 includes 时**不碰文件系统**（走老路径，行为完全不变）。
+    #[test]
+    fn 没配_includes_时行为不变() {
+        let cfg = parse_client(
+            "serverAddr = \"x\"\n[[proxies]]\nname = \"a\"\ntype = \"tcp\"\nlocalPort = 1\n",
+        )
+        .unwrap();
+        assert!(cfg.includes.is_empty());
+        assert_eq!(cfg.proxies.len(), 1);
     }
 }

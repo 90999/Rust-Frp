@@ -190,6 +190,55 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     util::init_tracing(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color);
 
+    // ★ v0.6.5：`auth.tokenSource` —— 从文件 / 外部命令取 token。
+    //
+    // 位置很关键：必须在 CLI 的 `-t/--token` **之后**、真正登录**之前**。
+    // 语义与官方 `AuthClientConfig` 一致（注释原文 "mutually exclusive with
+    // Token field"）：两者都配时**以 tokenSource 为准**并告警。
+    //
+    // CLI 显式给了 `-t` 是用户的即时意图，优先级最高；但只要 tokenSource
+    // 存在且 CLI 没给，就走 tokenSource。
+    if let Some(src) = cfg.auth.token_source.clone() {
+        if cli.token.is_some() {
+            debug!("命令行给了 -t/--token，本次忽略 auth.tokenSource");
+        } else {
+            // 先校验配置形状，把"写错 type / 缺子段"报在取 token 之前，
+            // 错误信息才对得上用户写的配置
+            src.validate()
+                .with_context(|| "auth.tokenSource 配置有误")?;
+            match src.kind.as_str() {
+                "file" => {
+                    let p = src
+                        .file
+                        .as_ref()
+                        .map(|f| f.path.as_str())
+                        .unwrap_or_default();
+                    info!("认证令牌来自文件 [{}]", p);
+                }
+                "exec" => {
+                    // exec 会执行外部程序，必须让审计日志能看见
+                    let c = src
+                        .exec
+                        .as_ref()
+                        .map(|e| e.command.as_str())
+                        .unwrap_or_default();
+                    info!("认证令牌来自外部命令 [{}]（以本进程身份执行）", c);
+                }
+                _ => {}
+            }
+            let resolved = src
+                .resolve()
+                .with_context(|| "从 auth.tokenSource 读取认证令牌失败")?;
+            if !cfg.token.is_empty() && cfg.token != resolved {
+                warn!(
+                    "auth.token 与 auth.tokenSource 同时配置且值不同，\
+                     按官方语义以 tokenSource 为准"
+                );
+            }
+            cfg.token = resolved;
+        }
+    }
+
     // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frpc 默认 strict 解析，
     // 未知字段**直接报错**；NFrp 的 serde 不拒绝未知字段，于是它们被**静默
     // 吞掉**。最危险的是 useEncryption / useCompression —— 用户以为加密了，

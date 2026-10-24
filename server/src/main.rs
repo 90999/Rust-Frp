@@ -103,6 +103,38 @@ async fn main() -> Result<()> {
     if let Some(token) = &cli.token {
         cfg.token = token.clone();
     }
+
+    // ★ v0.6.5：`auth.tokenSource` —— 服务端的**期望 token** 也能来自外部源。
+    //
+    // ★ 位置说明：必须放在 `check_token_strength` **之前** —— 那个检查看的是
+    //   实际生效的 token，先检查后解析等于在检查空字符串（会误报"token 太弱"）。
+    //   但此时 tracing 还没初始化，所以这里**只做解析，失败就 `?` 返回**
+    //   （启动错误用户一定看得到），"令牌来自文件/命令"这类提示放到
+    //   日志初始化之后再打。
+    //
+    // 语义与官方一致（"mutually exclusive with Token field"）：
+    // 两者都配时以 tokenSource 为准。CLI `-t` 是用户即时意图，优先级最高。
+    let mut token_source_conflict = false;
+    let token_source_kind: Option<String> = match &cfg.auth.token_source {
+        Some(src) if cli.token.is_none() => {
+            src.validate()
+                .with_context(|| "auth.tokenSource 配置有误")?;
+            let resolved = src
+                .resolve()
+                .with_context(|| "从 auth.tokenSource 读取令牌失败")?;
+            let previous = cfg.effective_auth().token;
+            if !previous.is_empty() && previous != resolved {
+                token_source_conflict = true;
+            }
+            cfg.auth.token = resolved;
+            // 顶层 token 同步清空：避免 `effective_auth()` 的回落逻辑
+            // 在热重载等路径上读到两份不一致的值
+            cfg.token.clear();
+            Some(src.kind.clone())
+        }
+        Some(_) => None, // 命令行 -t 优先
+        None => None,
+    };
     // ★ v0.5.3：弱/占位 token 的强告警。
     //
     // 背景（第二轮审计的 B 项）：v1 控制通道的登录凭证是
@@ -127,6 +159,38 @@ async fn main() -> Result<()> {
         util::init_tracing(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color);
         None
     };
+
+    // 令牌来源的提示（放在日志初始化之后，见上面 tokenSource 解析处的说明）
+    if let Some(kind) = &token_source_kind {
+        match kind.as_str() {
+            "file" => {
+                let p = cfg
+                    .auth
+                    .token_source
+                    .as_ref()
+                    .and_then(|s| s.file.as_ref())
+                    .map(|f| f.path.as_str())
+                    .unwrap_or_default();
+                tracing::info!("服务端期望令牌来自文件 [{p}]");
+            }
+            "exec" => {
+                let c = cfg
+                    .auth
+                    .token_source
+                    .as_ref()
+                    .and_then(|s| s.exec.as_ref())
+                    .map(|e| e.command.as_str())
+                    .unwrap_or_default();
+                tracing::info!("服务端期望令牌来自外部命令 [{c}]（以本进程身份执行）");
+            }
+            _ => {}
+        }
+        if token_source_conflict {
+            tracing::warn!(
+                "auth.token 与 auth.tokenSource 同时配置且值不同，按官方语义以 tokenSource 为准"
+            );
+        }
+    }
 
     // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frps 默认 strict 解析，
     // 未知字段直接报错；NFrp 的 serde 不拒绝未知字段，于是它们被**静默吞掉**。

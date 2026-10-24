@@ -420,16 +420,40 @@ async fn handle(
     let snapshot = registry.observ.snapshot();
     match path.as_str() {
         "/metrics" => {
-            let body = encode_prometheus(&snapshot, METRIC_PREFIX);
-            send(
-                &mut stream,
-                200,
-                "text/plain; version=0.0.4; charset=utf-8",
-                body.as_bytes(),
-                SEC_HEADERS,
-                head_only,
-            )
-            .await?;
+            // ★ v0.6.5（对齐官方 frps 的 `enablePrometheus`）：
+            //   官方默认**不开**这个端点，配了 `enablePrometheus = true` 才有
+            //   （`server.go`："EnablePrometheus will export prometheus metrics
+            //   on {dashboard_addr}:{dashboard_port}"）。
+            //
+            //   我们之前是无条件开放的 —— 两处不妥：
+            //   ① 与官方默认不一致，照官方文档部署的人会以为它关着；
+            //   ② 指标含业务信息（在线客户端数、代理数、流量字节），
+            //      在"只想开个面板"的部署里**默认多暴露一份数据面**。
+            //
+            //   所以默认改成关闭、与官方一致；要开就显式配。
+            //   `/api/healthz` 不受影响 —— 健康探针本来就该永远可用。
+            if cfg.enable_prometheus {
+                let body = encode_prometheus(&snapshot, METRIC_PREFIX);
+                send(
+                    &mut stream,
+                    200,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    body.as_bytes(),
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            } else {
+                send(
+                    &mut stream,
+                    404,
+                    "text/plain; charset=utf-8",
+                    b"metrics disabled: set enablePrometheus = true\n",
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            }
         }
         "/api/status" | "/api/status.json" => {
             let body = status_json(&registry, &snapshot);
@@ -1303,12 +1327,47 @@ Authorization: Basic ",
         assert!(out.contains("# TYPE nfrp_conns_active gauge"));
     }
 
+    /// ★ v0.6.5：`enablePrometheus` **默认关闭**（对齐官方 frps）。
+    ///
+    /// 这条防的是"以后有人图方便把默认改回 true"—— 那会重新变成
+    /// "只想开面板却默认多暴露一份业务指标"。
+    #[test]
+    fn enable_prometheus_默认关闭() {
+        let cfg = ServerConfig::default();
+        assert!(
+            !cfg.enable_prometheus,
+            "官方 frps 默认不开 metrics，我们必须一致"
+        );
+    }
+
+    /// 配置里能真正读进来（官方 camelCase 与 Nfrp snake_case 都认）。
+    #[test]
+    fn enable_prometheus_能读进来() {
+        let a =
+            nfrp_common::config::parse_server_toml("bindPort = 7000\nenablePrometheus = true\n")
+                .expect("解析失败");
+        assert!(a.enable_prometheus, "camelCase 写法要认");
+
+        let b =
+            nfrp_common::config::parse_server_toml("bind_port = 7000\nenable_prometheus = true\n")
+                .expect("解析失败");
+        assert!(b.enable_prometheus, "snake_case 写法要认");
+
+        let c = nfrp_common::config::parse_server_toml("bind_port = 7000\n").expect("解析失败");
+        assert!(!c.enable_prometheus, "不配就是关");
+    }
+
     // ==================================================================
     // v0.6.4（渗透测试 PT-03 / PT-05 / PT-07）：HTTP 语义与安全响应头
     // ==================================================================
 
     /// 起一个真实面板，返回监听地址。测完不用管，测试进程退出即回收。
     async fn spawn_dashboard() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_dashboard_with(false).await
+    }
+
+    /// 同上，但可以指定 `enable_prometheus`（v0.6.5）。
+    async fn spawn_dashboard_with(prometheus: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑端口");
         let addr = listener.local_addr().unwrap();
         let registry = Arc::new(Registry::unlimited());
@@ -1318,12 +1377,54 @@ Authorization: Basic ",
                 let registry = registry.clone();
                 let auth = auth.clone();
                 tokio::spawn(async move {
-                    let cfg = Arc::new(ServerConfig::default());
+                    let cfg = Arc::new(ServerConfig {
+                        enable_prometheus: prometheus,
+                        ..Default::default()
+                    });
                     let _ = handle(stream, peer, registry, auth, cfg).await;
                 });
             }
         });
         (addr, h)
+    }
+
+    /// ★ v0.6.5：`/metrics` 默认关闭时返回 404，并提示怎么开。
+    #[tokio::test]
+    async fn metrics_default_is_disabled() {
+        let (addr, _h) = spawn_dashboard().await;
+        let resp = http_req(addr, "GET", "/metrics", Some(("u", "p"))).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 404"),
+            "未开 enablePrometheus 时 /metrics 必须 404：{resp}"
+        );
+        assert!(
+            resp.contains("enablePrometheus"),
+            "提示里要写清怎么开启：{resp}"
+        );
+
+        // 健康探针**不受**这个开关影响 —— 否则容器会被反复重启
+        let hz = http_req(addr, "GET", "/api/healthz", None).await;
+        assert!(
+            hz.starts_with("HTTP/1.1 200"),
+            "healthz 必须永远可用，与 enablePrometheus 无关：{hz}"
+        );
+    }
+
+    /// 开启后 `/metrics` 正常工作，且 HEAD 仍然不返回 body。
+    #[tokio::test]
+    async fn head_works_on_metrics_when_enabled() {
+        let (addr, _h) = spawn_dashboard_with(true).await;
+
+        let get = http_req(addr, "GET", "/metrics", Some(("u", "p"))).await;
+        assert!(get.starts_with("HTTP/1.1 200"), "开启后应当 200：{get}");
+        assert!(get.contains("nfrp_uptime_seconds"), "应当有指标内容：{get}");
+
+        let head = http_req(addr, "HEAD", "/metrics", Some(("u", "p"))).await;
+        let head_end = head.find("\r\n\r\n").expect("必须有头尾分隔");
+        assert!(
+            head[head_end + 4..].is_empty(),
+            "HEAD /metrics 也不能返回 body：{head}"
+        );
     }
 
     /// ★ PT-03：`HEAD` **不得**返回响应体（RFC 9110 §9.3.2）。
@@ -1334,7 +1435,10 @@ Authorization: Basic ",
     async fn head_returns_headers_without_body() {
         let (addr, _h) = spawn_dashboard().await;
 
-        for path in ["/", "/api/status", "/metrics", "/api/healthz"] {
+        // ★ v0.6.5：`/metrics` 已改为默认关闭（`enablePrometheus`），
+        //   spawn_dashboard() 用的是默认配置，所以这里不能再断言它 200。
+        //   它的 HEAD 语义由 `head_works_on_metrics_when_enabled` 覆盖。
+        for path in ["/", "/api/status", "/api/healthz"] {
             let resp = http_req(addr, "HEAD", path, Some(("u", "p"))).await;
 
             // 状态行 + 头部分

@@ -1,4 +1,4 @@
-﻿//! 原版 frp（Go 版）TOML 配置兼容层。
+//! 原版 frp（Go 版）TOML 配置兼容层。
 //!
 //! # 为什么需要
 //!
@@ -268,12 +268,12 @@ const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
     // ---- 出站代理 ----
     "proxyURL",
     // ---- 认证 ----
-    "tokenSource",
+    // （`tokenSource` 已在 v0.6.5 实现，从清单移除）
     // ---- 顶层 ----
     "udpPacketSize",
     "natHoleStunServer",
     "dnsServer",
-    "includes",
+    // （`includes` 已在 v0.6.5 实现，从清单移除）
     // ---- 管理界面 ----
     "pprofEnable",
     "assetsDir",
@@ -303,18 +303,17 @@ pub fn unsupported_fields(root: &Value) -> Vec<String> {
 /// 实现后删掉。清单按官方 `frps_full_example.toml`（v0.71.0）逐项比对得出。
 const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     // 端口 / 监听
-    "quicBindPort",
+    // （`quicBindPort` 已在 v0.6.5 实现，从清单移除）
     // 传输层调优（`certFile` / `keyFile` / `trustedCaFile` 已在批次3实现）
     // HTTP 虚拟主机（`vhostHTTPTimeout` / `custom404Page` 已实现）
     // 面板 / 观测
     "assetsDir",
     "pprofEnable",
-    "enablePrometheus",
+    // （`enablePrometheus` 已在 v0.6.5 实现，从清单移除）
     // 行为
     "udpPacketSize",
     "natholeAnalysisDataReserveHours",
-    // 认证（结构里已声明占位，但功能未实现）
-    "tokenSource",
+    // 认证（`tokenSource` 已在 v0.6.5 实现，从清单移除）
     // 网关 / 插件
     "sshTunnelGateway",
     "httpPlugins",
@@ -1507,16 +1506,45 @@ enable = true
     }
 
     /// "官方支持、NFrp 未实现"的字段识别也要折叠大小写 ——
-    /// 用户写 `QuicBindPort`（官方照样认），NFrp 的告警就不能漏。
+    /// 用户写 `PprofEnable`（官方照样认），NFrp 的告警就不能漏。
     ///
-    /// 注意这里挑的是**至今确实没实现**的字段；历史上换过两次主角：
-    /// `AllowPorts`、`ProxyBindAddr` 都实现了（凡实现的都要从清单里删掉，
-    /// 否则会出现反向的假警报 —— 说"没实现"而实际能用）。
+    /// 注意这里挑的是**至今确实没实现**的字段；历史上换过几次主角：
+    /// `AllowPorts` / `ProxyBindAddr` / `QuicBindPort` 都实现了 ——
+    /// **凡实现的都要从清单里删掉**，否则会出现反向的假警报
+    /// （说"没实现"而实际能用）。
     #[test]
     fn 未实现字段识别也要折叠大小写() {
-        let text = "bindPort = 7000\nQuicBindPort = 7001\n";
+        let text = "bindPort = 7000\nPprofEnable = true\n";
         let cfg = parse_server_toml(text).unwrap();
-        assert_eq!(cfg.unsupported_fields, vec!["QuicBindPort".to_string()]);
+        assert_eq!(cfg.unsupported_fields, vec!["PprofEnable".to_string()]);
+    }
+
+    /// ★ v0.6.5：`quicBindPort` 已实现 —— 必须能真正读进来，
+    /// 且**不再**出现在"未实现"清单里。
+    ///
+    /// 官方语义：配了就开一个**独立** UDP 端口，与 `bindPort` 无关。
+    #[test]
+    fn quicbindport_已实现且能读进来() {
+        // 官方 camelCase 写法
+        let cfg = parse_server_toml("bindPort = 7000\nquicBindPort = 7101\n").unwrap();
+        assert_eq!(
+            cfg.quic_bind_port,
+            Some(7101),
+            "quicBindPort 必须读进 quic_bind_port"
+        );
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "实现了就不能再报未实现，实际：{:?}",
+            cfg.unsupported_fields
+        );
+
+        // NFrp 的 snake_case 写法也要认
+        let cfg2 = parse_server_toml("bind_port = 7000\nquic_bind_port = 7102\n").unwrap();
+        assert_eq!(cfg2.quic_bind_port, Some(7102));
+
+        // 不配就是 None（旧行为：`transport_protocol = quic` 时才用 bindPort）
+        let cfg3 = parse_server_toml("bind_port = 7000\n").unwrap();
+        assert_eq!(cfg3.quic_bind_port, None);
     }
 
     /// 限制①批次1：这批客户端字段已实现 —— 既不能再被报"未实现"，
