@@ -362,8 +362,18 @@ log_level = "info"
 
 # ---- VirtualNet 虚拟网络（[virtualNet]）----
 # 让本机拿到一个虚拟内网地址，与同网段的其他客户端**三层互通**。
-# 虚拟网卡（TUN）目前只在 Linux 上实现，需要 root 或 CAP_NET_ADMIN；
-# Windows 上客户端会明确报错，而不是静默不生效。
+#
+# 虚拟网卡（TUN）的现状：
+#   Linux   —— /dev/net/tun，需要 root 或 CAP_NET_ADMIN
+#   Windows —— Wintun（v0.6.6 起支持），需要管理员权限 + wintun.dll
+#   macOS   —— 未实现，会明确报错而不是静默不生效
+#
+# ★ Windows 上使用前：
+#   1. 从 https://www.wintun.net/ 下载对应架构的 wintun.dll
+#      （64 位程序用 bin/amd64/wintun.dll）
+#   2. 放到 nfrp 可执行文件旁边，或用环境变量 NFRP_WINTUN_DLL 指定完整路径
+#   3. **以管理员身份运行**（创建虚拟网卡需要该权限）
+#   找不到 dll 或没有管理员权限时，报错会明确写清缺什么、怎么办。
 #
 #   [virtualNet]
 #   serverPort = 7003         # 必须与服务端的 vnet_port 一致

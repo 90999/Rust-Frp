@@ -3,7 +3,18 @@
 日期 2026-10-24
 来源 第十四轮遗留清单
 本轮性质 **特性对齐 + 缺陷修复**（不是安全审计）
-质量门 **811 通过 / 0 失败** · clippy 0 告警 · audit 零漏洞
+质量门 **814 通过 / 0 失败**（+3 条 Windows 真机测试） · clippy 0 告警 · audit 零漏洞
+
+## 版本划分
+
+本轮内容分两批发布（因为第一批已经上线后才发现 Windows VNet 可以做真机验证）：
+
+| 版本 | 内容 |
+|---|---|
+| **v0.6.5** | ES256 致命 bug 修复 · 真实 IdP e2e · 完整 PSF · 四个配置字段 |
+| **v0.6.6** | **Windows VirtualNet（Wintun）实现 + 真机数据面验证** |
+
+下面各章分别标注属于哪一批。
 
 ---
 
@@ -205,23 +216,83 @@ const VEC_EC_SIG: &[u8] = &[
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --workspace -j 1`（串行） | ✅ **811 通过 / 0 失败**（上轮 785，+26） |
+| `cargo test --workspace -j 1`（串行） | ✅ **814 通过 / 0 失败**（上轮 785，+29） |
 | `cargo fmt --all -- --check` | ✅ 干净 |
 | `cargo clippy --workspace --all-targets -D warnings` | ✅ 0 告警 |
 | `cargo audit` | ✅ exit 0 零漏洞（184 crates） |
 | 退回验证（ES256） | ✅ 退回变红 / 还原变绿 / 文件干净 |
 
-测试分布：123 + 383 + 9 + 251 + 17 + 26 + 2 = **811**
+测试分布：123 + 386 + 9 + 251 + 17 + 26 + 2 = **814**（另有 3 条 Windows 真机测试标 #[ignore]，手动跑 3/3 通过）
 
 ---
 
-## 七、本轮**未完成**的（如实清单）
+## 七、Windows VirtualNet **已实现并真机验证**
+
+### 实现
+
+新增 `common/src/vnet/tun_windows.rs`（约 990 行），基于 **Wintun**
+（WireGuard 项目的开源 TUN 驱动，Apache-2.0/GPLv2 双许可）。
+
+选 Wintun 而不是 TAP-Windows 的理由：内核态驱动、只做 L3（正好是 VirtualNet
+需要的）、WireGuard for Windows 生产在用、运行时无需静态链接。
+
+**动态加载**：全部通过 `LoadLibraryExW` + `GetProcAddress`，**不在链接期依赖
+wintun.dll** —— 没装驱动的机器程序照常启动，只有用到 VirtualNet 时才报错。
+查找顺序：`NFRP_WINTUN_DLL` → exe 目录 → 当前目录 → 系统路径。
+全都找不到时报错**可操作**（含下载地址、架构要求、放置位置）。
+
+### 为什么用"后台线程 + 通道"而不是接 reactor
+
+Wintun 的读接口是"事件 + 非阻塞取包"，那个 `HANDLE` 事件**没法直接接进 tokio
+的 reactor**（`AsyncFd` 只在 unix 上有）。硬接要自己写 `Registration` + IOCP
+集成，出错面大得多。
+
+所以用最稳的：**一个专用阻塞线程**跑 `WaitForMultipleObjectsEx` + 取包，
+推进 `tokio::sync::mpsc`，async 侧只收通道；写方向不需要等待，同步写。
+代价是每条 TUN 多一个线程 —— 每个进程只有**一个** TUN，可接受。
+
+### 三个真机验证（`#[ignore]`，用 `--ignored` 手动跑）
+
+| 测试 | 证明什么 |
+|---|---|
+| `真机_创建网卡_配地址_再回收` | 驱动加载 / 适配器创建 / 会话启动 / IP 配置 / Drop 后网卡消失 |
+| `真机_数据面_ping_由我们应答` | **IP 包双向流动**：内核 → TUN → 我们 → TUN → 内核 |
+| `真机_非法地址前缀要报错` | 非法输入明确拒绝 |
+
+**连跑 3 次全通过。**
+
+### 踩到的三个坑（都写进代码注释了）
+
+**① `netsh interface ipv4 set address` 对 Wintun 无效。**
+实测：命令返回成功，但 `show addresses` 里只有 `DHCP enabled: No`，没有 IP。
+原因是 Wintun 建的是 **L3 隧道适配器**，`netsh` 那条老路径对它不生效。
+必须用 **IP Helper API** —— 这里经 `New-NetIPAddress`（就是它的封装）。
+
+**② IP 地址偏移写错（最隐蔽）。**
+交换源/目的地址时写成了 `(4, 16)` —— **offset 4 是 IP ID 字段**，不是源地址
+（源地址在 **12**）。后果：ID/flags 和目的地址被对调、源地址原地不动，
+内核收到直接丢。表现是"读方向通、写方向不通"，**没有任何报错**。
+是 hex dump 才看出来的：
+
+```
+请求  45 00 00 3c d0 0f 00 00 80 01 db af 64 7f 63 01 64 7f 63 02
+应答  45 00 00 3c 64 7f 63 02 40 01 1b b0 64 7f 63 01 d0 0f 00 00
+      版本/len    ↑ID 被写坏     TTL/proto/ck  src 没交换    ↑ID 跑到这
+```
+
+**③ "加打印就好了"是假象。**
+首次带诊断打印的版本"恰好"通过，因为 `eprintln` 拖了几秒 ——
+而**网卡建卡后路由表要过一会儿才生效**，这期间 ping 的包根本不会进 TUN。
+解法不是加打印，而是**多轮重试**（最多 3 轮，每轮起一次 ping）。
+
+---
+
+## 八、本轮**未完成**的（如实清单）
 
 | 项 | 状态与原因 |
 |---|---|
-| **TSan** | ❌ 未完成。云端 nightly 仍在下载（网络慢，已跑 1 小时+ 未完成）。**没有结果就不报结果** |
-| **Linux TUN Miri** | ❌ 未做。需要 nightly + miri 组件，与 TSan 争同一个 nightly 安装 |
-| **Windows VirtualNet** | ❌ 未实现。需要 Wintun 驱动（`wintun.dll`）+ 管理员权限 + 网卡配置，**必须在真机验证**；写而不验证等于埋雷 |
+| **TSan** | ❌ 未完成。云端 nightly **下载了两小时仍未完成**（网络问题）。**没有结果就不报结果** |
+| **Linux TUN Miri** | ❌ 未做。与 TSan 争同一个 nightly 安装 |
 | **`plugin_bridge` Linux 竞态** | ❌ 未修好。上轮两次尝试都引入忙等死循环（云端 4 进程各烧 20 分钟 CPU），已回退并记录正确方向（让"读"只有一个所有者，需重构 `HttpIO` 所有权） |
 | **剩余配置字段** | ❌ 未做：`useEncryption` / `useCompression`（数据面加密压缩，协议级改动）、`udpPacketSize`、`natHoleStunServer`、`dnsServer`、`proxyURL`、`pprofEnable`、`assetsDir`、`sshTunnelGateway`、`httpPlugins`、`natholeAnalysisDataReserveHours` |
 
@@ -236,7 +307,7 @@ future 被 `select!` 取消时那批字节消失。
 
 ---
 
-## 八、改动清单
+## 九、改动清单
 
 | 文件 | 改动 |
 |---|---|
@@ -253,7 +324,7 @@ future 被 `select!` 取消时那批字节消失。
 
 ---
 
-## 九、兼容性
+## 十、兼容性
 
 * **协议零变更**：与官方 frp 0.71.0 互通不受影响；
 * **OIDC 修复是纯增益**：以前 ES256 完全不能用，现在能用（RS256 不受影响）；

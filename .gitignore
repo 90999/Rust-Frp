@@ -18,3 +18,6 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# 第三方二进制（Wintun 驱动），由用户自行下载：https://www.wintun.net/
+/assets/wintun.dll

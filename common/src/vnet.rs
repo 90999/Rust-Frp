@@ -34,9 +34,19 @@
 //!
 //! # 平台支持
 //!
-//! TUN 设备只在类 Unix 上实现（Linux `/dev/net/tun`、macOS `utun`）；
-//! Windows 需要 Wintun 驱动，这里**明确报错**而不是假装成功 ——
-//! 但那之外的逻辑（地址分配、路由表、帧编解码）全是跨平台的，已单测覆盖。
+//! | 平台 | TUN 后端 | 要求 |
+//! |---|---|---|
+//! | Linux | `/dev/net/tun` | root 或 `CAP_NET_ADMIN` |
+//! | Windows | **Wintun**（v0.6.6 起） | 管理员权限 + `wintun.dll` |
+//! | macOS | 未实现 | 会**明确报错**，不假装成功 |
+//!
+//! Windows 侧走 Wintun（WireGuard 项目的开源 TUN 驱动）：驱动动态加载、
+//! 不在链接期依赖；找不到 `wintun.dll` 或没有管理员权限时，
+//! 报错会写清缺什么、从哪儿下、放哪儿。数据面已用"ping 由我们应答"
+//! 真机验证过（内核 → TUN → 我们 → TUN → 内核）。
+//!
+//! 除 TUN 读写之外的一切（地址分配、路由表、帧编解码）全是跨平台的，
+//! 已单测覆盖。
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -676,16 +686,27 @@ mod tun_linux;
 #[cfg(target_os = "linux")]
 pub use tun_linux::{open_tun, Tun};
 
-/// 非 Linux 平台：把话说清楚，而不是假装支持。
+// ★ v0.6.6：Windows 用 Wintun（WireGuard 项目的开源 TUN 驱动）。
+//
+// 与 Linux 版走**同一套上层逻辑**（地址分配 / 路由 / 帧编解码都是平台无关的），
+// 只有"打开设备 + 读写 IP 包"这一段是平台特定的。
+//
+// 运行时需要 `wintun.dll`（架构必须匹配），没装时报错信息会写清下载地址与
+// 放置位置；创建适配器需要管理员权限，被拒时会明确提示。
+#[cfg(target_os = "windows")]
+mod tun_windows;
+
+#[cfg(target_os = "windows")]
+pub use tun_windows::{open_tun, Tun};
+
+/// 其余平台（macOS 等）：把话说清楚，而不是假装支持。
 ///
-/// 没有实现是有意的 —— Windows 要引入 Wintun 驱动（`wintun.dll` +
-/// 管理员权限 + 网卡 IP 配置），macOS 的 `utun` 每个包还多一层 4 字节
-/// 地址族头。这两条路径都无法在当前环境里真跑一遍，而**没跑过的平台代码
-/// 比明确的报错更危险**。
+/// macOS 的 `utun` 每个包还多一层 4 字节地址族头，且无法在当前环境里真跑一遍
+/// —— 而**没跑过的平台代码比明确的报错更危险**。
 ///
-/// 好在它与平台无关的部分（地址分配、路由表、帧编解码）都已实现并单测覆盖，
+/// 好在平台无关的部分（地址分配、路由表、帧编解码）都已实现并单测覆盖，
 /// 补上 TUN 只需要实现这一个函数。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn open_tun(
     _name: &str,
     _mtu: u32,
@@ -693,22 +714,24 @@ pub fn open_tun(
     _peer: Option<&str>,
 ) -> anyhow::Result<Tun> {
     anyhow::bail!(
-        "VirtualNet 的 TUN 设备目前只实现了 Linux（/dev/net/tun）。\
-         Windows 需要 Wintun 驱动，macOS 需要 utun —— 均未实现。\
-         服务端转发逻辑本身是跨平台的，可用 Linux 客户端与服务端验证整条链路。"
+        "VirtualNet 的 TUN 设备在本平台尚未实现（已支持 Linux 的 /dev/net/tun 与 \
+         Windows 的 Wintun）。macOS 的 utun 每个包多一层 4 字节地址族头，\
+         且无法在本项目的验证环境里真跑一遍 —— 没跑过的平台代码比明确的报错更危险，\
+         所以这里宁可拒绝。\
+         服务端转发逻辑本身是跨平台的，可用 Linux 或 Windows 客户端与服务端验证整条链路。"
     )
 }
 
-/// 非 Linux 平台上的占位类型：**永远构造不出来**，但要和 Linux 版有同样的
+/// 其余平台（macOS 等）的占位类型：**永远构造不出来**，但要和 Linux/Windows 版有同样的
 /// 外形（方法名、trait 实现），否则上层那份平台无关的转发循环在 Windows 上
 /// 连编译都过不了 —— 那就等于把"不支持"变成了"整个客户端编不出来"。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub struct Tun {
     /// 不可能被构造出来，所以这些方法体在运行时永远不会执行。
     _never: std::convert::Infallible,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl Tun {
     pub fn name(&self) -> &str {
         match self._never {}
@@ -723,7 +746,7 @@ impl Tun {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl tokio::io::AsyncRead for Tun {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -734,7 +757,7 @@ impl tokio::io::AsyncRead for Tun {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl tokio::io::AsyncWrite for Tun {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,

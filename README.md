@@ -137,7 +137,7 @@ nfrp-common = "0.6"
 
 ### 可观测性与管理
 
-- 内置 Web 面板 + Prometheus `/metrics` + 免鉴权健康检查端点，支持 Basic Auth
+- 内置 Web 面板 + Prometheus `/metrics`（需配 `enablePrometheus = true`，默认关闭）+ 免鉴权健康检查端点，支持 Basic Auth
 - 面板可直接增删代理、踢掉客户端，无需改配置重启
 - Dashboard API v2（`/api/v2/*`）：统一错误信封 + 分页 + 稳定排序；v1 接口行为不变
 - 客户端本地 Web UI / API（`[webServer] port = 7400`）：查看隧道 / 连接 / 流量，并可增删代理
@@ -173,7 +173,7 @@ token = "换成一个足够随机的口令"
 # 可选：xtcp 真 P2P 的牵线端口（需放行 UDP）
 p2p_port = 7002
 
-# 可选：内置面板 + Prometheus 指标
+# 可选：内置面板（另可配 enablePrometheus = true 打开 /metrics）
 dashboard_port = 7500
 dashboard_user = "admin"
 dashboard_pwd = "换成一个强口令"
@@ -358,9 +358,19 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 
 ## 当前限制
 
-- **VirtualNet 在 Windows 上未实现**（需要 TUN 设备），Linux 与 Android 上可用；配置了会明确报错而不是静默失败
-- 官方 frp 的 xtcp NatHole UDP 地址交换协议未实现，所以**官方 frpc 的 xtcp visitor 打不了洞**；服务端会明确拒绝并让官方客户端立刻转走它自己的 `fallbackTo` 中继
-- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段。TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，含服务端 mTLS 与客户端证书）已实现；仍缺的主要是：客户端的 `useEncryption` / `useCompression` / `proxyURL` / `tokenSource` / `udpPacketSize` / `natHoleStunServer` / `dnsServer` / `includes` / `pprofEnable` / `assetsDir`，服务端的 `quicBindPort` / `assetsDir` / `webServer.tls.certFile` / `webServer.tls.keyFile` / `pprofEnable` / `enablePrometheus` / `udpPacketSize` / `natholeAnalysisDataReserveHours` / `tokenSource` / `sshTunnelGateway` / `httpPlugins`
+- **VirtualNet 的 TUN 设备**：Linux 用 `/dev/net/tun`（需 root 或 `CAP_NET_ADMIN`）；
+  **Windows 用 Wintun**（v0.6.6 起支持，需管理员权限 + 自行下载 `wintun.dll`，
+  数据面已真机验证：ping 由我们应答，内核→TUN→我们→TUN→内核 双向打通）；
+  macOS 未实现，配置了会明确报错而不是静默失败
+- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段。
+  **已实现**：TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，
+  含服务端 mTLS 与客户端证书）、`auth.tokenSource`（文件 / 外部命令，客户端与服务端）、
+  `includes`（客户端配置包含）、`quicBindPort`、`enablePrometheus`。
+  仍缺的主要是：客户端的 `useEncryption` / `useCompression` / `proxyURL` /
+  `udpPacketSize` / `natHoleStunServer` / `dnsServer` / `pprofEnable` / `assetsDir`，
+  服务端的 `assetsDir` / `webServer.tls.certFile` / `webServer.tls.keyFile` /
+  `pprofEnable` / `udpPacketSize` / `natholeAnalysisDataReserveHours` /
+  `sshTunnelGateway` / `httpPlugins`
 
 ## License
 
