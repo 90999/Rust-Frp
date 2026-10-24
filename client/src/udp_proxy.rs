@@ -29,7 +29,6 @@ use tokio::{net::UdpSocket, sync::mpsc, time::interval};
 use tracing::{debug, info};
 
 /// 单条 UDP 报文上限（与 frp `MaxUDPPayloadSize` 一致）。
-const MAX_UDP_PAYLOAD: usize = 65507;
 /// 会话空闲回收时间：与 frp 客户端的 30s 读超时一致。
 const SESSION_IDLE: Duration = Duration::from_secs(30);
 /// 工作连接心跳间隔（官方 frps 对 UDP 工作连接有 60s 读超时）。
@@ -39,7 +38,13 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 type SessionTx = mpsc::Sender<Vec<u8>>;
 
 /// 跑一条 UDP 工作连接，直到断开。
-pub async fn run(conn: FrpConn, local_addr: String, proxy_name: String) -> Result<()> {
+pub async fn run(
+    conn: FrpConn,
+    local_addr: String,
+    proxy_name: String,
+    // ★ v0.6.6：单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
+    packet_size: usize,
+) -> Result<()> {
     let local: SocketAddr = util::resolve_addr(&local_addr)
         .await
         .with_context(|| format!("解析内网 UDP 地址 {local_addr} 失败"))?;
@@ -69,7 +74,7 @@ pub async fn run(conn: FrpConn, local_addr: String, proxy_name: String) -> Resul
                         };
                         let tx = match existing {
                             Some(tx) => tx,
-                            None => match new_session(&local, &remote, &sessions, &to_server_tx).await {
+                            None => match new_session(&local, &remote, &sessions, &to_server_tx, packet_size).await {
                                 Ok(tx) => tx,
                                 Err(e) => {
                                     debug!(%remote, "创建 UDP 会话失败：{e:#}");
@@ -106,6 +111,8 @@ async fn new_session(
     remote: &UdpAddr,
     sessions: &Arc<Mutex<HashMap<String, SessionTx>>>,
     to_server: &mpsc::Sender<UdpPacket>,
+    // ★ v0.6.6：单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
+    packet_size: usize,
 ) -> Result<SessionTx> {
     let bind: SocketAddr = if local.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -144,7 +151,7 @@ async fn new_session(
         let sessions = sessions.clone();
         let to_server = to_server.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+            let mut buf = vec![0u8; packet_size];
             loop {
                 match tokio::time::timeout(SESSION_IDLE, sock.recv(&mut buf)).await {
                     Ok(Ok(n)) => {

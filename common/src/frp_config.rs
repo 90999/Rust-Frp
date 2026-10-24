@@ -270,7 +270,7 @@ const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
     // ---- 认证 ----
     // （`tokenSource` 已在 v0.6.5 实现，从清单移除）
     // ---- 顶层 ----
-    "udpPacketSize",
+    // （`udpPacketSize` 已在 v0.6.6 实现，从清单移除）
     "natHoleStunServer",
     "dnsServer",
     // （`includes` 已在 v0.6.5 实现，从清单移除）
@@ -311,7 +311,7 @@ const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     "pprofEnable",
     // （`enablePrometheus` 已在 v0.6.5 实现，从清单移除）
     // 行为
-    "udpPacketSize",
+    // （`udpPacketSize` 已在 v0.6.6 实现，从清单移除）
     "natholeAnalysisDataReserveHours",
     // 认证（`tokenSource` 已在 v0.6.5 实现，从清单移除）
     // 网关 / 插件

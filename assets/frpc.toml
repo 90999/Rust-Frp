@@ -46,6 +46,14 @@ token = "your_secret_token"
 # 需要服务端允许 yamux（frps 的 tcp_mux）
 tcp_mux = true
 
+# UDP 转发的单报文缓冲上限（对应官方 udpPacketSize）
+#   ★ 官方默认 1500，本工具默认 **65507**（UDP over IPv4 的最大载荷）。
+#   为什么故意不同：它决定"单个 UDP 报文最多能带多少字节"，超过就被截断。
+#   改成 1500 会**静默截断**大报文（收得到包、内容少一截），比报错难查；
+#   想把行为对齐官方的部署，显式配 1500 即可。
+#   取值会被夹在 [1, 65507]。
+# udpPacketSize = 1500
+
 # TLS 加密传输（对应 frp 的 transport.tls.enable）
 # 与 frp 行为一致：默认不校验服务端证书，服务端用自签名证书即可
 tls_enable = false

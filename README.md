@@ -362,15 +362,32 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   **Windows 用 Wintun**（v0.6.6 起支持，需管理员权限 + 自行下载 `wintun.dll`，
   数据面已真机验证：ping 由我们应答，内核→TUN→我们→TUN→内核 双向打通）；
   macOS 未实现，配置了会明确报错而不是静默失败
-- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段。
+- 与官方 0.71 的配置字段对齐情况分三类：
+
   **已实现**：TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，
   含服务端 mTLS 与客户端证书）、`auth.tokenSource`（文件 / 外部命令，客户端与服务端）、
-  `includes`（客户端配置包含）、`quicBindPort`、`enablePrometheus`。
-  仍缺的主要是：客户端的 `useEncryption` / `useCompression` / `proxyURL` /
-  `udpPacketSize` / `natHoleStunServer` / `dnsServer` / `pprofEnable` / `assetsDir`，
-  服务端的 `assetsDir` / `webServer.tls.certFile` / `webServer.tls.keyFile` /
-  `pprofEnable` / `udpPacketSize` / `natholeAnalysisDataReserveHours` /
-  `sshTunnelGateway` / `httpPlugins`
+  `includes`（客户端配置包含）、`quicBindPort`、`enablePrometheus`、
+  `udpPacketSize`（两端；默认 65507 而非官方的 1500 —— 见下）
+
+  **本工具不适用**（不是"没做"，是概念上没有对应）：
+  `pprofEnable` —— 那是 Go 运行时的 CPU / 堆采样；Rust 用 `perf` / `heaptrack`
+  在进程外抓，内嵌一个同名开关只会误导人。
+  `sshTunnelGateway` —— 官方 frps 内嵌了一个 SSH 服务器（`ssh -R` 直接开隧道），
+  要补它等于在本项目里再写一个 SSH 服务端，攻击面与工作量都远超"配置字段"。
+
+  **仍未做**：客户端的 `useEncryption` / `useCompression`（数据面加密与压缩，
+  需要与 `fatedier/golib` 的 AES-128-CFB 与 snappy 流**字节级对齐**，
+  做错会静默破坏与官方 frpc 的互通）、`proxyURL`（出站 HTTP/SOCKS5 代理）、
+  `dnsServer`（自定义 DNS）、`natHoleStunServer`、`pprofEnable`、`assetsDir`；
+  服务端的 `assetsDir`、`webServer.tls.certFile` / `webServer.tls.keyFile`
+  （面板 HTTPS）、`natholeAnalysisDataReserveHours`、`httpPlugins`（服务端鉴权回调）。
+  配置里写了这些字段时，启动日志会逐条列出"配了但不会生效"。
+
+  > `udpPacketSize` 的默认值**故意与官方不同**：官方默认 1500，NFRP 一直用
+  > 65507（UDP 协议上限）。改成 1500 会**静默截断**现有用户的大 UDP 报文
+  > （收得到包、内容少一截），比报错难查得多。想对齐官方行为的部署，
+  > 显式配 `udpPacketSize = 1500` 即可。
+
 
 ## License
 

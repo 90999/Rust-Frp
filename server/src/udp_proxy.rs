@@ -24,9 +24,6 @@ use tracing::{debug, info, warn};
 
 use crate::ClientState;
 
-/// 单个 UDP 报文缓冲上限（与 frp `MaxUDPPayloadSize` 一致）。
-const MAX_UDP_PAYLOAD: usize = 65507;
-
 /// "最近见过的访客 IP"集合上限（v0.5.6 修审计总报告 L18）。
 ///
 /// 取 4096：一个 UDP 代理同时活跃的访客极少超过这个量级；
@@ -112,6 +109,9 @@ pub fn spawn(
     proxy_name: String,
     client: Arc<ClientState>,
     sec: Arc<crate::guard::SecurityContext>,
+    // ★ v0.6.6：单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
+    // 由配置传入而不是写死常量 —— 见 `ServerConfig::udp_packet_size` 的说明。
+    packet_size: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -127,7 +127,15 @@ pub fn spawn(
                     continue;
                 }
             };
-            if let Err(e) = run_session(work.conn, udp.clone(), &proxy_name, sec.clone()).await {
+            if let Err(e) = run_session(
+                work.conn,
+                udp.clone(),
+                &proxy_name,
+                sec.clone(),
+                packet_size,
+            )
+            .await
+            {
                 debug!(proxy = %proxy_name, "UDP 工作连接结束：{e:#}");
             }
             if client.is_stopped() {
@@ -148,6 +156,7 @@ async fn run_session(
     udp: Arc<UdpSocket>,
     proxy_name: &str,
     sec: Arc<crate::guard::SecurityContext>,
+    packet_size: usize,
 ) -> Result<()> {
     conn.send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
         proxy_name: proxy_name.to_string(),
@@ -200,7 +209,7 @@ async fn run_session(
         //   （日志里要用它）⇒ 克隆一份。这只是一次短字符串分配，可忽略。
         let proxy_name_owned = proxy_name.to_string();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+            let mut buf = vec![0u8; packet_size];
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {

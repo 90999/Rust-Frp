@@ -1623,7 +1623,13 @@ async fn work_conn_flow(
         // （工作连接本身不加密，所以直接 new 即可）。
         let mut udp_conn = FrpConn::new(work, link.wire);
         udp_conn.set_udp_codec(link.udp_binary.load(std::sync::atomic::Ordering::Relaxed));
-        return udp_proxy::run(udp_conn, proxy.local_addr.clone(), proxy_name.to_string()).await;
+        return udp_proxy::run(
+            udp_conn,
+            proxy.local_addr.clone(),
+            proxy_name.to_string(),
+            nfrp_common::config::clamp_udp_packet_size(link.cfg.udp_packet_size),
+        )
+        .await;
     }
 
     // 插件：工作连接直接接到插件上，不再连内网服务

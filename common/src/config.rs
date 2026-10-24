@@ -715,6 +715,24 @@ pub struct ServerConfig {
     #[serde(default, rename = "enablePrometheus", alias = "enable_prometheus")]
     pub enable_prometheus: bool,
 
+    /// UDP 转发的单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
+    ///
+    /// ★ v0.6.6：官方默认 **1500**，而 NFRP 一直用 **65507**（UDP 协议上限）。
+    ///
+    /// 为什么默认**故意与官方不同**：
+    /// * 它决定"单个 UDP 报文最多能带多少字节"，超过就被截断；
+    /// * 我们此前一直按 65507 工作，改成 1500 会**截断现有用户的大报文**
+    ///   （某些游戏 / 私有协议单包就上千字节）—— 那是静默的数据损坏；
+    /// * 想把行为对齐官方的部署，显式配 `udpPacketSize = 1500` 即可。
+    ///
+    /// 取值会被夹在 `[1, 65507]`：0 或超限都没有意义。
+    #[serde(
+        default = "default_udp_packet_size",
+        rename = "udpPacketSize",
+        alias = "udp_packet_size"
+    )]
+    pub udp_packet_size: usize,
+
     /// 面板用户名（留空表示**不做鉴权**）。
     ///
     /// ★ 留空只在 `bind_addr` 是回环时被接受（本机自用）。配了
@@ -1188,6 +1206,7 @@ impl Default for ServerConfig {
             p2p_port: None,
             dashboard_port: None,
             enable_prometheus: false,
+            udp_packet_size: default_udp_packet_size(),
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
@@ -2044,6 +2063,17 @@ pub struct ClientConfig {
     #[serde(default, alias = "include", alias = "IncludeConfigFiles")]
     pub includes: Vec<String>,
 
+    /// UDP 转发的单报文缓冲上限（官方 frpc 的 `udpPacketSize`）。
+    ///
+    /// 与服务端同名字段同义、同默认（65507，官方默认 1500 但要保持现状
+    /// 以免截断现有用户的大报文）。详见 `ServerConfig::udp_packet_size`。
+    #[serde(
+        default = "default_udp_packet_size",
+        rename = "udpPacketSize",
+        alias = "udp_packet_size"
+    )]
+    pub udp_packet_size: usize,
+
     // ================= 以下为 v0.3.4 新增 =================
     // 同样全部默认关闭，老的 client.toml 行为不变。
     /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
@@ -2133,6 +2163,7 @@ impl Default for ClientConfig {
             proxies: Vec::new(),
             visitors: Vec::new(),
             includes: Vec::new(),
+            udp_packet_size: default_udp_packet_size(),
             auth: Default::default(),
             store: Default::default(),
             web_server: Default::default(),
@@ -2551,6 +2582,28 @@ fn default_predict_window() -> u16 {
 
 fn default_transport_protocol() -> String {
     "tcp".to_string()
+}
+
+/// UDP 单报文缓冲的默认上限：65507（UDP over IPv4 的最大载荷）。
+///
+/// 官方 frp 默认 1500，这里**故意不同** —— 见字段文档里"为什么默认不同"。
+pub const MAX_UDP_PACKET_SIZE: usize = 65507;
+
+fn default_udp_packet_size() -> usize {
+    MAX_UDP_PACKET_SIZE
+}
+
+/// 把配置里的 `udpPacketSize` 夹到有意义的范围。
+///
+/// 0 会让读取长度变成 0（等于收不到任何报文），超 65507 也没有意义
+/// （UDP 协议上限）。**夹紧而不是报错**：这类值通常是手误，
+/// 让它退回默认比拒绝启动更友好，但要留下告警（调用方负责打）。
+pub fn clamp_udp_packet_size(n: usize) -> usize {
+    if n == 0 {
+        MAX_UDP_PACKET_SIZE
+    } else {
+        n.min(MAX_UDP_PACKET_SIZE)
+    }
 }
 
 /// 判断配置是否选择了 QUIC 传输（大小写与下划线一律宽容处理）。
@@ -4656,6 +4709,72 @@ tcpmuxPassthrough = true
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ==================================================================
+    // v0.6.6：`udpPacketSize`（两端）
+    // ==================================================================
+
+    /// 默认是 65507（NFRP 一直用的值），**不是**官方的 1500。
+    ///
+    /// 这条锁住"默认不被改成 1500" —— 改了会截断现有用户的大 UDP 报文，
+    /// 而且是静默截断（收得到包、内容少一截），比报错难查得多。
+    #[test]
+    fn udp_packet_size_默认是_65507() {
+        assert_eq!(ServerConfig::default().udp_packet_size, MAX_UDP_PACKET_SIZE);
+        assert_eq!(ClientConfig::default().udp_packet_size, MAX_UDP_PACKET_SIZE);
+        assert_eq!(MAX_UDP_PACKET_SIZE, 65507);
+    }
+
+    /// 两端都能读（官方 camelCase 与 NFRP snake_case 都认）。
+    #[test]
+    fn udp_packet_size_两端都能读() {
+        let sv = parse_server_toml("bind_port = 7000\nudpPacketSize = 1500\n").unwrap();
+        assert_eq!(sv.udp_packet_size, 1500, "服务端 camelCase");
+
+        let sv2 = parse_server_toml("bind_port = 7000\nudp_packet_size = 1400\n").unwrap();
+        assert_eq!(sv2.udp_packet_size, 1400, "服务端 snake_case");
+
+        let cl = parse_client_toml("serverAddr = \"x\"\nudpPacketSize = 1200\n").unwrap();
+        assert_eq!(cl.udp_packet_size, 1200, "客户端 camelCase");
+
+        let cl2 = parse_client_toml("server_addr = \"x\"\nudp_packet_size = 1100\n").unwrap();
+        assert_eq!(cl2.udp_packet_size, 1100, "客户端 snake_case");
+    }
+
+    /// 夹紧：0 退回默认，超上限夹到 65507。
+    #[test]
+    fn udp_packet_size_会夹紧到有意义范围() {
+        assert_eq!(clamp_udp_packet_size(0), MAX_UDP_PACKET_SIZE, "0 没意义");
+        assert_eq!(clamp_udp_packet_size(1), 1, "1 是合法的最小值");
+        assert_eq!(clamp_udp_packet_size(1500), 1500);
+        assert_eq!(
+            clamp_udp_packet_size(70_000),
+            MAX_UDP_PACKET_SIZE,
+            "超过 UDP 协议上限要夹住"
+        );
+        assert_eq!(
+            clamp_udp_packet_size(MAX_UDP_PACKET_SIZE),
+            MAX_UDP_PACKET_SIZE
+        );
+    }
+
+    /// 实现了就不能再出现在"未实现字段"清单里（否则是反向假警报）。
+    #[test]
+    fn udp_packet_size_不再被报未实现() {
+        let sv = parse_server_toml("bind_port = 7000\nudpPacketSize = 1500\n").unwrap();
+        assert!(
+            sv.unsupported_fields.is_empty(),
+            "服务端不该再报：{:?}",
+            sv.unsupported_fields
+        );
+
+        let cl = parse_client_toml("serverAddr = \"x\"\nudpPacketSize = 1500\n").unwrap();
+        assert!(
+            cl.unsupported_fields.is_empty(),
+            "客户端不该再报：{:?}",
+            cl.unsupported_fields
+        );
     }
 
     /// 没配 includes 时**不碰文件系统**（走老路径，行为完全不变）。

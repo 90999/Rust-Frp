@@ -1696,6 +1696,7 @@ async fn register_udp(
         m.proxy_name.clone(),
         client.clone(),
         registry.security(),
+        nfrp_common::config::clamp_udp_packet_size(cfg.udp_packet_size),
     );
     registry.attach_listener(m.remote_port, handle.abort_handle());
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);

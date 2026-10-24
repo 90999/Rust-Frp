@@ -43,6 +43,14 @@ transport_protocol = "tcp"
 #   配了之后客户端把 transport.protocol 设成 kcp 并连这个端口即可。
 # kcpBindPort = 7001
 
+# UDP 转发的单报文缓冲上限（对应官方 udpPacketSize）
+#   ★ 官方默认 1500，本工具默认 **65507**（UDP over IPv4 的最大载荷）。
+#   为什么故意不同：它决定"单个 UDP 报文最多能带多少字节"，超过就被截断。
+#   改成 1500 会**静默截断**大报文（收得到包、内容少一截），比报错难查；
+#   想把行为对齐官方的部署，显式配 1500 即可。
+#   取值会被夹在 [1, 65507]。
+# udpPacketSize = 1500
+
 # ---- HTTP / HTTPS 虚拟主机 ----
 # 客户端用 http / https 类型代理时，按域名路由到对应内网服务。
 # 不配置这两项则 http / https 代理会被拒绝。
