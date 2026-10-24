@@ -394,25 +394,33 @@ pub async fn handle_nat_hole_visitor(
         return Ok(());
     };
 
-    // 2) 准入：**NFrp 的打洞协调是自有协议，只服务自家客户端**。
-    //
-    // ★ 这里必须**明确拒绝**，不能"装作成功"。官方 frpc 的 xtcp visitor 走的是
-    //   frp 自己的 UDP `NatHoleSid` 交换（在 `p2p_port` 上发 JSON 报文要地址），
-    //   NFrp 目前没实现那套交换。若我们回一个 `error` 为空的 `NatHoleResp`，
-    //   官方 frpc 会认为打洞可用 → 一直等地址直到超时 → **连中继回退都不会发生**，
-    //   结果是 xtcp 完全不通（比 stcp 还差）。
-    //   回一条明确的错误，客户端才能按 `fallbackTo = "stcp"` 退回中继。
-    //
-    //   判据就是"有没有带签名"：NFrp 客户端一定会带
-    //   （`client/src/p2p.rs` 用 `auth_key(secret_key, ts)`），
-    //   而官方 frpc 的 NatHoleVisitor 实测只有
-    //   `{"transaction_id":…,"proxy_name":…,"pre_check":true}`（无 sign_key/timestamp）。
+    // 2) 官方 frpc 的预检：只问“provider 在不在、我能不能访问”，
+    //    消息里没有 sign_key/timestamp，不能按普通打洞请求处理。
+    //    成功必须回 `error` 为空的响应，官方客户端才会继续做 NAT 探测。
+    if m.pre_check {
+        return match crate::nathole_official::precheck(&entry, &visitor_client.user) {
+            Ok(()) => {
+                visitor_client.forward_to_client(FrpMessage::NatHoleResp(NatHoleResp {
+                    transaction_id: m.transaction_id.clone(),
+                    ..Default::default()
+                }));
+                Ok(())
+            }
+            Err(err) => {
+                refuse(visitor_client, &m.transaction_id, err);
+                Ok(())
+            }
+        };
+    }
+
+    // 3) 签名/用户校验。NFrp 自有协议和官方协议共用同一套
+    //    `auth_key(secret_key, timestamp)`，因此这里不分支。
     if m.sign_key.is_empty() {
         refuse(
             visitor_client,
             &m.transaction_id,
             format!(
-                "xtcp hole punching on this nfrp-server requires the NFrp client \
+                "xtcp hole punching requires a signed NatHoleVisitor \
                  (visitor [{proxy_name}] sent no signature); falling back to relay is required"
             ),
         );
@@ -447,7 +455,20 @@ pub async fn handle_nat_hole_visitor(
         return Ok(());
     }
 
-    // 4) 没有配置 p2p_port 时，明确告诉对方回退中继
+    // 4) 官方 frpc 的正式请求：带 NAT 探测得到的 mapped_addrs。
+    //    它走官方控制消息交换，不依赖 `p2p_port`，也不再走下面的
+    //    NFRp 自有 UDP HELLO 牵线。
+    if !m.mapped_addrs.is_empty() {
+        return match crate::nathole_official::start_session(visitor_client, &entry, m) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                refuse(visitor_client, &m.transaction_id, err);
+                Ok(())
+            }
+        };
+    }
+
+    // 5) NFRp 自有协议：没有 mapped_addrs，靠 `p2p_port` 上的 UDP HELLO。
     let Some(hub) = registry.p2p() else {
         refuse(
             visitor_client,
@@ -739,17 +760,13 @@ mod tests {
         );
     }
 
-    /// ★ **官方 frpc 的 `NatHoleVisitor` 不带 `sign_key` / `timestamp`。**
+    /// 官方 frpc 的预检消息只带 `pre_check`，没有签名。
     ///
-    /// 实测抓包（frpc 0.71.0，本仓库 `--example dump_frpc`）原文：
-    /// `{"transaction_id":"...","proxy_name":"xt","pre_check":true}`。
-    ///
-    /// 它走的是 frp 自己的 UDP `NatHoleSid` 地址交换（NFrp 尚未实现），所以
-    /// 服务端必须**明确拒绝**、而不是回一个空错误的"成功"应答 —— 后者会让
-    /// 官方 frpc 一直等地址直到超时，**连 `fallbackTo = "stcp"` 的中继回退都不触发**，
-    /// 最终 xtcp 一个字节都不通。
+    /// 现在服务端实现了官方 `NatHole` 控制器，预检通过后回空错误，
+    /// 官方客户端会继续做 STUN 探测并发正式请求；预检本身不建立
+    /// NFRp 自有的 UDP HELLO 会话。
     #[tokio::test]
-    async fn 官方_frpc_访客被明确拒绝以便回退中继() {
+    async fn 官方_frpc_预检成功但不建立自有会话() {
         let registry = Arc::new(Registry::unlimited());
         let provider = client("bob");
         registry
@@ -777,11 +794,7 @@ mod tests {
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .expect("处理过程不应返回 IO 错误");
-        assert_eq!(
-            hub.len(),
-            0,
-            "没有签名的访客不该建立打洞会话（否则官方 frpc 会一直等地址、不回退中继）"
-        );
+        assert_eq!(hub.len(), 0, "官方预检不该建立 NFRp 自有的 UDP HELLO 会话");
     }
 
     #[tokio::test]

@@ -100,7 +100,7 @@ nfrp-common = "0.6"
 - QUIC 传输（`transport_protocol = "quic"`）：1-RTT 握手、流级多路复用
 - KCP 弱网通道：既可作为 xtcp 直连通道，也可作为独立传输协议（`kcp_bind_port`）
 - yamux 多路复用（`transport.tcpMux`），控制连接与工作连接复用一条 TCP
-- TLS 加密（`transport.tls`），含官方自定义首字节伪装，服务端自动生成自签名证书
+- TLS 加密（`transport.tls`），含官方自定义首字节伪装；服务端默认自动生成自签名证书，也支持 `certFile` / `keyFile` 自定义证书，以及 `trustedCaFile` 开启客户端证书（mTLS）；客户端可配 `certFile` / `keyFile` 出示身份
 - WebSocket / WSS（`websocket = true`），同一端口按路径自动识别，可穿透只放行 HTTP 的防火墙
 - Proxy Protocol v1 / v2，把真实客户端 IP 透传给 Nginx / HAProxy / 后端应用
 
@@ -360,7 +360,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 
 - **VirtualNet 在 Windows 上未实现**（需要 TUN 设备），Linux 与 Android 上可用；配置了会明确报错而不是静默失败
 - 官方 frp 的 xtcp NatHole UDP 地址交换协议未实现，所以**官方 frpc 的 xtcp visitor 打不了洞**；服务端会明确拒绝并让官方客户端立刻转走它自己的 `fallbackTo` 中继
-- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段
+- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段。TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，含服务端 mTLS 与客户端证书）已实现；仍缺的主要是：客户端的 `useEncryption` / `useCompression` / `proxyURL` / `tokenSource` / `udpPacketSize` / `natHoleStunServer` / `dnsServer` / `includes` / `pprofEnable` / `assetsDir`，服务端的 `quicBindPort` / `assetsDir` / `webServer.tls.certFile` / `webServer.tls.keyFile` / `pprofEnable` / `enablePrometheus` / `udpPacketSize` / `natholeAnalysisDataReserveHours` / `tokenSource` / `sshTunnelGateway` / `httpPlugins`
 
 ## License
 

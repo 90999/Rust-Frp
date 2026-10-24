@@ -453,6 +453,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls_force: bool,
 
+    /// 服务端 TLS 证书（PEM，对应官方 `transport.tls.certFile`）。
+    ///
+    /// 留空 = 继续用进程启动时生成的自签名证书（与官方默认一致）。
+    /// 与 `tls_key_file` 必须同时配置；只配一个会在启动时明确报错。
+    #[serde(default, rename = "certFile")]
+    pub tls_cert_file: String,
+
+    /// 服务端 TLS 私钥（PEM，对应官方 `transport.tls.keyFile`）。
+    #[serde(default, rename = "keyFile")]
+    pub tls_key_file: String,
+
+    /// 校验客户端证书的 CA（PEM，对应官方 `transport.tls.trustedCaFile`）。
+    ///
+    /// 非空时启用 **mTLS**：客户端必须出示由该 CA 签发的证书。
+    /// 官方 frpc 默认不带客户端证书，因此这条路径主要给"NFRP 客户端 + NFRP 服务端"
+    /// 或自建证书的双端使用。
+    #[serde(default, rename = "trustedCaFile")]
+    pub tls_trusted_ca_file: String,
+
     /// HTTP 代理的虚拟主机端口（对应 frp `vhostHTTPPort`）。
     /// 留空表示不启用 http 类型代理。
     #[serde(default)]
@@ -1094,6 +1113,9 @@ impl Default for ServerConfig {
             protocol: Protocol::default(),
             tcp_mux: true,
             tls_force: false,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_trusted_ca_file: String::new(),
             vhost_http_port: None,
             vhost_https_port: None,
             tcpmux_http_connect_port: None,
@@ -1807,6 +1829,17 @@ pub struct ClientConfig {
     #[serde(default, rename = "trustedCaFile")]
     pub tls_trusted_ca_file: String,
 
+    /// 客户端 TLS 证书（PEM，对应官方 `transport.tls.certFile`）。
+    ///
+    /// 仅用于服务端开启 `trustedCaFile`（mTLS）时出示身份。
+    /// 与 `tls_key_file` 必须同时配置。
+    #[serde(default, rename = "certFile")]
+    pub tls_cert_file: String,
+
+    /// 客户端 TLS 私钥（PEM，对应官方 `transport.tls.keyFile`）。
+    #[serde(default, rename = "keyFile")]
+    pub tls_key_file: String,
+
     /// 是否在 TLS 握手前发送 frp 自定义首字节 `0x17`
     /// （对应 frp `transport.tls.disableCustomTLSFirstByte`，这里语义相反）。
     #[serde(default = "default_true")]
@@ -2008,6 +2041,8 @@ impl Default for ClientConfig {
             //   想要校验的用户显式开 verifyServerCert。
             tls_verify_server_cert: false,
             tls_trusted_ca_file: String::new(),
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
             tls_custom_first_byte: true,
             log_level: default_log_level(),
             log_to: String::new(),
@@ -4070,10 +4105,10 @@ tcpmuxPassthrough = true
 
         // ---- ③ 官方段落写法（`[transport.tls] enable`）----
         //
-        // ★ 注意：官方 schema 里 `[transport.tls]` 段**只有** `enable` 与
-        //   `serverName`（见 `frp_config.rs:585` 的 hoist 表），
-        //   `verifyServerCert` / `trustedCaFile` 是**顶层**键。
-        //   所以这里分开断言 —— 免得把"官方 schema 就是这样"误当成 bug。
+        // ★ 注意：官方 0.71 的 `[transport.tls]` 段包含 `enable` /
+        //   `certFile` / `keyFile` / `trustedCaFile` / `serverName` /
+        //   `disableCustomTLSFirstByte`（见官方 frpc_full_example.toml）。
+        //   NFRp 的 `verifyServerCert` 仍是顶层键，所以这里分开断言。
         let c3 = parse("[transport.tls]\nenable = true\n");
         assert!(c3.tls_enable, "官方 `[transport.tls] enable` 写法必须有效");
 

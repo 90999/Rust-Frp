@@ -218,6 +218,32 @@ impl Bridge {
     ///
     /// 访问侧在此期间读到的字节由 `HttpIo::watch_closed` 存入缓冲，不会丢
     /// （管道化的下一条请求照常处理）；被 `select!` 取消的那支是取消安全的。
+    ///
+    /// # ★★ v0.6.4：这里有一个**已知的 Linux 竞态，本轮未修好**
+    ///
+    /// 实测：同一测试在 Linux 上 10 次跑出 **5 通过 / 5 次超时**，
+    /// 超时表现为"插件收到连接却从未把请求转给上游"。
+    ///
+    /// 根因已定位：`watch_closed` 用 `read(&mut chunk)` 读进**局部数组**，
+    /// 被 `select!` 取消时那批字节随局部变量消失，丢掉的可能正是请求体开头。
+    ///
+    /// **两次修复尝试都失败了**，如实记录以免下一任重复踩：
+    ///
+    /// 1. `watch_closed` 改成 `read_buf` 直接读进 `self.buf` +
+    ///    "缓冲非空就立即 `return Ok(false)`" ⇒ `loop { select! }` 变成
+    ///    100% CPU 的**忙等死循环**（云端 4 个进程各烧掉 20 分钟 CPU，
+    ///    本地单进程烧掉 1288 秒）。
+    /// 2. 再在循环里加 `if io.available() > 0 { return Ok(fut.await) }`
+    ///    ⇒ 仍然空转，因为 `watch_closed` 那份 `read_buf` 已经先把数据
+    ///    吸进缓冲，`available()` 永远 > 0。
+    ///
+    /// 正确方向（留给后续）：把"盯访问侧关闭"改成**单一所有权**的读协程 ——
+    /// 一个任务独占 `stream` 做读取，把字节推进共享队列，`wait_upstream`
+    /// 只等队列信号。那样不存在"两个 future 抢同一个 stream"的问题。
+    /// 这需要改动 `HttpIo` 的所有权结构，属于重构级改动，本轮不动。
+    ///
+    /// 影响面：仅 Linux 上 `http2*` / `https2*` 插件的端到端用例会间歇失败；
+    /// Windows 上 21/21 稳定通过。产品在 Windows 上不受影响。
     async fn wait_upstream<T, S>(
         io: &mut HttpIo<&mut S>,
         fut: impl std::future::Future<Output = Result<T>>,

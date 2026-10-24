@@ -34,6 +34,44 @@ pub const HEALTHZ_PATH: &str = "/api/healthz";
 /// Prometheus 指标名前缀。
 const METRIC_PREFIX: &str = "nfrp";
 
+/// 面板所有响应都会带的**安全响应头**（v0.6.4，渗透测试 PT-05）。
+///
+/// # 为什么加
+///
+/// 面板是一个带 Basic Auth 的网页，曾经一个安全头都没有。这些头不改变
+/// 服务端逻辑，但决定浏览器怎么对待页面：
+///
+/// | 头 | 作用 |
+/// |---|---|
+/// | `X-Content-Type-Options: nosniff` | 禁止浏览器嗅探 MIME。少了它，一个被上传的"文件"可能被当 HTML 执行 |
+/// | `X-Frame-Options: DENY` | 禁止被 `<iframe>` 嵌入 —— 挡住点击劫持（把面板套进攻击者页面，诱导管理员点"踢出"） |
+/// | `Referrer-Policy: no-referrer` | 面板 URL 不通过 `Referer` 泄露给外部站点 |
+/// | `Content-Security-Policy` | 只允许内联样式与脚本（面板是单文件 HTML，没有外部资源），禁止一切外域加载与 `frame-ancestors` |
+///
+/// # 为什么不用 HSTS
+///
+/// 面板默认是**明文 HTTP**。对明文响应发 `Strict-Transport-Security`
+/// 会被浏览器**直接忽略**（RFC 6797 §7.2），发了也没用；更糟的是会让人
+/// 误以为"已经上 HTTPS 了"。等面板自己支持 TLS 之后再按需加。
+///
+/// # CSP 的取舍
+///
+/// 面板 HTML 的所有脚本与样式都是内联的（`html_page()` 单文件），所以
+/// `script-src` / `style-src` 必须允许 `'unsafe-inline'`。这不是疏忽 ——
+/// 在一个自包含页面上，能挡的部分是 `default-src 'none'`（禁止一切外域
+/// 请求、图片、字体、frame），而那正好是最有价值的部分。
+const SEC_HEADERS: &[(&str, &str)] = &[
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'unsafe-inline'; \
+         style-src 'unsafe-inline'; img-src 'self' data:; \
+         connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    ),
+];
+
 /// 单条请求行的最大长度。
 const MAX_LINE: usize = 8 * 1024;
 
@@ -207,6 +245,10 @@ async fn handle(
     let body = body_of(&req);
     let query = query_of(&req);
 
+    // v0.6.4（渗透测试 PT-03）：`HEAD` 只回响应头，不回 body。
+    // 见 [`send`] 的 `head_only` 参数说明。
+    let head_only = method == "HEAD";
+
     // 健康探针必须在鉴权**之前**处理。
     //
     // k8s 的 liveness/readiness、docker 的 HEALTHCHECK、各类 LB 的健康检查
@@ -220,12 +262,21 @@ async fn handle(
                 405,
                 "text/plain; charset=utf-8",
                 b"Method Not Allowed\n",
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
             return Ok(());
         }
-        send(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n", &[]).await?;
+        send(
+            &mut stream,
+            200,
+            "text/plain; charset=utf-8",
+            b"ok\n",
+            SEC_HEADERS,
+            head_only,
+        )
+        .await?;
         debug!(%peer, "健康检查");
         return Ok(());
     }
@@ -272,7 +323,8 @@ async fn handle(
                     401,
                     "text/plain; charset=utf-8",
                     b"Unauthorized\n".as_slice(),
-                    &[("WWW-Authenticate", "Basic realm=\"nfrp\"")],
+                    SEC_HEADERS_WITH_AUTH.as_slice(),
+                    head_only,
                 )
                 .await?;
                 return Ok(());
@@ -291,7 +343,8 @@ async fn handle(
             405,
             "text/plain; charset=utf-8",
             b"Method Not Allowed\n",
-            &[],
+            SEC_HEADERS,
+            head_only,
         )
         .await?;
         return Ok(());
@@ -310,7 +363,8 @@ async fn handle(
             resp.status,
             "application/json; charset=utf-8",
             resp.body.as_bytes(),
-            &[],
+            SEC_HEADERS,
+            head_only,
         )
         .await?;
         debug!(%peer, %method, %path, status = resp.status, "面板 v2 请求已处理");
@@ -335,11 +389,32 @@ async fn handle(
                 code,
                 "application/json; charset=utf-8",
                 payload.as_bytes(),
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
             return Ok(());
         }
+
+        // ★ v0.6.4（渗透测试 PT-07）：**未匹配的 POST 一律 405**。
+        //
+        // 旧行为是落进下面的 `match path`，于是 `POST /api/status` 会命中
+        // `"/api/status"` 分支、返回 200 + 完整状态 JSON。那既违反直觉
+        // （只读端点接受了写方法），也让只按"状态码 200 就算成功"的
+        // 客户端 / 监控误判。
+        //
+        // 用 405 而不是 404：路径确实存在，只是方法不对 —— 这是 HTTP 语义
+        // 要求，顺带用 `Allow` 告诉调用方该用什么方法。
+        send(
+            &mut stream,
+            405,
+            "text/plain; charset=utf-8",
+            b"Method Not Allowed: read-only endpoint\n",
+            SEC_HEADERS_WITH_ALLOW.as_slice(),
+            head_only,
+        )
+        .await?;
+        return Ok(());
     }
 
     let snapshot = registry.observ.snapshot();
@@ -351,7 +426,8 @@ async fn handle(
                 200,
                 "text/plain; version=0.0.4; charset=utf-8",
                 body.as_bytes(),
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
         }
@@ -362,7 +438,8 @@ async fn handle(
                 200,
                 "application/json; charset=utf-8",
                 body.as_bytes(),
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
         }
@@ -373,7 +450,8 @@ async fn handle(
                 200,
                 "text/html; charset=utf-8",
                 body.as_bytes(),
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
         }
@@ -384,7 +462,8 @@ async fn handle(
                 404,
                 "text/plain; charset=utf-8",
                 body.as_bytes(),
-                &[],
+                SEC_HEADERS,
+                head_only,
             )
             .await?;
         }
@@ -539,12 +618,63 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     nfrp_common::frp::msg::constant_time_eq(a, b)
 }
 
+/// 把「调用点自己的头」与 [`SEC_HEADERS`] 合并。
+///
+/// 401 要带 `WWW-Authenticate`、405 要带 `Allow` —— 这些是**协议必需**的头，
+/// 不能因为加安全头而丢掉。
+///
+/// 注意：这里**不用**运行时拼接函数。`send` 收的是 `&[(&str, &str)]`，
+/// 写 `&with_sec_headers(...)` 会产生临时值、活不过调用表达式；改成两个
+/// `static` 数组在编译期就固定下来，零运行时开销、也没有生命周期问题。
+/// 只有需要额外头的调用点才用它们，其余直接传 [`SEC_HEADERS`]。
+static SEC_HEADERS_WITH_AUTH: [(&str, &str); SEC_HEADERS.len() + 1] = concat_headers_auth();
+
+static SEC_HEADERS_WITH_ALLOW: [(&str, &str); SEC_HEADERS.len() + 1] = concat_headers_allow();
+
+/// 401 用：`WWW-Authenticate` + 安全头。
+const fn concat_headers_auth() -> [(&'static str, &'static str); SEC_HEADERS.len() + 1] {
+    let mut out = [("", ""); SEC_HEADERS.len() + 1];
+    out[0] = ("WWW-Authenticate", "Basic realm=\"nfrp\"");
+    let mut i = 0;
+    while i < SEC_HEADERS.len() {
+        out[i + 1] = SEC_HEADERS[i];
+        i += 1;
+    }
+    out
+}
+
+/// 405 用：`Allow` + 安全头。
+const fn concat_headers_allow() -> [(&'static str, &'static str); SEC_HEADERS.len() + 1] {
+    let mut out = [("", ""); SEC_HEADERS.len() + 1];
+    out[0] = ("Allow", "GET, HEAD");
+    let mut i = 0;
+    while i < SEC_HEADERS.len() {
+        out[i + 1] = SEC_HEADERS[i];
+        i += 1;
+    }
+    out
+}
+
+/// 写一个完整的 HTTP 响应。
+///
+/// # `head_only`（v0.6.4，渗透测试 PT-03）
+///
+/// `HEAD` 请求**必须只回头、不回头**（RFC 9110 §9.3.2）。
+/// 早先这里无差别地写 body，于是一个 `HEAD /` 会回 10368 字节 HTML。
+///
+/// 危害有限（不是漏洞，是协议违规），但会带来实际问题：
+/// * 一些健康检查 / 监控用 HEAD 探测，白白拉一遍完整页面；
+/// * 某些缓存与代理对 HEAD 的 body 处理不一致，可能污染缓存。
+///
+/// `Content-Length` **仍然按真实 body 长度发送** —— 这正是 HEAD 的语义：
+/// 告诉对端 GET 会拿到多少字节，但不真的发。
 async fn send(
     stream: &mut TcpStream,
     code: u16,
     content_type: &str,
     body: &[u8],
     extra: &[(&str, &str)],
+    head_only: bool,
 ) -> anyhow::Result<()> {
     let reason = match code {
         200 => "OK",
@@ -572,7 +702,10 @@ async fn send(
     }
     out.push_str("\r\n");
     stream.write_all(out.as_bytes()).await?;
-    stream.write_all(body).await?;
+    // HEAD：只回头，body 一个字节都不写
+    if !head_only {
+        stream.write_all(body).await?;
+    }
     stream.flush().await?;
     Ok(())
 }
@@ -868,13 +1001,23 @@ mod tests {
     }
 
     async fn http_get(addr: SocketAddr, path: &str, auth: Option<(&str, &str)>) -> String {
+        http_req(addr, "GET", path, auth).await
+    }
+
+    /// 通用请求（v0.6.4）：可以指定方法，用于测 HEAD / POST 的语义。
+    async fn http_req(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        auth: Option<(&str, &str)>,
+    ) -> String {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
         if let Some((u, p)) = auth {
             let cred = STANDARD.encode(format!("{u}:{p}"));
             req.push_str(&format!("Authorization: Basic {cred}\r\n"));
         }
-        req.push_str("\r\n");
+        req.push_str("Content-Length: 0\r\n\r\n");
         let mut s = TcpStream::connect(addr).await.expect("连上面板");
         s.write_all(req.as_bytes()).await.expect("写请求");
         let mut buf = Vec::new();
@@ -1158,5 +1301,175 @@ Authorization: Basic ",
         let out = encode_prometheus(&snap, METRIC_PREFIX);
         assert!(out.contains("nfrp_uptime_seconds"));
         assert!(out.contains("# TYPE nfrp_conns_active gauge"));
+    }
+
+    // ==================================================================
+    // v0.6.4（渗透测试 PT-03 / PT-05 / PT-07）：HTTP 语义与安全响应头
+    // ==================================================================
+
+    /// 起一个真实面板，返回监听地址。测完不用管，测试进程退出即回收。
+    async fn spawn_dashboard() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑端口");
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Registry::unlimited());
+        let auth: DashboardAuth = Arc::new(RwLock::new(Some(("u".into(), "p".into()))));
+        let h = tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                let registry = registry.clone();
+                let auth = auth.clone();
+                tokio::spawn(async move {
+                    let cfg = Arc::new(ServerConfig::default());
+                    let _ = handle(stream, peer, registry, auth, cfg).await;
+                });
+            }
+        });
+        (addr, h)
+    }
+
+    /// ★ PT-03：`HEAD` **不得**返回响应体（RFC 9110 §9.3.2）。
+    ///
+    /// 修复前：`HEAD /` 会回 10368 字节 HTML，`HEAD /api/status` 回 659 字节。
+    /// 但 `Content-Length` **必须照常是真实 body 长度** —— 那正是 HEAD 的语义。
+    #[tokio::test]
+    async fn head_returns_headers_without_body() {
+        let (addr, _h) = spawn_dashboard().await;
+
+        for path in ["/", "/api/status", "/metrics", "/api/healthz"] {
+            let resp = http_req(addr, "HEAD", path, Some(("u", "p"))).await;
+
+            // 状态行 + 头部分
+            let head_end = resp.find("\r\n\r\n").expect("响应必须有头尾分隔");
+            let head = &resp[..head_end];
+            let body = &resp[head_end + 4..];
+
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "HEAD {path} 应当 200：{resp}"
+            );
+            assert!(
+                body.is_empty(),
+                "★ HEAD {path} 绝不能返回 body，实际多回 {} 字节：{:?}",
+                body.len(),
+                &body[..body.len().min(80)]
+            );
+            // Content-Length 仍然要按真实长度给
+            assert!(
+                head.to_ascii_lowercase().contains("content-length:"),
+                "HEAD {path} 仍须给 Content-Length：{head}"
+            );
+        }
+    }
+
+    /// 对照：同一个路径用 GET 必须**照常**返回 body。
+    ///
+    /// 这条防的是"把 HEAD 的修法扩大到 GET 上"——那会把面板变成空白页。
+    #[tokio::test]
+    async fn get_still_returns_body() {
+        let (addr, _h) = spawn_dashboard().await;
+        let resp = http_req(addr, "GET", "/", Some(("u", "p"))).await;
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(!body.is_empty(), "GET / 必须有 body：{resp}");
+        assert!(body.contains("<html"), "GET / 应当是 HTML 页面");
+    }
+
+    /// ★ PT-07：只读端点**不接受 POST**，必须回 405。
+    ///
+    /// 修复前 `POST /api/status` 会落进 `match path` 的只读分支，返回
+    /// 200 + 完整状态 JSON —— 只按"200 就算成功"的客户端会误判。
+    #[tokio::test]
+    async fn post_to_readonly_endpoint_is_405() {
+        let (addr, _h) = spawn_dashboard().await;
+
+        for path in ["/api/status", "/metrics", "/"] {
+            let resp = http_req(addr, "POST", path, Some(("u", "p"))).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 405"),
+                "★ POST {path} 必须 405，实际：{}",
+                resp.lines().next().unwrap_or("")
+            );
+            assert!(
+                resp.to_ascii_lowercase().contains("allow:"),
+                "405 应当带 Allow 头告诉调用方该用什么方法：{resp}"
+            );
+        }
+
+        // 真正的写接口不受影响
+        let resp = http_req(addr, "POST", "/api/clients/kick", Some(("u", "p"))).await;
+        assert!(
+            !resp.starts_with("HTTP/1.1 405"),
+            "写接口不能被 405 拦掉：{resp}"
+        );
+    }
+
+    /// ★ PT-05：所有响应都要带安全头。
+    #[tokio::test]
+    async fn security_headers_on_every_response() {
+        let (addr, _h) = spawn_dashboard().await;
+
+        // 覆盖成功、未鉴权、方法不允许三类响应
+        let cases = [
+            ("GET", "/", Some(("u", "p"))),
+            ("GET", "/api/status", Some(("u", "p"))),
+            ("GET", "/api/status", None),              // 401
+            ("POST", "/api/status", Some(("u", "p"))), // 405
+            ("GET", "/api/healthz", None),             // 免鉴权
+        ];
+
+        for (method, path, auth) in cases {
+            let resp = http_req(addr, method, path, auth).await;
+            let lower = resp.to_ascii_lowercase();
+            for h in [
+                "x-content-type-options: nosniff",
+                "x-frame-options: deny",
+                "referrer-policy: no-referrer",
+                "content-security-policy:",
+            ] {
+                assert!(
+                    lower.contains(h),
+                    "★ {method} {path} 缺少安全头 {h}：\n{resp}"
+                );
+            }
+        }
+    }
+
+    /// 401 的 `WWW-Authenticate` 不能被安全头挤掉 —— 那是 Basic Auth 的协议要求。
+    #[tokio::test]
+    async fn unauthorized_still_carries_www_authenticate() {
+        let (addr, _h) = spawn_dashboard().await;
+        let resp = http_req(addr, "GET", "/api/status", None).await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+        assert!(
+            resp.to_ascii_lowercase()
+                .contains("www-authenticate: basic realm=\"nfrp\""),
+            "401 必须带 WWW-Authenticate：{resp}"
+        );
+        // 同时也要有安全头
+        assert!(
+            resp.to_ascii_lowercase().contains("x-frame-options: deny"),
+            "401 同样要带安全头：{resp}"
+        );
+    }
+
+    /// 安全头常量本身要合理：不能为空、不能有重复名。
+    #[test]
+    fn sec_headers_are_sane() {
+        assert!(!SEC_HEADERS.is_empty(), "安全头不能是空的");
+        let names: Vec<String> = SEC_HEADERS
+            .iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        let mut dedup = names.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), names.len(), "安全头里有重复的名字：{names:?}");
+
+        // 合并后的数组必须包含原头 + 全部安全头
+        assert_eq!(SEC_HEADERS_WITH_AUTH[0].0, "WWW-Authenticate");
+        assert_eq!(SEC_HEADERS_WITH_ALLOW[0].0, "Allow");
+        assert_eq!(SEC_HEADERS_WITH_AUTH.len(), SEC_HEADERS.len() + 1);
+        assert_eq!(SEC_HEADERS_WITH_ALLOW.len(), SEC_HEADERS.len() + 1);
+        // 合并数组的后半段就是 SEC_HEADERS 本身
+        assert_eq!(&SEC_HEADERS_WITH_AUTH[1..], SEC_HEADERS);
+        assert_eq!(&SEC_HEADERS_WITH_ALLOW[1..], SEC_HEADERS);
     }
 }

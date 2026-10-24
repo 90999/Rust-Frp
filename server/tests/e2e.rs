@@ -6,7 +6,12 @@
 //! 要不到、配对成功却没发 StartWorkConn、visitor 校验通过却没取到工作连接。
 //! 这些只有在真跑一遍完整协议时才暴露。
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use nfrp_common::{
     config::ServerConfig,
@@ -90,29 +95,97 @@ fn base_cfg() -> ServerConfig {
 ///
 /// 端口被释放到再被服务端 bind 之间有一小段窗口，理论上存在竞态；
 /// 相比写死端口号（CI 上迟早冲突），这点风险可以接受。
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+/// 本测试进程已经发出去的端口号。
+///
+/// `TcpListener::bind("127.0.0.1:0")` 返回的端口在 listener 被 drop 后，
+/// 操作系统可以立刻再次分配出去。e2e 用例是并行跑的，两三个测试同时
+/// `free_port()` 时就会拿到同一个号，随后一个先 bind 成功、另一个报
+/// `Address already in use`。这里把发过的号永久保留，直到测试进程退出，
+/// 用一点点地址空间换掉这类随机红灯。
+fn claimed_ports() -> &'static Mutex<HashSet<u16>> {
+    static PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    PORTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// 挑一个**TCP 和 UDP 都 bind 得上**的端口（QUIC 服务端用）。
+fn free_port() -> u16 {
+    for _ in 0..128 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let mut claimed = claimed_ports().lock().expect("claimed_ports poisoned");
+        if claimed.insert(port) {
+            return port;
+        }
+    }
+    panic!("试了 128 次都没有拿到未被本进程占用的端口")
+}
+
+/// 挑一个**TCP 和 UDP 都 bind 得上**的端口（QUIC / KCP 服务端用）。
 ///
 /// 两个协议空间是独立的：TCP:0 拿到的端口号，UDP 未必能 bind。
 /// Windows 上尤其如此 —— Hyper-V 会预留一段 UDP 端口
 /// （`netsh interface ipv4 show excludedportrange protocol=udp` 能看到），
 /// 落在这段里的号 bind UDP 会直接 `os error 10013`。
 /// 早先这里只按 TCP 挑号，测试在本机上就随机红。
+///
+/// # v0.6.4：消除端口竞态
+///
+/// 旧实现是 `free_port()`（内部已 drop 掉 TCP listener）之后再 bind UDP：
+///
+/// ```rust
+/// let p = free_port();                                  // TCP listener 已 drop
+/// if UdpSocket::bind(("127.0.0.1", p)).is_ok() { ... }   // ← 中间有空窗
+/// ```
+///
+/// 两次 bind 之间没有任何保护，并行测试的另一个线程可能正好抢走这个号，
+/// 于是 64 次全撞车并 panic。这是**真实存在**的 flake，不是"偶发环境问题"。
+///
+/// 现在改成：
+/// 1. TCP 与 UDP **同时持有**，两个都绑上了才算这个号可用；
+/// 2. 校验通过后登记进 [`claimed_ports`]，本进程内不再发出去；
+/// 3. 校验期间 socket 一直被持有，别的测试拿不到这个号。
+///
+/// 注意：跨**进程**的竞态无法在用户态彻底消除（OS 分配端口的固有性质），
+/// 但这里已经把窗口从"两次函数调用之间"压缩到"同一个作用域内"，
+/// 并且从根源上去掉了"先放后抢"的写法。
 fn free_port_both() -> u16 {
-    for _ in 0..64 {
-        let p = free_port();
-        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
-            return p;
+    for _ in 0..128 {
+        // TCP 先绑到 0 号，拿一个候选端口；listener **不 drop**
+        let tcp = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let p = match tcp.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => continue,
+        };
+
+        // 在 TCP listener 仍持有的情况下试 UDP：两个都能绑才算数
+        let udp = match std::net::UdpSocket::bind(("127.0.0.1", p)) {
+            Ok(s) => s,
+            Err(_) => continue, // UDP 这个号被占（Windows 预留段常见）→ 换一个
+        };
+
+        // 两个 socket 都还活着 ⇒ 这个号真的可用。
+        // 立刻登记，防止本进程内其它测试再发出去。
+        {
+            let mut claimed = claimed_ports().lock().expect("claimed_ports poisoned");
+            if !claimed.insert(p) {
+                // 本进程已发过这个号：放掉重试
+                drop(tcp);
+                drop(udp);
+                continue;
+            }
         }
+
+        // 登记成功后再放掉，交给被测服务端去 bind
+        drop(tcp);
+        drop(udp);
+        return p;
     }
-    panic!("试了 64 次都没拿到 TCP/UDP 都能 bind 的端口")
+    panic!("试了 128 次都没拿到 TCP/UDP 都能 bind 的端口")
 }
 
 /// 带标签的回显服务：回 `{tag}:` + 收到的内容。
@@ -478,6 +551,53 @@ async fn wrong_token_is_rejected_at_handshake() {
     )
     .await;
     assert!(r.is_err(), "token 不对时必须握手失败，否则等于没有鉴权");
+}
+
+/// Stage 4 降级（PSF 不可得）：把“工作连接/visitor 消息误发到控制连接”的
+/// 乱序状态喂给真实服务端，要求**不崩、不断线**，且后续合法注册仍能成功。
+///
+/// 官方 frps 对控制连接上的未知消息也是忽略；这里不把“严格拒绝”当成契约，
+/// 只把“不会被乱序消息带崩”当成可重复的门。真正的 PSF 会把每条消息按
+/// 状态机建模并枚举转移，本用例只覆盖两个最容易写错的跨状态消息。
+#[tokio::test]
+async fn out_of_state_messages_do_not_kill_control_session() {
+    let port = start_server(base_cfg()).await;
+    let (mut conn, _run_id) = login(port, TOKEN, "state-probe").await;
+
+    conn.send_msg(&FrpMessage::NewWorkConn(NewWorkConn {
+        run_id: "not-this-session".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("发送乱序 NewWorkConn");
+
+    conn.send_msg(&FrpMessage::NewVisitorConn(
+        nfrp_common::frp::msg::NewVisitorConn {
+            run_id: "not-this-session".into(),
+            proxy_name: "missing".into(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("发送乱序 NewVisitorConn");
+
+    // 乱序消息应被忽略；控制连接还必须能继续完成一次合法注册。
+    let remote = free_port();
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "after-out-of-state".into(),
+            proxy_type: "tcp".into(),
+            remote_port: remote,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        resp.error.is_empty(),
+        "乱序消息之后的合法注册失败：{}",
+        resp.error
+    );
 }
 
 #[tokio::test]

@@ -304,10 +304,7 @@ pub fn unsupported_fields(root: &Value) -> Vec<String> {
 const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     // 端口 / 监听
     "quicBindPort",
-    // 传输层调优
-    "certFile",
-    "keyFile",
-    "trustedCaFile",
+    // 传输层调优（`certFile` / `keyFile` / `trustedCaFile` 已在批次3实现）
     // HTTP 虚拟主机（`vhostHTTPTimeout` / `custom404Page` 已实现）
     // 面板 / 观测
     "assetsDir",
@@ -336,6 +333,20 @@ pub fn unsupported_fields_ini(text: &str) -> Vec<String> {
 pub fn unsupported_server_fields(root: &Value) -> Vec<String> {
     let mut found = Vec::new();
     collect_named(root, UNSUPPORTED_SERVER_FIELDS, &mut found);
+    // `certFile` / `keyFile` 已从全局清单移除（`transport.tls` 已实现），
+    // 但 `webServer.tls.*` 是**另一组**未实现字段（面板 HTTPS）。名字相同，
+    // 只能按路径补扫，否则会把“面板 TLS 没生效”静默吞掉。
+    if let Some(tls) = root
+        .get("webServer")
+        .and_then(|v| v.get("tls"))
+        .and_then(|v| v.as_table())
+    {
+        for key in ["certFile", "keyFile"] {
+            if tls.keys().any(|k| field_matches(key, k)) {
+                found.push(format!("webServer.tls.{key}"));
+            }
+        }
+    }
     found.sort();
     found.dedup();
     found
@@ -573,7 +584,16 @@ pub fn normalize_client(root: &mut toml::Value) {
     hoist(
         t,
         &["transport", "tls"],
-        &[("enable", "tls_enable"), ("serverName", "tls_server_name")],
+        &[
+            ("enable", "tls_enable"),
+            ("serverName", "tls_server_name"),
+            // 限制①批次3：mTLS / 自定义证书。官方把这几项放在
+            // `[transport.tls]`，NFrp 结构体是平铺字段，必须 hoist 才生效。
+            // 目标键保持官方 camelCase —— 结构体字段带 `rename`，serde 认的是它。
+            ("trustedCaFile", "trustedCaFile"),
+            ("certFile", "certFile"),
+            ("keyFile", "keyFile"),
+        ],
     );
     hoist_inverted_bool(
         t,
@@ -726,7 +746,17 @@ pub fn normalize_server(root: &mut toml::Value) {
             ("tcpKeepalive", "tcp_keepalive"),
         ],
     );
-    hoist(t, &["transport", "tls"], &[("force", "tls_force")]);
+    hoist(
+        t,
+        &["transport", "tls"],
+        &[
+            ("force", "tls_force"),
+            // 限制①批次3：服务端自定义证书 + mTLS。
+            ("certFile", "certFile"),
+            ("keyFile", "keyFile"),
+            ("trustedCaFile", "trustedCaFile"),
+        ],
+    );
 
     hoist(t, &["auth"], &[("token", "token")]);
     hoist(
@@ -1121,6 +1151,9 @@ protocol = "quic"
 enable = true
 serverName = "example.com"
 disableCustomTLSFirstByte = true
+trustedCaFile = "ca.pem"
+certFile = "client.pem"
+keyFile = "client-key.pem"
 
 [[proxies]]
 name = "web"
@@ -1152,6 +1185,9 @@ intervalSeconds = 7
         assert_eq!(cfg.transport_protocol, "quic");
         assert!(cfg.tls_enable);
         assert_eq!(cfg.tls_server_name, "example.com");
+        assert_eq!(cfg.tls_trusted_ca_file, "ca.pem");
+        assert_eq!(cfg.tls_cert_file, "client.pem");
+        assert_eq!(cfg.tls_key_file, "client-key.pem");
         // frp 说的是"禁用自定义首字节"，NFrp 说的是"启用" —— 语义相反
         assert!(!cfg.tls_custom_first_byte);
 
@@ -1394,6 +1430,9 @@ token = "st"
 
 [transport.tls]
 force = true
+certFile = "server.pem"
+keyFile = "server-key.pem"
+trustedCaFile = "ca.pem"
 
 [webServer]
 port = 7500
@@ -1408,6 +1447,9 @@ password = "pw"
         assert_eq!(cfg.vhost_http_port, Some(8080));
         assert_eq!(cfg.subdomain_host, "example.com");
         assert!(cfg.tls_force);
+        assert_eq!(cfg.tls_cert_file, "server.pem");
+        assert_eq!(cfg.tls_key_file, "server-key.pem");
+        assert_eq!(cfg.tls_trusted_ca_file, "ca.pem");
         assert_eq!(cfg.dashboard_port, Some(7500));
         assert_eq!(cfg.dashboard_user, "admin");
         assert_eq!(cfg.dashboard_pwd, "pw");
@@ -1746,5 +1788,105 @@ enabled = false
         );
         assert!(cfg.port_allowed(8443));
         assert_eq!(cfg.max_ports_per_client, 3);
+    }
+
+    /// `transport.tls.certFile` 已实现，但 `webServer.tls.certFile` 没有；
+    /// 两者同名，必须按路径区分，不能因为前者实现就把后者一起“洗白”。
+    #[test]
+    fn 面板_tls_字段仍要报告未实现() {
+        let cfg = parse_server_toml(
+            "[webServer.tls]\ncertFile = \"server.crt\"\nkeyFile = \"server.key\"\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.unsupported_fields
+                .iter()
+                .any(|f| f == "webServer.tls.certFile"),
+            "实际：{:?}",
+            cfg.unsupported_fields
+        );
+        assert!(
+            cfg.unsupported_fields
+                .iter()
+                .any(|f| f == "webServer.tls.keyFile"),
+            "实际：{:?}",
+            cfg.unsupported_fields
+        );
+    }
+
+    /// Stage 5 降级（Phaedra 不可得）：定向变异，只要求**不 panic**。
+    ///
+    /// 这不是覆盖率 fuzz，也不声称发现了多少问题；它只把"解析器遇到
+    /// 任意截断/拼接/乱码 TOML 时会不会把进程带崩"变成可重复的门。
+    /// 断言故意很弱：`Ok` / `Err` 都接受，panic 就失败。
+    #[test]
+    fn 定向变异配置不应_panic() {
+        let seeds = [
+            r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "t"
+[transport.tls]
+enable = true
+serverName = "x"
+[[proxies]]
+name = "web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 18080
+"#,
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+vhostHTTPPort = 8080
+[auth]
+method = "token"
+token = "t"
+[transport.tls]
+force = true
+"#,
+            r#"
+serverAddr = "x"
+[[visitors]]
+name = "v"
+type = "stcp"
+serverName = "s"
+secretKey = "k"
+bindAddr = "127.0.0.1"
+bindPort = 9000
+"#,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for seed in seeds {
+            for _ in 0..400 {
+                let mut bytes = seed.as_bytes().to_vec();
+                match next() % 3 {
+                    0 if !bytes.is_empty() => {
+                        let i = (next() as usize) % bytes.len();
+                        bytes[i] = (next() % 0x7f) as u8;
+                    }
+                    1 if !bytes.is_empty() => {
+                        let i = (next() as usize) % bytes.len();
+                        bytes.remove(i);
+                    }
+                    _ => {
+                        let i = (next() as usize) % (bytes.len() + 1);
+                        bytes.insert(i, (next() % 0x7f) as u8);
+                    }
+                }
+                // 只喂合法 UTF-8；非法字节序列由 TOML 解析器直接拒绝，
+                // 不在本测试的断言范围内（那属于字节层 fuzz）。
+                let text = String::from_utf8_lossy(&bytes);
+                let _ = parse_client_toml(&text);
+                let _ = parse_server_toml(&text);
+            }
+        }
     }
 }

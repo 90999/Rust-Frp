@@ -933,11 +933,15 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     }
     let stream = tls::connect_client(
         stream,
-        tls_on,
-        name,
-        !cfg.tls_custom_first_byte,
-        cfg.tls_verify_server_cert,
-        &cfg.tls_trusted_ca_file,
+        &tls::ClientTlsOptions {
+            enable: tls_on,
+            server_name: name,
+            disable_custom_first_byte: !cfg.tls_custom_first_byte,
+            verify: cfg.tls_verify_server_cert,
+            trusted_ca_file: &cfg.tls_trusted_ca_file,
+            client_cert_file: &cfg.tls_cert_file,
+            client_key_file: &cfg.tls_key_file,
+        },
     )
     .await?;
 

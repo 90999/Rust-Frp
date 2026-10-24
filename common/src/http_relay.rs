@@ -106,8 +106,31 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// （★ v0.5.8，第八轮审计 **F8T-1**：`https2*` 悬挂上游 + 访问方撤离，
     /// 上游连接原先永不释放）。
     ///
-    /// 取消安全：作为 `select!` 的另一支被 drop 时，`read` 不会吞掉字节
-    /// （tokio 的 `AsyncRead::read` 在取消时不消费数据）。
+    /// # ★★ v0.6.4：这里有一个**已知的取消安全缺陷，本轮未修好**
+    ///
+    /// 用 `read(&mut chunk)` 读进**局部数组**。若这个 future 在 `select!`
+    /// 里被另一支抢先 drop，已经 `poll_read` 进来的字节会随局部 `chunk`
+    /// 一起消失。
+    ///
+    /// 实测表现（Linux）：`plugin_bridge` 的 `http2*` / `https2*` 端到端用例
+    /// 10 次跑出 5 通过 / 5 次 5 秒超时；超时时插件收到连接却从未把请求
+    /// 转给上游。Windows 上 21/21 稳定通过。
+    ///
+    /// ## 两次失败的修复尝试（如实记录）
+    ///
+    /// 1. 改成 `read_buf` 直接读进 `self.buf` + 缓冲非空时立即返回
+    ///    ⇒ 调用方 `wait_upstream` 的 `loop { select! }` 变成 **100% CPU
+    ///    忙等死循环**（云端 4 进程各烧 20 分钟 CPU，本地单进程烧 1288 秒）。
+    /// 2. 再在循环里加 `if io.available() > 0 { return Ok(fut.await) }`
+    ///    ⇒ 仍然空转，因为 `read_buf` 已经把数据吸进缓冲，`available()` 恒 > 0。
+    ///
+    /// ## 正确方向（未实施）
+    ///
+    /// 让"读"只有一个所有者：单独一个读协程独占 `stream`，把字节推进共享
+    /// 队列，`wait_upstream` 只等队列信号。这样两个 future 不会抢同一个
+    /// stream，取消也就不会丢数据。这需要重构 `HttpIo` 的所有权结构。
+    ///
+    /// 在此之前保持原实现 —— **宁可保留已知缺陷，也不引入忙等**。
     pub async fn watch_closed(&mut self) -> Result<bool> {
         let mut chunk = [0u8; 1024];
         let n = self.stream.read(&mut chunk).await?;

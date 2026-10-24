@@ -168,12 +168,12 @@ rebind/c03、r6-e2e、r5-h1、r5-h3）全部分诊为**探针自身的问题**�
 
 | Stage | 内容 | 状态 |
 |---|---|---|
-| 1 | Miri（nightly；可编译测试子集；并发项 many-seeds） | 待跑 |
-| 2 | ASan / TSan（Windows MSVC 先试；TSan 走云端 Linux 或如实记未执行） | 待跑 |
-| 3 | cargo-vet + cargo-deny（供应链） | 待跑 |
-| 4 | PSF 状态机（不可得则降级手工状态探针） | 待跑 |
-| 5 | Phaedra 字段 fuzz（不可得则降级定向变异） | 待跑 |
-| 6 | OIDC 核查（代码路径实测） | 待跑 |
+| 1 | Miri（nightly；可编译测试子集；并发项 many-seeds） | **部分完成**：编译 362 测试；`frp_config` 38/38 + WS 纯函数 1/1 通过；tokio/mio Windows IOCP 不可执行；Linux TUN 未覆盖（详见文末 Stage 1 节） |
+| 2 | ASan / TSan（Windows MSVC 先试；TSan 走云端 Linux 或如实记未执行） | **部分完成**：ASan 下 `nfrp-common` 371/371、`nfrp-server` 238/238 通过；TSan 在 Windows MSVC 不可用，未执行 |
+| 3 | cargo-vet + cargo-deny（供应链） | **部分完成**：`cargo deny check` 四项全绿；`cargo audit` 修复 3 条通告后清零；`cargo vet` 仅初始化 184 条 exemption，**不等于已审计** |
+| 4 | PSF 状态机（不可得则降级手工状态探针） | **降级完成**：新增真实 e2e 乱序消息探针，服务端不崩且后续合法注册成功 |
+| 5 | Phaedra 字段 fuzz（不可得则降级定向变异） | **降级完成**：1200 次确定性 TOML 变异，解析器未 panic |
+| 6 | OIDC 核查（代码路径实测） | **部分完成**：27 个 OIDC 单测全过（JWT/JWKS/claims/subject 绑定）；无真实 IdP 端到端 |
 
 （本报告为**进行中**状态，后续 Stage 逐段补充。）
 
@@ -200,3 +200,286 @@ rebind/c03、r6-e2e、r5-h1、r5-h3）全部分诊为**探针自身的问题**�
   `unit tests (ubuntu/macOS)` 与 `fmt / clippy` 红，**Windows 单测 / e2e 冒烟 / 两条 musl 交叉编译绿**。
   本机质量门（fmt / clippy 0 告警 / 732 通过）不受影响；Linux/macOS 单测通道与 clippy 通道
   当前不可用，记为**待专项**。
+
+---
+
+# 第二部分 · Stage 1「Miri」实跑记录（2026-10-24）
+
+> 本节只记录**实际执行**的内容与硬限制；没有跑到的部分明确写“未执行”，不把
+> “Miri 能编译”当成“内存安全已证明”。
+
+## 1.1 环境
+
+| 项 | 值 |
+|---|---|
+| 主机 | Windows 11 10.0.26200（本地） |
+| rustc | `1.101.0-nightly (8006091eb 2026-10-17)` |
+| cargo-miri | `miri 0.1.0 (8006091eb7 2026-10-17)` |
+| target | `x86_64-pc-windows-msvc`（nightly 仅装此 target） |
+| Miri flags | `-Zmiri-disable-isolation -Zmiri-strict-provenance` |
+| CARGO_TARGET_DIR | `D:\cargo-target-miri`（与正常构建隔离） |
+
+## 1.2 编译门
+
+命令：
+
+```text
+cargo +nightly miri test -p nfrp-common --lib --no-run
+```
+
+结果：**成功**。`nfrp-common` 及其依赖（tokio、rustls、ring 相关构建脚本等）在
+Miri sysroot 下编译通过；证据 `tmp\miri_common_compile.txt`。
+测试清单共 **362** 个（`tmp\miri_common_list.txt`，`-- --list`）。
+
+## 1.3 已实际跑通的子集
+
+### A. 配置解析/兼容层（38/38 通过）
+
+```text
+cargo +nightly miri test -p nfrp-common --lib frp_config:: -- --test-threads=1
+```
+
+结果：
+
+```text
+running 38 tests
+...
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured;
+324 filtered out; finished in 423.70s
+```
+
+证据：`tmp\miri_frp_config.txt`。
+
+覆盖点包括：TOML/INI 的未实现字段识别与大小写折叠、`auth`/`transport` 子表、
+`visitors`、`allow_ports`、`subdomain_host`、`healthcheck.httpHeaders`、
+`metadatas`、示例配置加载、字段优先级等。**未发现 Miri UB/越界/未初始化读。**
+
+### B. WebSocket 纯函数（1/1 通过）
+
+```text
+cargo +nightly miri test -p nfrp-common --lib ws::tests::accept_key_matches_rfc_vector -- --test-threads=1
+```
+
+结果：`1 passed; 0 failed; ... finished in 0.46s`；证据 `tmp\miri_ws_one.txt`。
+
+## 1.4 未能执行的子集（硬限制）
+
+对 `ws::` 整个模块执行时，第 2 个测试
+`ws::tests::binary_payload_survives_including_invalid_utf8` 在 Miri 下直接报：
+
+```text
+error: unsupported operation: can't call foreign function `CreateIoCompletionPort`
+on OS `windows`
+  --> mio-1.2.3/src/sys/windows/iocp.rs:57:28
+```
+
+根因：该测试用 `#[tokio::test]`，tokio 的 Windows IO driver 初始化 `mio` 的
+IOCP；Miri 不支持这个 Windows FFI。**不是 nfrp 的 UB**，是 Miri/Windows 运行时限制。
+证据：`tmp\miri_ws.txt`（16 个 ws 测试，第 1 个通过后中止）。
+
+尝试补 `x86_64-unknown-linux-gnu` nightly target（让 mio 走 epoll）时，
+`rustup +nightly target add` 在 300 秒内未完成，target 仍未安装；为避免把
+网络等待写成“已执行”，本节不声称 Linux target 已跑。
+
+另外：本仓库唯一的真实 `unsafe`（TUN 设备）在 `#[cfg(target_os = "linux")]`
+下编译，Windows 的 Miri 根本不会实例化它；因此 **Stage 1 没有覆盖 Linux TUN 的
+unsafe 路径**。要完整覆盖，需在 Linux 主机装 nightly + miri + rust-src 后重跑
+（云端旧机内存/时间未在本轮尝试）。
+
+## 1.5 Stage 1 结论
+
+- 可编译性：**通过**（362 个测试的 Miri 构建）。
+- 纯 Rust 配置解析子集：**38/38 通过**，无 Miri 报错。
+- WebSocket 纯函数：**1/1 通过**。
+- tokio/mio 网络测试：**Windows Miri 不可执行**（IOCP FFI），未用“跳过”伪装成全绿。
+- Linux TUN unsafe：**未覆盖**。
+- 因此 Stage 1 状态记为 **部分完成（partial）**，不能写成“Miri 全量通过”。
+
+后续补齐命令（Linux）：
+
+```bash
+rustup toolchain install nightly --component miri rust-src
+rustup +nightly target add x86_64-unknown-linux-gnu
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-strict-provenance" \
+  cargo +nightly miri test -p nfrp-common --lib -- --test-threads=1
+```
+
+（在 Linux 上还要单独对 `common/src/vnet/tun_linux.rs` 的 unsafe 路径做定向测试。）
+
+---
+
+# 第三部分 · Stage 2–6 实跑记录（2026-10-24，OpenCode）
+
+> 本节只写**实际执行**的命令与结果；不可用的工具/平台明确写“未执行”，
+> 不把“能编译”“初始化了配置文件”当成“已证明安全”。
+
+## 2.1 Stage 2：ASan / TSan
+
+### ASan（实际通过）
+
+环境：Windows 11，`rustc 1.101.0-nightly`，target `x86_64-pc-windows-msvc`，
+`rust-src` 已安装，`RUSTFLAGS=-Zsanitizer=address`，`-Zbuild-std`。
+
+```text
+cargo +nightly test -p nfrp-common --lib -Zbuild-std \
+  --target x86_64-pc-windows-msvc -- --test-threads=1
+# test result: ok. 371 passed; 0 failed; ... finished in 17.15s
+
+cargo +nightly test -p nfrp-server -p nfrp-client --lib -Zbuild-std \
+  --target x86_64-pc-windows-msvc -- --test-threads=1
+# test result: ok. 238 passed; 0 failed; ... finished in 14.43s
+```
+
+另外对 `frp_config::` 38 个测试单独跑过 ASan，全部通过。
+没有出现 `ERROR: AddressSanitizer` / `SUMMARY: AddressSanitizer`。
+证据：`tmp\asan_common_final2.txt`、`tmp\asan_server_client.txt`、`tmp\asan_common_frp_config.txt`。
+
+### TSan（未执行）
+
+Windows MSVC 的 Rust TSan 不受支持；本轮没有 Linux 构建机可用，
+因此**没有**运行 TSan，也没有用 ASan 的结果替代 TSan 结论。
+遗留并发风险仍需 Linux + nightly TSan 定向跑 `server\src\serve.rs`、
+`server\src\pool.rs`、`common\src\frp\mux.rs`。
+
+## 2.2 Stage 3：供应链
+
+### 实际发现并修复（有通告 ID）
+
+`cargo audit` 首次运行命中：
+
+| 组件 | 版本 | 通告 | 处理 |
+|---|---|---|---|
+| `rustls-webpki` | 0.103.15 | RUSTSEC-2026-0382（证书链可能接受不受信中间 CA） | 升到 0.103.16 |
+| `webpki-roots` | 1.0.9 | RUSTSEC-2026-0381（内置根含不受信 emSign 中间 CA） | 升到 1.0.10 |
+| `tokio` | 1.53.1 | RUSTSEC-2026-0386（`AsyncFd` I/O safety，unsound） | 升到 1.54.1 |
+
+升级后 `cargo audit` 输出为空（0 vulnerabilities / 0 warnings）。
+证据：`tmp\cargo_audit.txt`（修复前）、`tmp\cargo_audit_final.txt`（修复后）。
+
+### cargo-deny
+
+新增 `nfrp\deny.toml`（许可证白名单、禁用 wildcard、未知 registry/git 源、
+RustSec advisory 数据库）。最终：
+
+```text
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+证据：`tmp\cargo_deny_final.txt`。许可证为常见宽松/弱 copyleft 组合，
+`webpki-roots` 的 `CDLA-Permissive-2.0` 已显式列入。
+
+### cargo-vet（仅基线，不是审计）
+
+`cargo vet init` 生成 `nfrp\supply-chain\{config.toml,audits.toml,imports.lock}`，
+`cargo vet` 输出：
+
+```text
+Vetting Succeeded (184 exempted)
+```
+
+**184 条全部是 exemption，不是人工审计结论。** 这一步只证明工具链能跑、
+依赖树能锁定；后续要么补真实 audit，要么引入可信 imports 后删除 exemption。
+证据：`tmp\cargo_vet.txt`、`tmp\cargo_vet_final.txt`。
+
+## 2.3 Stage 4：PSF 降级（手工状态探针）
+
+PSF 工具本轮不可得，降级为真实服务端 e2e 探针：
+登录后把 `NewWorkConn` / `NewVisitorConn` 误发到**控制连接**，随后做一次
+合法 `NewProxy` 注册。结果：服务端不崩、不断线，合法注册成功。
+
+```text
+cargo test -p nfrp-server --test e2e \
+  out_of_state_messages_do_not_kill_control_session -- --nocapture
+# 1 passed
+```
+
+证据：`tmp\stage4_state_test.txt`；代码在 `server\tests\e2e.rs`。
+
+**未覆盖**：完整状态机枚举（登录前/后、代理注册中、关闭中、心跳超时交叉）、
+并发多连接状态竞争；这些仍需 PSF 或自建状态模型。
+
+## 2.4 Stage 5：Phaedra 降级（定向变异）
+
+Phaedra 不可得，降级为确定性 TOML 定向变异：3 个种子 × 400 次
+（替换/删除/插入），共 1200 次，分别喂给客户端和服务端解析器；
+`Ok`/`Err` 都接受，**panic 即失败**。
+
+```text
+cargo test -p nfrp-common --lib \
+  frp_config::tests::定向变异配置不应_panic
+# 1 passed
+```
+
+证据：`tmp\fuzz_mutation_test.txt`；代码在 `common\src\frp_config.rs`。
+这不是覆盖率 fuzz，没有发现新漏洞；只证明这 1200 个变异没有把解析器带崩。
+
+## 2.5 Stage 6：OIDC 核查
+
+实际执行：
+
+```text
+cargo test -p nfrp-common --lib auth::oidc:: -- --test-threads=1
+# test result: ok. 27 passed; 0 failed
+```
+
+覆盖：JWT 分段解析、base64url、`exp`/`nbf`/`iss`/`aud`、`alg=none` 拒绝、
+RSA/ES256/ES384 验签、JWKS key 解析、`skip` 语义、subject 与会话 `run_id` 绑定。
+
+**未覆盖**：真实 IdP 的 discovery + JWKS 拉取 e2e、密钥轮换、网络错误/超时、
+恶意 JWKS（超大 key、重复 kid、非预期 alg）。代码路径只做了单元级验证。
+
+## 2.6 Stage 2–6 结论
+
+- 真实执行：ASan、cargo-deny、cargo-audit、cargo-vet（基线）、e2e 状态探针、
+  定向变异、OIDC 单测。
+- 明确未执行：TSan、完整 PSF、Phaedra、真实 IdP e2e、Linux TUN Miri。
+- 真实修复：3 条 RustSec 依赖通告；没有把它们写成“0day 已修”。
+- 新增质量门：`deny.toml`、ASan 可重复命令、1200 次变异测试、乱序状态 e2e。
+
+---
+
+# 第四部分 · README 限制①批次3：TLS 证书组（2026-10-24）
+
+实现范围：官方 0.71 的 `[transport.tls]` 证书组。
+
+- 服务端：`certFile` / `keyFile` 自定义证书；`trustedCaFile` 启用 mTLS。
+- 客户端：`certFile` / `keyFile` 在 TLS 握手时出示客户端证书。
+- 三者为空时保持官方默认（自签名、不校验客户端）。
+- 只配 cert 或只配 key：启动与 `--check` 都明确报错，不静默退回自签名。
+
+关键代码：
+
+| 文件 | 内容 |
+|---|---|
+| `common\src\config.rs` | 5 个字段 + 默认值 |
+| `common\src\frp_config.rs` | `[transport.tls]` hoist；从 unsupported 清单移除；`webServer.tls.*` 按路径补扫，避免同名误洗白 |
+| `common\src\frp\tls.rs` | PEM helper、`server_config_from_pem_with_ca`、`configure_server_tls`、`validate_server_tls_files`、客户端身份、`ClientTlsOptions` |
+| `client\src\main.rs` | 传入客户端证书/私钥 |
+| `server\src\serve.rs` | accept 前安装证书；预检校验 |
+| `common\src\config.rs` 测试 | 官方段写法的解析断言 |
+
+验证：
+
+```text
+cargo test -p nfrp-common --lib
+# 371 passed（新增 TLS 配置/装载/半配置报错/变异测试）
+
+cargo test --workspace -j 2 -- --test-threads=1
+# 123 + 371 + 238 + 17 + 25 + 2 passed；0 failed；5 ignored
+
+cargo clippy --workspace --all-targets
+# 0 warning
+```
+
+证据：`tmp\test_final5.txt`、`tmp\clippy_final5.txt`、`tmp\webserver_tls_test.txt`。
+
+mTLS 已做内存双端真实握手：合法客户端证书通过；不带证书拒绝；错误 CA 签发拒绝。
+证据：`tmp\mtls_handshake_test2.txt`。同一份 TLS 配置重复安装是幂等的；换另一组文件
+会明确报错（`configure_tls_is_idempotent_for_same_files`）。
+
+仍未实现：`webServer.tls.*`（面板 HTTPS）、Windows VirtualNet、官方 xtcp NatHole，
+以及 README 限制③列出的其余字段。
+
+
+
+

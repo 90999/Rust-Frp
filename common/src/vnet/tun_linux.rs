@@ -160,11 +160,35 @@ impl Tun {
             return Err(e);
         }
 
-        let tun = Self {
-            fd: AsyncFd::new(OwnedFd(raw))?,
-            name: dev,
-            mtu,
+        // ★ v0.6.4：`AsyncFd::new` 在 tokio 1.54 起被标记为 **deprecated**，
+        //   理由是「unsound due to lack of I/O safety」（tokio PR #8587）。
+        //
+        //   官方替代品是 `unsafe fn register`。为什么它是 unsafe：
+        //   tokio 要求调用方**保证**被注册的 fd 在其生命周期内保持有效，
+        //   且不会被外部 close / dup —— 这些是运行时无法静态检查的。
+        //
+        //   这里的保证：
+        //   * fd 是从 `libc::open("/dev/net/tun")` 拿到的裸 fd，
+        //     紧接着被包进 `OwnedFd`，**由它独占所有权**；
+        //   * `OwnedFd` 随后移交给 `AsyncFd`，没有别的路径持有它；
+        //   * 上面 `set_nonblocking` / `ioctl` 失败的分支都已显式 `close(raw)`
+        //     并 return，所以到这里 raw 一定还活着且只被这里接管。
+        //
+        //   用 `register` 而不是压 `#[allow(deprecated)]`：后者只是让编译过去，
+        //   真正要修的是"I/O safety"问题本身 —— 现在所有权链条是明确的。
+        //
+        //   注册失败时 tokio 会**把原始对象还回来**（`into_parts()`），
+        //   必须 drop 掉才不会泄漏 fd（否则 TUN 设备会一直挂在内核里）。
+        let fd = match unsafe { AsyncFd::register(OwnedFd(raw)) } {
+            Ok(f) => f,
+            Err(e) => {
+                let (owned, io_err) = e.into_parts();
+                drop(owned); // OwnedFd::drop 会 close(raw)
+                return Err(anyhow::anyhow!("把 TUN 设备注册进 tokio 失败：{io_err}"));
+            }
         };
+
+        let tun = Self { fd, name: dev, mtu };
 
         // 配地址 + up。失败就把设备还回去 —— 留一个没有地址的网卡只会误导人。
         // 这里必须写成 `?`（clippy::question_mark；同样是本机 Windows 编不到、

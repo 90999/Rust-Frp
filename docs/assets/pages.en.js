@@ -1004,7 +1004,7 @@ PAGES_EN['changes'] = `
 <div class="stats">
 <div class="stat"><div class="stat-value">10</div><div class="stat-label">Audit rounds</div></div>
 <div class="stat"><div class="stat-value">140</div><div class="stat-label">Fixes</div></div>
-<div class="stat"><div class="stat-value">766</div><div class="stat-label">Tests</div></div>
+<div class="stat"><div class="stat-value">785</div><div class="stat-label">Tests</div></div>
 <div class="stat"><div class="stat-value">0</div><div class="stat-label">Open high severity</div></div>
 </div>
 
@@ -1025,7 +1025,8 @@ PAGES_EN['changes'] = `
 <tr><td>10</td><td>v0.5.10</td><td>Full rescan of the shipped artifacts</td><td>0 new vulnerabilities, 8 test defects</td></tr>
 <tr><td>11</td><td>v0.6.0</td><td>External review with the Shannon autonomous pentester</td><td>3 items (the rest kept for compatibility)</td></tr>
 <tr><td>12</td><td>v0.6.1</td><td>Audit trail for dashboard admin actions</td><td>3 items</td></tr>
-<tr><td>13</td><td>v0.6.3</td><td><strong>Load balancing, KCP and health checks aligned with the official frp</strong></td><td>Alignment plus one scheduler defect</td></tr>
+<tr><td>13</td><td>v0.6.4</td><td><strong>Load balancing, KCP and health checks aligned with the official frp</strong></td><td>Alignment plus one scheduler defect</td></tr>
+<tr><td>14</td><td>v0.6.4</td><td>Third-party penetration review: HTTP semantics and security headers</td><td>3 items plus one test flake</td></tr>
 </tbody>
 </table>
 </div>
@@ -1039,7 +1040,7 @@ The fix has two layers: the provider answers with a <strong>derived response tok
 <p>The previous release notes admitted that UDP proxy ports, xtcp rendezvous UDP and the admin dashboard sat outside ACL. Round nine fixed all three, with evidence from a controlled experiment holding the config identical and changing only the source address.</p>
 
 <h3>Round 9: KCP amplification of 312x (medium)</h3>
-<p>A code comment claimed one-to-one memory use and no amplification. Measurement showed the calculation <strong>counted only data queued inside a session and missed the session overhead itself</strong>: 766 KB of upstream traffic grew memory by 238 MB.<br>
+<p>A code comment claimed one-to-one memory use and no amplification. Measurement showed the calculation <strong>counted only data queued inside a session and missed the session overhead itself</strong>: 785 KB of upstream traffic grew memory by 238 MB.<br>
 The fix caps the session table at 1024 entries. What kept this from being high severity is that KCP is not enabled by default.</p>
 
 <h3>Round 11: three genuine findings</h3>

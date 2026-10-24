@@ -240,6 +240,13 @@ pub async fn serve(cfg: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<()
 pub fn preflight(cfg: &ServerConfig) -> Result<()> {
     // 与 `serve_with` 启动路径**同一份**校验，只是不绑端口、不拉 JWKS。
     crate::guard::SecurityContext::from_config(cfg)?;
+    // 限制①批次3：证书/私钥/CA 能否装载，必须在 --check 阶段就暴露，
+    // 不能等到真正 TLS 握手时才报错。
+    frp::tls::validate_server_tls_files(
+        &cfg.tls_cert_file,
+        &cfg.tls_key_file,
+        &cfg.tls_trusted_ca_file,
+    )?;
     Ok(())
 }
 
@@ -279,6 +286,13 @@ pub async fn serve_on_with(
     extras: ServeExtras,
 ) -> Result<()> {
     let addr = listener.local_addr().context("取不到监听地址")?;
+
+    // 限制①批次3：自定义证书 / mTLS。必须在任何 accept_server 之前安装。
+    frp::tls::configure_server_tls(
+        &cfg.tls_cert_file,
+        &cfg.tls_key_file,
+        &cfg.tls_trusted_ca_file,
+    )?;
 
     // 安全上下文：认证方式 / IP 白黑名单 / 角色权限 / 审计日志。
     //
@@ -1384,7 +1398,13 @@ async fn handle_control(
                         crate::p2p::handle_nat_hole_visitor(&registry, &client, &m).await?;
                     }
                     FrpMessage::NatHoleClient(m) => {
-                        debug!(proxy = %m.proxy_name, "收到 NatHoleClient（客户端侧不应下发），忽略");
+                        // 官方 frpc 的 provider 收到 NatHoleClient{sid} 后，
+                        // 会回一条带自己 mapped_addrs 的 NatHoleClient。
+                        // 这是打洞配对的关键一步，不能只记日志丢掉。
+                        if !crate::nathole_official::handle_client(&client, &m) {
+                            debug!(proxy = %m.proxy_name, sid = %m.sid,
+                                "收到无法配对的 NatHoleClient（会话不存在/已超时/不是该 provider）");
+                        }
                     }
                     FrpMessage::NatHoleReport(m) => {
                         debug!(sid = %m.sid, success = m.success, "收到 NatHoleReport");

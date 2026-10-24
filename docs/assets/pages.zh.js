@@ -1002,7 +1002,7 @@ PAGES_ZH['changes'] = `
 <div class="stats">
 <div class="stat"><div class="stat-value">10</div><div class="stat-label">轮审计</div></div>
 <div class="stat"><div class="stat-value">140</div><div class="stat-label">修复项</div></div>
-<div class="stat"><div class="stat-value">766</div><div class="stat-label">测试</div></div>
+<div class="stat"><div class="stat-value">785</div><div class="stat-label">测试</div></div>
 <div class="stat"><div class="stat-value">0</div><div class="stat-label">未修复高危</div></div>
 </div>
 
@@ -1023,7 +1023,8 @@ PAGES_ZH['changes'] = `
 <tr><td>十</td><td>v0.5.10</td><td>对已发布产物做全量复扫</td><td>0 新漏洞 / 8 处测试缺陷</td></tr>
 <tr><td>十一</td><td>v0.6.0</td><td>引入 Shannon 自主渗透测试器做外部复核</td><td>3 项（其余为对齐官方而保留）</td></tr>
 <tr><td>十二</td><td>v0.6.1</td><td>补齐面板管理操作的审计链</td><td>3 项</td></tr>
-<tr><td>十三</td><td>v0.6.3</td><td><strong>负载均衡 / KCP / 健康检查与官方 frp 对齐</strong></td><td>特性对齐 + 1 处调度缺陷</td></tr>
+<tr><td>十三</td><td>v0.6.4</td><td><strong>负载均衡 / KCP / 健康检查与官方 frp 对齐</strong></td><td>特性对齐 + 1 处调度缺陷</td></tr>
+<tr><td>十四</td><td>v0.6.4</td><td>外部渗透测试复核：HTTP 语义与安全响应头</td><td>3 项 + 1 处测试 flake</td></tr>
 </tbody>
 </table>
 </div>
@@ -1037,7 +1038,7 @@ PAGES_ZH['changes'] = `
 <p>上一版的发版总结自己写着"UDP 代理端口、xtcp 牵线 UDP、管理面板不在 ACL 内"。第九轮就把这三条全修了，实测证据是"只改源地址，配置完全相同"的对照实验。</p>
 
 <h3>第九轮：KCP 放大 312 倍（中危）</h3>
-<p>代码注释原本写着"1:1 占用，非放大"。实测发现那个算法<strong>只算了会话里堆的数据，漏掉了会话本身的开销</strong>：766 KB 上行能让内存涨 238 MB。<br>
+<p>代码注释原本写着"1:1 占用，非放大"。实测发现那个算法<strong>只算了会话里堆的数据，漏掉了会话本身的开销</strong>：785 KB 上行能让内存涨 238 MB。<br>
 修法是给会话表加 1024 条上限。真正让它不到高危的理由是 KCP 默认不启用。</p>
 
 <h3>第十一轮：三条真发现</h3>
