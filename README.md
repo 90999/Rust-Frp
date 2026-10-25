@@ -117,13 +117,12 @@ nfrp-common = "0.6"
 - 凭据比较统一走常量时间；HTTP 转发做逐跳头剥离、`Host` 规范化、CL+TE 走私拒绝
 - 面板与客户端本地界面**绑非回环地址却没有凭据时拒绝启动**（逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）
 
-完整修复清单见 [SECURITY-FIXES.md](SECURITY-FIXES.md)；
-第四轮（11 项）见 [SECURITY-FIXES-ROUND4.md](SECURITY-FIXES-ROUND4.md)；
-第五轮（39 项）见 [SECURITY-FIXES-ROUND5.md](SECURITY-FIXES-ROUND5.md)；
-第六轮（8 项）见 [SECURITY-FIXES-ROUND6.md](SECURITY-FIXES-ROUND6.md)；
-第七轮（13 项）见 [SECURITY-FIXES-ROUND7.md](SECURITY-FIXES-ROUND7.md)；
-第八轮（5 项）见 [SECURITY-FIXES-ROUND8.md](SECURITY-FIXES-ROUND8.md)；
-第十六轮（官方 0.71 兼容收尾 / NatHole / SSH 网关 / pprof / HTTP 插件）见
+所有安全修复已整合为一份文档（按日期编排、各轮原文完整收录）：
+
+**[SECURITY-ALL-FIXES.md](SECURITY-ALL-FIXES.md)** —— 第一 ~ 第十六轮，2026-10-04 至 2026-10-25
+
+各轮原始报告仍保留（SECURITY-FIXES-ROUND4..16.md），作为证据链引用；
+总文档里每一轮都标了日期与结论，并保留「实测复现 / 修复方式 / 回归测试」。
 [SECURITY-FIXES-ROUND16.md](SECURITY-FIXES-ROUND16.md)。
 
 ### 运维与调度
