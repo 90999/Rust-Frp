@@ -79,9 +79,9 @@ fn find_key_ci(t: &toml::Table, name: &str) -> Option<String> {
 /// 目标已存在时**保留目标值**（NFrp 原生写法优先），并丢弃来源键 ——
 /// 否则两套写法同时出现会让 serde 撞上 "duplicate field"。
 fn rename(t: &mut toml::Table, from: &str, to: &str) {
-    if from == to {
-        return;
-    }
+    // 即使 `from == to` 也要继续：官方 Go 的 JSON/TOML 解析对键名大小写
+    // 不敏感，`PprofEnable` 与 `pprofEnable` 等价。早退会让这种写法被
+    // serde 静默忽略（字段还在，值却是默认值）。
     let Some(actual) = find_key_ci(t, from) else {
         return;
     };
@@ -261,22 +261,10 @@ fn merge_local_addr(p: &mut toml::Table) {
 /// `tunnelProxy` / `udpMultiplexer` 这些字段（verify 直接回 `unknown field`）。
 /// 把它们列进来，会让用户以为"官方有而 NFrp 缺"，实际是两边都没有。
 const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
-    // ---- 数据面：最要紧的两个 ----
-    // 用户以为加密/压缩了，实际完全没生效（协议字段存在但配置层没暴露）
-    "useEncryption",
-    "useCompression",
-    // ---- 出站代理 ----
-    "proxyURL",
-    // ---- 认证 ----
-    // （`tokenSource` 已在 v0.6.5 实现，从清单移除）
-    // ---- 顶层 ----
-    // （`udpPacketSize` 已在 v0.6.6 实现，从清单移除）
-    "natHoleStunServer",
-    "dnsServer",
-    // （`includes` 已在 v0.6.5 实现，从清单移除）
-    // ---- 管理界面 ----
-    "pprofEnable",
-    "assetsDir",
+    // v0.6.6：官方 0.71 的客户端顶层 / 代理 / visitor 字段已全部落地。
+    // useEncryption、useCompression、proxyURL、tokenSource、udpPacketSize、
+    // natHoleStunServer、dnsServer、includes、pprofEnable、assetsDir 均已在
+    // 配置层与实际执行路径接通。
 ];
 
 /// 扫描一份配置里出现的、[`UNSUPPORTED_CLIENT_FIELDS`] 中的字段名。
@@ -302,21 +290,10 @@ pub fn unsupported_fields(root: &Value) -> Vec<String> {
 /// 维护规则同客户端清单：只放"官方 0.71 确认支持、且 NFrp 确实没实现"的，
 /// 实现后删掉。清单按官方 `frps_full_example.toml`（v0.71.0）逐项比对得出。
 const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
-    // 端口 / 监听
-    // （`quicBindPort` 已在 v0.6.5 实现，从清单移除）
-    // 传输层调优（`certFile` / `keyFile` / `trustedCaFile` 已在批次3实现）
-    // HTTP 虚拟主机（`vhostHTTPTimeout` / `custom404Page` 已实现）
-    // 面板 / 观测
-    "assetsDir",
-    "pprofEnable",
-    // （`enablePrometheus` 已在 v0.6.5 实现，从清单移除）
-    // 行为
-    // （`udpPacketSize` 已在 v0.6.6 实现，从清单移除）
-    "natholeAnalysisDataReserveHours",
-    // 认证（`tokenSource` 已在 v0.6.5 实现，从清单移除）
-    // 网关 / 插件
-    "sshTunnelGateway",
-    "httpPlugins",
+    // v0.6.6：官方 0.71 的 frps 顶层字段已全部落地。
+    // pprofEnable、natholeAnalysisDataReserveHours、sshTunnelGateway、
+    // httpPlugins 均已在配置层与执行路径接通。
+    // 唯一仍单独检测的是 `webServer.tls.*`（面板 HTTPS），见下方路径扫描。
 ];
 
 /// 从 **legacy INI 原文**里扫未实现字段（返回出现的原始键名）。
@@ -332,20 +309,8 @@ pub fn unsupported_fields_ini(text: &str) -> Vec<String> {
 pub fn unsupported_server_fields(root: &Value) -> Vec<String> {
     let mut found = Vec::new();
     collect_named(root, UNSUPPORTED_SERVER_FIELDS, &mut found);
-    // `certFile` / `keyFile` 已从全局清单移除（`transport.tls` 已实现），
-    // 但 `webServer.tls.*` 是**另一组**未实现字段（面板 HTTPS）。名字相同，
-    // 只能按路径补扫，否则会把“面板 TLS 没生效”静默吞掉。
-    if let Some(tls) = root
-        .get("webServer")
-        .and_then(|v| v.get("tls"))
-        .and_then(|v| v.as_table())
-    {
-        for key in ["certFile", "keyFile"] {
-            if tls.keys().any(|k| field_matches(key, k)) {
-                found.push(format!("webServer.tls.{key}"));
-            }
-        }
-    }
+    // 注意：`webServer.tls.certFile` / `keyFile` 已实现（面板 HTTPS），
+    // 不能再按路径补扫成“未实现”告警 —— 否则启动日志会和实际行为矛盾。
     found.sort();
     found.dedup();
     found
@@ -578,6 +543,14 @@ pub fn normalize_client(root: &mut toml::Value) {
             // 语义与落法见 config.rs 对应字段的文档）。
             ("dialServerKeepalive", "dial_server_keepalive"),
             ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            // ★ v0.6.6：数据面加密/压缩、出站代理、自定义 DNS。
+            // 官方 GetRealConn 读的是 pxy.baseCfg.Transport.*（客户端级），
+            // 所以这几项必须从 [transport] 提升到顶层，否则配了也不生效。
+            ("useEncryption", "useEncryption"),
+            ("useCompression", "useCompression"),
+            ("proxyURL", "proxyURL"),
+            ("dnsServer", "dnsServer"),
+            ("natHoleStunServer", "natHoleStunServer"),
         ],
     );
     hoist(
@@ -642,6 +615,9 @@ pub fn normalize_client(root: &mut toml::Value) {
             &[
                 ("bandwidthLimit", "bandwidth_limit"),
                 ("bandwidthLimitMode", "bandwidth_limit_mode"),
+                // ★ v0.6.6：数据面加密/压缩在官方的 [proxies.transport] 段里
+                ("useEncryption", "use_encryption"),
+                ("useCompression", "use_compression"),
             ],
         );
         hoist(
@@ -709,6 +685,16 @@ const SERVER_TOP: Renames = &[
     // 限制①批次1：数据面监听地址与"等用户连接配工作连接"的超时（官方顶层键）。
     ("proxyBindAddr", "proxy_bind_addr"),
     ("userConnTimeout", "user_conn_timeout"),
+    // 官方 0.71 新增的顶层键（serde 里已经是 camelCase，这里只是为了
+    // 折叠大小写：`PprofEnable` / `SSHTunnelGateway` 也要能读）。
+    ("assetsDir", "assetsDir"),
+    ("pprofEnable", "pprofEnable"),
+    (
+        "natholeAnalysisDataReserveHours",
+        "natholeAnalysisDataReserveHours",
+    ),
+    ("httpPlugins", "httpPlugins"),
+    ("sshTunnelGateway", "sshTunnelGateway"),
 ];
 
 /// 把一份服务端配置的键名从 frp 风格规范化成 NFrp 风格（原地修改）。
@@ -777,6 +763,11 @@ pub fn normalize_server(root: &mut toml::Value) {
             ("port", "dashboard_port"),
             ("user", "dashboard_user"),
             ("password", "dashboard_pwd"),
+            // 官方把静态资源与 pprof 开关也放在 [webServer] 下。
+            // 少这两行会静默忽略：用户以为开了 pprof / 换了面板，
+            // 实际一个字节都没变。
+            ("assetsDir", "assetsDir"),
+            ("pprofEnable", "pprofEnable"),
         ],
     );
 }
@@ -817,7 +808,10 @@ mod tests {
     /// `useEncryption` / `useCompression` 是最要紧的两个：用户以为加密了，
     /// 实际是明文。TOML 的 camelCase 写法必须能识别出来。
     #[test]
-    fn tom_能识别未实现的_use_encryption() {
+    fn tom_里_use_encryption_已经实现所以不再报未实现() {
+        // ★ v0.6.6：`useEncryption` / `useCompression` 已经真正实现了
+        // （数据面 AES-128-CFB + Snappy framing），所以它们**不该**再出现在
+        // "未实现字段"清单里 —— 否则会出现"说没实现而实际能用"的反向假警报。
         let raw = r#"
 serverAddr = "127.0.0.1"
 [[proxies]]
@@ -832,35 +826,27 @@ useCompression = true
 "#;
         let cfg = parse_client_toml(raw).unwrap();
         assert!(
-            cfg.unsupported_fields
-                .contains(&"useEncryption".to_string()),
-            "实际：{:?}",
+            cfg.unsupported_fields.is_empty(),
+            "实现之后不该再报未实现：{:?}",
             cfg.unsupported_fields
         );
-        assert!(cfg
-            .unsupported_fields
-            .contains(&"useCompression".to_string()));
+        // 值要真的落到配置里
+        assert!(cfg.proxies[0].use_encryption, "useEncryption 要读进来");
+        assert!(cfg.proxies[0].use_compression, "useCompression 要读进来");
     }
 
     /// 官方 legacy INI 用的是 snake_case（`use_encryption`），也要认。
     #[test]
-    fn ini能识别未实现的_use_encryption() {
-        let raw = r#"
-[common]
-server_addr = 127.0.0.1
-server_port = 7000
-
-[p]
-type = tcp
-local_ip = 127.0.0.1
-local_port = 22
-remote_port = 6000
-use_encryption = true
-"#;
+    fn ini_里_use_encryption_已经实现所以不再报未实现() {
+        // legacy INI 同理：`use_encryption` 现在会真的生效。
+        let raw = "\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\n\
+[ssh]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = 22\nremote_port = 6000\n\
+use_encryption = true\nuse_compression = true\n";
         let cfg = crate::config::parse_client(raw).unwrap();
         assert!(
-            cfg.unsupported_fields.iter().any(|f| f == "use_encryption"),
-            "实际：{:?}",
+            !cfg.unsupported_fields
+                .contains(&"use_encryption".to_string()),
+            "实现之后不该再报未实现：{:?}",
             cfg.unsupported_fields
         );
     }
@@ -1505,18 +1491,22 @@ enable = true
         assert!(cfg.tls_enable);
     }
 
-    /// "官方支持、NFrp 未实现"的字段识别也要折叠大小写 ——
-    /// 用户写 `PprofEnable`（官方照样认），NFrp 的告警就不能漏。
+    /// 已实现字段必须能读进来，且**不能**再被误报成“未实现”。
     ///
-    /// 注意这里挑的是**至今确实没实现**的字段；历史上换过几次主角：
-    /// `AllowPorts` / `ProxyBindAddr` / `QuicBindPort` 都实现了 ——
-    /// **凡实现的都要从清单里删掉**，否则会出现反向的假警报
-    /// （说"没实现"而实际能用）。
+    /// `PprofEnable` 是官方 `webServer.pprofEnable` 的顶层写法（老版本
+    /// frps 也认）；这里同时验证大小写不敏感。历史上 `AllowPorts` /
+    /// `ProxyBindAddr` / `QuicBindPort` 也当过这个测试的主角，实现后都应
+    /// 从“未实现”清单里删掉 —— 否则会出现反向的假警报。
     #[test]
-    fn 未实现字段识别也要折叠大小写() {
+    fn 已实现字段不再误报未实现且折叠大小写() {
         let text = "bindPort = 7000\nPprofEnable = true\n";
         let cfg = parse_server_toml(text).unwrap();
-        assert_eq!(cfg.unsupported_fields, vec!["PprofEnable".to_string()]);
+        assert!(cfg.pprof_enable);
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "PprofEnable 已实现，不应再报告未实现：{:?}",
+            cfg.unsupported_fields
+        );
     }
 
     /// ★ v0.6.5：`quicBindPort` 已实现 —— 必须能真正读进来，
@@ -1703,6 +1693,58 @@ tcpKeepalive = 444
         assert_eq!(cfg.tcp_keepalive, 0);
     }
 
+    /// 官方 0.71 新增的四个服务端字段：`pprofEnable`、
+    /// `natholeAnalysisDataReserveHours`、`[[httpPlugins]]`、
+    /// `[sshTunnelGateway]`。它们不只是“能解析”，还必须真的落到运行时字段。
+    #[test]
+    fn 官方071新增服务端字段全部读入() {
+        let raw = r#"
+bindAddr = "127.0.0.1"
+bindPort = 7000
+pprofEnable = true
+natholeAnalysisDataReserveHours = 12
+
+[[httpPlugins]]
+name = "auth"
+addr = "127.0.0.1:9000"
+path = "/handler"
+ops = ["Login", "NewProxy"]
+tlsVerify = true
+
+[sshTunnelGateway]
+bindPort = 2200
+privateKeyFile = "/tmp/host_key"
+autoGenPrivateKeyPath = "/tmp/autogen"
+authorizedKeysFile = "/tmp/authorized_keys"
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(cfg.pprof_enable);
+        assert_eq!(cfg.nathole_analysis_data_reserve_hours, 12);
+        assert_eq!(cfg.http_plugins.len(), 1);
+        assert_eq!(cfg.http_plugins[0].name, "auth");
+        assert_eq!(cfg.http_plugins[0].ops, vec!["Login", "NewProxy"]);
+        assert!(cfg.http_plugins[0].tls_verify);
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+        assert_eq!(
+            cfg.ssh_tunnel_gateway.authorized_keys_file,
+            "/tmp/authorized_keys"
+        );
+        assert!(cfg.unsupported_fields.is_empty());
+    }
+
+    /// `webServer.pprofEnable` 的旧写法（官方文档把它列在 `[webServer]` 下）
+    /// 也要 hoist 到顶层，且大小写不敏感。
+    #[test]
+    fn web_server_pprof_enable也能读() {
+        let cfg = parse_server_toml(
+            "bindPort = 7000\n[webServer]\nPprofEnable = true\nassetsDir = \"/srv/www\"\n",
+        )
+        .unwrap();
+        assert!(cfg.pprof_enable);
+        assert_eq!(cfg.assets_dir, "/srv/www");
+        assert!(cfg.unsupported_fields.is_empty());
+    }
+
     /// `proxyBindAddr` 留空时跟随 `bind_addr`（官方 `Complete()` 语义），
     /// 保证默认配置下行为与老版本完全一致。
     #[test]
@@ -1821,25 +1863,34 @@ enabled = false
     /// `transport.tls.certFile` 已实现，但 `webServer.tls.certFile` 没有；
     /// 两者同名，必须按路径区分，不能因为前者实现就把后者一起“洗白”。
     #[test]
-    fn 面板_tls_字段仍要报告未实现() {
+    fn 面板_tls_字段已经实现所以不再报未实现() {
+        // ★ v0.6.6：`webServer.tls.certFile` / `keyFile` 已经真正实现了
+        // （面板 HTTPS：rustls 包装 dashboard / client web 的监听器，
+        //   并在 HTTPS 响应上带 HSTS）。
+        //
+        // 这条测试原来断言"仍要报未实现" —— 实现之后必须反过来，
+        // 否则会出现"功能可用却告警说没实现"的反向假警报。
         let cfg = parse_server_toml(
             "[webServer.tls]\ncertFile = \"server.crt\"\nkeyFile = \"server.key\"\n",
         )
         .unwrap();
+
         assert!(
-            cfg.unsupported_fields
+            !cfg.unsupported_fields
                 .iter()
-                .any(|f| f == "webServer.tls.certFile"),
-            "实际：{:?}",
+                .any(|f| f.starts_with("webServer.tls.")),
+            "实现之后不该再报未实现：{:?}",
             cfg.unsupported_fields
         );
-        assert!(
-            cfg.unsupported_fields
-                .iter()
-                .any(|f| f == "webServer.tls.keyFile"),
-            "实际：{:?}",
-            cfg.unsupported_fields
-        );
+
+        // 而且值要真的落到配置里（不是"不报错但也没读进去"）
+        let (cert, key) = cfg
+            .web_tls()
+            .files()
+            .expect("cert/key 成对，不该报错")
+            .expect("两个都配了，应当有值");
+        assert_eq!(cert, "server.crt");
+        assert_eq!(key, "server.key");
     }
 
     /// Stage 5 降级（Phaedra 不可得）：定向变异，只要求**不 panic**。

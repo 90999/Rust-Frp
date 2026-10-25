@@ -23,6 +23,7 @@ pub mod pool;
 pub mod registry;
 pub mod reload;
 pub mod serve;
+pub mod ssh_gateway;
 pub mod udp_proxy;
 pub mod vhost;
 pub mod visitor;

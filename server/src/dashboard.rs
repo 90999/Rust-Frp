@@ -9,10 +9,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(test)]
+use tokio::net::TcpStream;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
 };
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use crate::{
@@ -48,11 +51,11 @@ const METRIC_PREFIX: &str = "nfrp";
 /// | `Referrer-Policy: no-referrer` | 面板 URL 不通过 `Referer` 泄露给外部站点 |
 /// | `Content-Security-Policy` | 只允许内联样式与脚本（面板是单文件 HTML，没有外部资源），禁止一切外域加载与 `frame-ancestors` |
 ///
-/// # 为什么不用 HSTS
+/// # HSTS
 ///
-/// 面板默认是**明文 HTTP**。对明文响应发 `Strict-Transport-Security`
-/// 会被浏览器**直接忽略**（RFC 6797 §7.2），发了也没用；更糟的是会让人
-/// 误以为"已经上 HTTPS 了"。等面板自己支持 TLS 之后再按需加。
+/// 面板现在支持 `[webServer.tls]`。HSTS 头在 HTTPS 响应上生效；如果仍是
+/// 明文 HTTP，浏览器按 RFC 6797 §7.2 会忽略它，因此统一发送不会把 HTTP
+/// 伪装成 HTTPS，也不会改变 HTTP 的行为。
 ///
 /// # CSP 的取舍
 ///
@@ -64,6 +67,10 @@ const SEC_HEADERS: &[(&str, &str)] = &[
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "no-referrer"),
+    (
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+    ),
     (
         "Content-Security-Policy",
         "default-src 'none'; script-src 'unsafe-inline'; \
@@ -90,17 +97,29 @@ const MAX_DASHBOARD_CONNS: usize = 128;
 /// （slowloris）—— 而面板与业务同进程，会连带拖累业务。
 const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 启动面板服务。
+/// 启动面板服务（明文 HTTP，保留给测试和旧调用方）。
 pub async fn run(
     listener: TcpListener,
     registry: Arc<Registry>,
     auth: DashboardAuth,
     cfg: Arc<ServerConfig>,
 ) {
+    run_with_tls(listener, registry, auth, cfg, None).await
+}
+
+/// [`run`] 的 TLS 版本。`tls = Some(..)` 时监听器只接受 HTTPS。
+pub async fn run_with_tls(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    auth: DashboardAuth,
+    cfg: Arc<ServerConfig>,
+    tls: Option<TlsAcceptor>,
+) {
     let addr = listener.local_addr().ok();
     tracing::info!(
-        "面板已启动：{}  （/ 面板、/metrics 指标、/api/status 状态）",
-        addr.map(|a| a.to_string()).unwrap_or_default()
+        "面板已启动：{}  （/ 面板、/metrics 指标、/api/status 状态，{}）",
+        addr.map(|a| a.to_string()).unwrap_or_default(),
+        if tls.is_some() { "HTTPS" } else { "HTTP" }
     );
     // 并发闸门：拿不到许可就直接关掉这条连接（不回 503 —— 那还要多写一次，
     // 而洪水场景下我们连写都不想写）。
@@ -167,10 +186,30 @@ pub async fn run(
                 let registry = registry.clone();
                 let auth = auth.clone();
                 let cfg = cfg.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
                     // permit 随任务存活，任务结束即归还
                     let _permit = permit;
-                    if let Err(e) = handle(stream, peer, registry, auth, cfg).await {
+                    let result = match tls {
+                        Some(acceptor) => {
+                            // 与主控制端口一致：TLS 握手也要有上限，防止慢速
+                            // ClientHello 占满面板闸门。
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    handle(tls_stream, peer, registry, auth, cfg).await
+                                }
+                                Ok(Err(e)) => Err(anyhow::anyhow!("面板 TLS 握手失败：{e}")),
+                                Err(_) => Err(anyhow::anyhow!("面板 TLS 握手超时")),
+                            }
+                        }
+                        None => handle(stream, peer, registry, auth, cfg).await,
+                    };
+                    if let Err(e) = result {
                         debug!(%peer, "面板连接结束：{e:#}");
                     }
                 });
@@ -183,13 +222,16 @@ pub async fn run(
     }
 }
 
-async fn handle(
-    mut stream: TcpStream,
+async fn handle<S>(
+    mut stream: S,
     peer: SocketAddr,
     registry: Arc<Registry>,
     auth: DashboardAuth,
     cfg: Arc<ServerConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 读到"请求头结束"为止，如果带了 `Content-Length`，还要把**请求体读全**。
     //
     // 只按 `\r\n\r\n` 收尾是不够的，会踩两个坑：
@@ -419,6 +461,94 @@ async fn handle(
 
     let snapshot = registry.observ.snapshot();
     match path.as_str() {
+        // 官方 frps 的 `webServer.pprofEnable`：在面板监听器上挂 Go pprof。
+        // Rust 侧用 pprof-rs 输出同格式的 protobuf，路径与参数保持一致。
+        "/debug/pprof" | "/debug/pprof/" => {
+            if !cfg.effective_pprof_enable() {
+                send(
+                    &mut stream,
+                    404,
+                    "text/plain; charset=utf-8",
+                    b"pprof disabled: set webServer.pprofEnable = true\n",
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            } else {
+                send(
+                    &mut stream,
+                    200,
+                    "text/plain; charset=utf-8",
+                    b"GET /debug/pprof/profile?seconds=N\n",
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            }
+        }
+        "/debug/pprof/profile" => {
+            if !cfg.effective_pprof_enable() {
+                send(
+                    &mut stream,
+                    404,
+                    "text/plain; charset=utf-8",
+                    b"pprof disabled: set webServer.pprofEnable = true\n",
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            } else {
+                let secs = nfrp_common::pprof_http::parse_seconds(&query);
+                // 采集是阻塞的（pprof guard 在 drop 时收尾），必须离开 async
+                // 执行器；否则一个 60 秒的请求会把整块 worker 占死。
+                match tokio::task::spawn_blocking(move || {
+                    nfrp_common::pprof_http::capture_cpu_profile(secs)
+                })
+                .await
+                {
+                    Ok(Ok(body)) => {
+                        send(
+                            &mut stream,
+                            200,
+                            "application/octet-stream",
+                            &body,
+                            SEC_HEADERS,
+                            head_only,
+                        )
+                        .await?;
+                    }
+                    Ok(Err(e)) => {
+                        let text = format!("pprof failed: {e:#}\n");
+                        let code = if text.contains("only supported on Unix") {
+                            501
+                        } else {
+                            500
+                        };
+                        send(
+                            &mut stream,
+                            code,
+                            "text/plain; charset=utf-8",
+                            text.as_bytes(),
+                            SEC_HEADERS,
+                            head_only,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        let text = format!("pprof task failed: {e}\n");
+                        send(
+                            &mut stream,
+                            500,
+                            "text/plain; charset=utf-8",
+                            text.as_bytes(),
+                            SEC_HEADERS,
+                            head_only,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
         "/metrics" => {
             // ★ v0.6.5（对齐官方 frps 的 `enablePrometheus`）：
             //   官方默认**不开**这个端点，配了 `enablePrometheus = true` 才有
@@ -468,28 +598,43 @@ async fn handle(
             .await?;
         }
         "/" | "/index.html" | "/dashboard" => {
-            let body = html_page();
-            send(
-                &mut stream,
-                200,
-                "text/html; charset=utf-8",
-                body.as_bytes(),
-                SEC_HEADERS,
-                head_only,
-            )
-            .await?;
+            // ★ v0.6.6（对齐官方 frps 的 `webServer.assetsDir`）：
+            // 配了目录就优先用里面的 index.html，否则用内嵌的那份。
+            match load_asset(cfg.effective_assets_dir(), "index.html") {
+                Some((body, ctype)) => {
+                    send(&mut stream, 200, ctype, &body, SEC_HEADERS, head_only).await?;
+                }
+                None => {
+                    let body = html_page();
+                    send(
+                        &mut stream,
+                        200,
+                        "text/html; charset=utf-8",
+                        body.as_bytes(),
+                        SEC_HEADERS,
+                        head_only,
+                    )
+                    .await?;
+                }
+            }
         }
         other => {
-            let body = format!("404 Not Found: {other}\n");
-            send(
-                &mut stream,
-                404,
-                "text/plain; charset=utf-8",
-                body.as_bytes(),
-                SEC_HEADERS,
-                head_only,
-            )
-            .await?;
+            // 配了 assets_dir 时，其余路径也当作静态资源找一遍
+            // （面板换皮通常还带 css/js/图片）。找不到才 404。
+            if let Some((body, ctype)) = load_asset(cfg.effective_assets_dir(), other) {
+                send(&mut stream, 200, ctype, &body, SEC_HEADERS, head_only).await?;
+            } else {
+                let body = format!("404 Not Found: {other}\n");
+                send(
+                    &mut stream,
+                    404,
+                    "text/plain; charset=utf-8",
+                    body.as_bytes(),
+                    SEC_HEADERS,
+                    head_only,
+                )
+                .await?;
+            }
         }
     }
     debug!(%peer, %method, %path, "面板请求已处理");
@@ -692,14 +837,17 @@ const fn concat_headers_allow() -> [(&'static str, &'static str); SEC_HEADERS.le
 ///
 /// `Content-Length` **仍然按真实 body 长度发送** —— 这正是 HEAD 的语义：
 /// 告诉对端 GET 会拿到多少字节，但不真的发。
-async fn send(
-    stream: &mut TcpStream,
+async fn send<S>(
+    stream: &mut S,
     code: u16,
     content_type: &str,
     body: &[u8],
     extra: &[(&str, &str)],
     head_only: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
@@ -790,6 +938,89 @@ fn status_json(registry: &Registry, snap: &Snapshot) -> String {
 }
 
 /// 面板页面：纯静态 HTML + 一点 JS 轮询 `/api/status`。
+/// 从 `assets_dir` 里取一个静态文件；返回 `(内容, MIME)`。
+///
+/// `rel` 是请求路径（可能带前导 `/`）。返回 `None` 表示"没有这个文件"，
+/// 由调用方回退到内嵌面板 / 404。
+///
+/// # 安全：三道防线
+///
+/// 1. `assets_dir` 为空 ⇒ 直接返回 `None`（默认行为，一个字节都不多读）；
+/// 2. 把 `rel` 里的 `..` / 绝对路径段挡掉 —— 光靠 `canonicalize` 不够，
+///    Windows 上 `..\\` 与 `..%5c` 都可能是穿越向量；
+/// 3. `canonicalize` 之后**再确认结果仍在 assets_dir 之内** ——
+///    这一步才真正挡住符号链接把根指到目录外。
+fn load_asset(assets_dir: &str, rel: &str) -> Option<(Vec<u8>, &'static str)> {
+    if assets_dir.trim().is_empty() {
+        return None;
+    }
+
+    // 只保留正常的路径段；任何 `..` 或盘符直接拒
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in rel.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." || seg.contains(':') {
+            return None;
+        }
+        parts.push(seg);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+
+    let root = std::path::Path::new(assets_dir);
+    let mut full = root.to_path_buf();
+    for p in &parts {
+        full.push(p);
+    }
+
+    // ② 解析真实路径，并确认没有跑出根目录
+    let canon_root = root.canonicalize().ok()?;
+    let canon_full = full.canonicalize().ok()?;
+    if !canon_full.starts_with(&canon_root) {
+        tracing::warn!(
+            assets_dir,
+            requested = rel,
+            "静态资源路径越出 assets_dir，已拒绝"
+        );
+        return None;
+    }
+    if !canon_full.is_file() {
+        return None;
+    }
+
+    let body = std::fs::read(&canon_full).ok()?;
+    Some((body, mime_of(&canon_full)))
+}
+
+/// 按扩展名给 MIME。认不出来的按二进制流 —— 宁可让浏览器下载，
+/// 也不要把未知内容当 HTML 渲染（那是 XSS 面）。
+fn mime_of(p: &std::path::Path) -> &'static str {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("txt") | Some("map") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
 fn html_page() -> String {
     r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1363,29 +1594,209 @@ Authorization: Basic ",
 
     /// 起一个真实面板，返回监听地址。测完不用管，测试进程退出即回收。
     async fn spawn_dashboard() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        spawn_dashboard_with(false).await
+        spawn_dashboard_cfg(ServerConfig::default()).await
     }
 
     /// 同上，但可以指定 `enable_prometheus`（v0.6.5）。
     async fn spawn_dashboard_with(prometheus: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_dashboard_cfg(ServerConfig {
+            enable_prometheus: prometheus,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// 起一个配了 `assets_dir` 的面板（v0.6.6）。
+    async fn spawn_dashboard_with_assets(
+        assets_dir: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_dashboard_cfg(ServerConfig {
+            assets_dir: assets_dir.to_string(),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// 面板块的真实监听循环，配置由调用方给，避免每个新字段都复制一段 accept。
+    async fn spawn_dashboard_cfg(cfg: ServerConfig) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑端口");
         let addr = listener.local_addr().unwrap();
         let registry = Arc::new(Registry::unlimited());
         let auth: DashboardAuth = Arc::new(RwLock::new(Some(("u".into(), "p".into()))));
+        let cfg = Arc::new(cfg);
         let h = tokio::spawn(async move {
             while let Ok((stream, peer)) = listener.accept().await {
                 let registry = registry.clone();
                 let auth = auth.clone();
+                let cfg = cfg.clone();
                 tokio::spawn(async move {
-                    let cfg = Arc::new(ServerConfig {
-                        enable_prometheus: prometheus,
-                        ..Default::default()
-                    });
                     let _ = handle(stream, peer, registry, auth, cfg).await;
                 });
             }
         });
         (addr, h)
+    }
+
+    /// 真实 HTTPS 面板：自签证书 + rustls 客户端，验证 200 与 HSTS。
+    #[tokio::test]
+    async fn web_server_tls_真实_https_和_hsts() {
+        let dir = std::env::temp_dir().join(format!("nfrp-web-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let tls = nfrp_common::frp::tls::server_config_from_pem_with_ca(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            "",
+        )
+        .expect("加载自签证书");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Registry::unlimited());
+        let auth: DashboardAuth = Arc::new(RwLock::new(Some(("u".into(), "p".into()))));
+        let h = tokio::spawn(run_with_tls(
+            listener,
+            registry,
+            auth,
+            Arc::new(ServerConfig::default()),
+            Some(TlsAcceptor::from(tls)),
+        ));
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await.expect("TLS 握手");
+        tls.write_all(b"GET /api/healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tls.read(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 200"), "实际响应：{text}");
+        assert!(
+            text.contains("strict-transport-security: max-age=31536000"),
+            "HTTPS 必须带 HSTS：{text}"
+        );
+        h.abort();
+    }
+
+    // ==================================================================
+    // v0.6.6：`assetsDir`（面板静态资源目录）
+    // ==================================================================
+
+    /// 造一个临时资源目录。
+    fn tmp_assets(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nfrp-assets-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 没配目录时**一个字节都不多读**（默认行为不变）。
+    #[test]
+    fn assets_dir_为空时不读文件() {
+        assert!(load_asset("", "index.html").is_none());
+        assert!(load_asset("   ", "index.html").is_none());
+    }
+
+    /// 正常读取，并按扩展名给 MIME。
+    #[test]
+    fn assets_dir_能读文件且_mime_正确() {
+        let d = tmp_assets("ok");
+        std::fs::write(d.join("index.html"), b"<h1>hi</h1>").unwrap();
+        std::fs::write(d.join("app.css"), b"body{}").unwrap();
+        std::fs::write(d.join("blob.bin"), b"\x00\x01").unwrap();
+
+        let dir = d.to_string_lossy().into_owned();
+        let (body, ctype) = load_asset(&dir, "/index.html").expect("index.html 应当读到");
+        assert_eq!(body, b"<h1>hi</h1>");
+        assert!(ctype.starts_with("text/html"));
+
+        let (_, ctype) = load_asset(&dir, "/app.css").expect("app.css 应当读到");
+        assert!(ctype.starts_with("text/css"));
+
+        // 未知扩展名按二进制（不要把未知内容当 HTML 渲染，那是 XSS 面）
+        let (_, ctype) = load_asset(&dir, "/blob.bin").expect("blob.bin 应当读到");
+        assert_eq!(ctype, "application/octet-stream");
+
+        // 不存在的文件
+        assert!(load_asset(&dir, "/nope.html").is_none());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ 目录穿越必须被挡：`../`、绝对路径、盘符一律拒。
+    #[test]
+    fn assets_dir_挡住目录穿越() {
+        let d = tmp_assets("trav");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("index.html"), b"ok").unwrap();
+        // 在**父目录**放一个秘密文件，穿越成功就能读到它
+        let parent = d
+            .parent()
+            .unwrap()
+            .join(format!("nfrp-secret-{}.txt", std::process::id()));
+        std::fs::write(&parent, b"TOP-SECRET").unwrap();
+
+        let dir = d.to_string_lossy().into_owned();
+
+        for evil in [
+            "../nfrp-secret-1.txt",
+            "/../index.html/../../etc/passwd",
+            "..",
+            "sub/../../x",
+            "C:\\Windows\\win.ini",
+            "..\\..\\etc\\passwd",
+        ] {
+            assert!(
+                load_asset(&dir, evil).is_none(),
+                "穿越路径 [{evil}] 必须被拒，绝不能读到目录外的东西"
+            );
+        }
+
+        // 子目录里的正常文件仍可读
+        std::fs::write(d.join("sub/a.js"), b"1").unwrap();
+        assert!(load_asset(&dir, "/sub/a.js").is_some(), "子目录内应可读");
+
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    /// 配了 assets_dir 时，`/` 返回目录里的 index.html；没配则用内嵌 HTML。
+    #[tokio::test]
+    async fn assets_dir_影响面板首页() {
+        let d = tmp_assets("home");
+        std::fs::write(d.join("index.html"), b"<h1>custom panel</h1>").unwrap();
+        let dir = d.to_string_lossy().into_owned();
+
+        let (addr, _h) = spawn_dashboard_with_assets(&dir).await;
+        let resp = http_req(addr, "GET", "/", Some(("u", "p"))).await;
+        assert!(resp.contains("custom panel"), "应当返回自定义面板：{resp}");
+        // 安全头仍在
+        assert!(resp.to_ascii_lowercase().contains("x-frame-options: deny"));
+
+        // 换成空目录 ⇒ 回退到内嵌面板
+        let empty = tmp_assets("home-empty");
+        let (addr2, _h2) = spawn_dashboard_with_assets(&empty.to_string_lossy()).await;
+        let resp2 = http_req(addr2, "GET", "/", Some(("u", "p"))).await;
+        assert!(
+            resp2.contains("<!DOCTYPE html>") || resp2.contains("<html"),
+            "空目录应当回退到内嵌面板：{}",
+            &resp2[..resp2.len().min(120)]
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     /// ★ v0.6.5：`/metrics` 默认关闭时返回 404，并提示怎么开。
@@ -1552,6 +1963,99 @@ Authorization: Basic ",
             resp.to_ascii_lowercase().contains("x-frame-options: deny"),
             "401 同样要带安全头：{resp}"
         );
+    }
+
+    /// `webServer.pprofEnable` 默认关闭时必须真的是 404，而不是只把字段读进来；
+    /// 打开后索引页可用，且 HEAD 不返回 body。
+    #[tokio::test]
+    async fn pprof_disabled_is_404_and_index_when_enabled_is_200() {
+        let (addr, _h) = spawn_dashboard().await;
+        for path in [
+            "/debug/pprof",
+            "/debug/pprof/",
+            "/debug/pprof/profile?seconds=1",
+        ] {
+            let resp = http_req(addr, "GET", path, Some(("u", "p"))).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 404"),
+                "默认关闭必须是 404：{resp}"
+            );
+            assert!(
+                resp.contains("pprof disabled"),
+                "错误要说清怎么打开：{resp}"
+            );
+        }
+
+        let (addr, _h) = spawn_dashboard_cfg(ServerConfig {
+            pprof_enable: true,
+            ..Default::default()
+        })
+        .await;
+        for path in ["/debug/pprof", "/debug/pprof/"] {
+            let resp = http_req(addr, "GET", path, Some(("u", "p"))).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "打开后索引页应 200：{resp}"
+            );
+            assert!(
+                resp.contains("GET /debug/pprof/profile?seconds=N"),
+                "{resp}"
+            );
+        }
+        let head = http_req(addr, "HEAD", "/debug/pprof", Some(("u", "p"))).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            head.split("\r\n\r\n").nth(1).unwrap_or(""),
+            "",
+            "HEAD 不能返回索引 body：{head}"
+        );
+    }
+
+    /// Windows 没有 perf signal/`ucontext_t`，端点必须明确 501，不能 500 或挂住。
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn pprof_profile_on_windows_is_501() {
+        let (addr, _h) = spawn_dashboard_cfg(ServerConfig {
+            pprof_enable: true,
+            ..Default::default()
+        })
+        .await;
+        let resp = http_req(
+            addr,
+            "GET",
+            "/debug/pprof/profile?seconds=1",
+            Some(("u", "p")),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
+        assert!(resp.contains("only supported on Unix"), "{resp}");
+    }
+
+    /// Unix 上真正跑一次 1 秒 CPU profile，验证 200 + protobuf 二进制响应，
+    /// 而不是只验证路由分支。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pprof_profile_on_unix_returns_protobuf() {
+        let (addr, _h) = spawn_dashboard_cfg(ServerConfig {
+            pprof_enable: true,
+            ..Default::default()
+        })
+        .await;
+        let resp = http_req(
+            addr,
+            "GET",
+            "/debug/pprof/profile?seconds=1",
+            Some(("u", "p")),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            resp.to_ascii_lowercase()
+                .contains("content-type: application/octet-stream"),
+            "{resp}"
+        );
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(!body.is_empty(), "profile body 不能为空：{resp}");
     }
 
     /// 安全头常量本身要合理：不能为空、不能有重复名。

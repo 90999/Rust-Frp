@@ -38,9 +38,11 @@ use nfrp_common::{
     http1, util,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
     sync::{mpsc, oneshot},
 };
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::{health, registry::ProxyTable, store::Store, ClientSession, ServerLink};
@@ -245,9 +247,16 @@ fn proxy_name_of(body: &str) -> Result<String, String> {
 /// 调用方负责在 `[webServer] port != 0` 时才调用它 —— 函数本身不做判断，
 /// 免得"要不要监听"这件事有两个地方各判一次。
 pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
+    run_with_tls(listener, hub, None).await
+}
+
+/// [`run`] 的 TLS 版本。`tls = Some(..)` 时只接受 HTTPS。
+pub async fn run_with_tls(listener: TcpListener, hub: Arc<Hub>, tls: Option<TlsAcceptor>) {
     let addr = listener.local_addr().ok();
+    let secure = tls.is_some();
     info!(
-        "客户端管理界面已启动：http://{}/  （/api/status 状态、/api/proxies 代理表）",
+        "客户端管理界面已启动：{}://{}/  （/api/status 状态、/api/proxies 代理表）",
+        if secure { "https" } else { "http" },
         addr.map(|a| a.to_string()).unwrap_or_default()
     );
     let user = hub.cfg.web_server.user.trim();
@@ -272,8 +281,22 @@ pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let hub = hub.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, peer, hub).await {
+                    let result = match tls {
+                        Some(acceptor) => match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => handle(s, peer, hub, true).await,
+                            Ok(Err(e)) => Err(anyhow::anyhow!("客户端管理界面 TLS 握手失败：{e}")),
+                            Err(_) => Err(anyhow::anyhow!("客户端管理界面 TLS 握手超时")),
+                        },
+                        None => handle(stream, peer, hub, false).await,
+                    };
+                    if let Err(e) = result {
                         debug!(%peer, "客户端管理界面连接结束：{e:#}");
                     }
                 });
@@ -312,7 +335,18 @@ use nfrp_common::util::is_loopback_addr;
 pub(crate) struct Decision {
     pub code: u16,
     pub ctype: &'static str,
-    pub body: String,
+    /// 用字节而不是 `String`：pprof 输出是 protobuf，不保证是合法 UTF-8。
+    pub body: Vec<u8>,
+}
+
+impl Decision {
+    fn text(code: u16, ctype: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            code,
+            ctype,
+            body: body.into().into_bytes(),
+        }
+    }
 }
 
 /// 纯逻辑：给定一条已解析的请求，算出该回什么。**不碰 socket。**
@@ -331,25 +365,20 @@ async fn decide(hub: &Arc<Hub>, req: &http1::Request, peer: SocketAddr) -> Decis
     // 而它只回一个 "ok"，泄露的信息量为零。
     if path == HEALTHZ_PATH {
         if method != "GET" && method != "HEAD" {
-            return Decision {
-                code: 405,
-                ctype: CT_JSON,
-                body: err_body("method_not_allowed", "只支持 GET"),
-            };
+            return Decision::text(405, CT_JSON, err_body("method_not_allowed", "只支持 GET"));
         }
-        return Decision {
-            code: 200,
-            ctype: "text/plain; charset=utf-8",
-            body: "ok\n".to_string(),
-        };
+        return Decision::text(200, "text/plain; charset=utf-8", "ok\n");
     }
 
     if let Some(body) = auth_failure(hub, req) {
-        return Decision {
-            code: 401,
-            ctype: CT_JSON,
-            body,
-        };
+        return Decision::text(401, CT_JSON, body);
+    }
+
+    // pprof 必须在鉴权之后；输出是二进制，不能走下面的 `route -> String`。
+    if method == "GET" || method == "HEAD" {
+        if let Some(d) = pprof_decision(hub, req).await {
+            return d;
+        }
     }
 
     // ---- CSRF / DNS rebinding 防线 ----
@@ -378,34 +407,94 @@ async fn decide(hub: &Arc<Hub>, req: &http1::Request, peer: SocketAddr) -> Decis
         for origin in req.headers_all("origin") {
             if !origin_is_local(&origin) {
                 debug!(%peer, origin, "拒绝跨站写请求");
-                return Decision {
-                    code: 403,
-                    ctype: CT_JSON,
-                    body: err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
-                };
+                return Decision::text(
+                    403,
+                    CT_JSON,
+                    err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
+                );
             }
         }
         if req.header(CSRF_HEADER).is_none() {
             debug!(%peer, %method, %path, "拒绝缺少防伪头的写请求");
-            return Decision {
-                code: 403,
-                ctype: CT_JSON,
-                body: err_body(
+            return Decision::text(
+                403,
+                CT_JSON,
+                err_body(
                     "forbidden",
                     &format!("写操作必须带 {CSRF_HEADER} 头（防止网页盲打本地接口）"),
                 ),
-            };
+            );
         }
     }
 
     let (code, ctype, body) = route(hub, method, path, req).await;
-    Decision { code, ctype, body }
+    Decision::text(code, ctype, body)
 }
 
-async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyhow::Result<()> {
+/// `webServer.pprofEnable`：客户端管理界面上的 CPU profile。
+///
+/// 返回 `None` 表示这不是 pprof 路径，继续走普通路由。
+async fn pprof_decision(hub: &Arc<Hub>, req: &http1::Request) -> Option<Decision> {
+    let path = req.path.as_str();
+    if path != "/debug/pprof" && path != "/debug/pprof/" && path != "/debug/pprof/profile" {
+        return None;
+    }
+    if !hub.cfg.web_server.pprof_enable {
+        return Some(Decision::text(
+            404,
+            "text/plain; charset=utf-8",
+            "pprof disabled: set webServer.pprofEnable = true\n",
+        ));
+    }
+    if path != "/debug/pprof/profile" {
+        return Some(Decision::text(
+            200,
+            "text/plain; charset=utf-8",
+            "GET /debug/pprof/profile?seconds=N\n",
+        ));
+    }
+
+    let secs = nfrp_common::pprof_http::parse_seconds(&req.query);
+    match tokio::task::spawn_blocking(move || nfrp_common::pprof_http::capture_cpu_profile(secs))
+        .await
+    {
+        Ok(Ok(body)) => Some(Decision {
+            code: 200,
+            ctype: "application/octet-stream",
+            body,
+        }),
+        Ok(Err(e)) => {
+            let text = format!("pprof failed: {e:#}\n");
+            let code = if text.contains("only supported on Unix") {
+                501
+            } else {
+                500
+            };
+            Some(Decision::text(code, "text/plain; charset=utf-8", text))
+        }
+        Err(e) => Some(Decision::text(
+            500,
+            "text/plain; charset=utf-8",
+            format!("pprof task failed: {e}\n"),
+        )),
+    }
+}
+
+async fn handle<S>(mut stream: S, peer: SocketAddr, hub: Arc<Hub>, hsts: bool) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let req = http1::read_request(&mut stream).await?;
     let d = decide(&hub, &req, peer).await;
-    http1::send(&mut stream, d.code, d.ctype, d.body.as_bytes(), &[]).await?;
+    let extra: &[(&str, &str)] = if hsts {
+        &[(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )]
+    } else {
+        &[]
+    };
+    http1::send(&mut stream, d.code, d.ctype, &d.body, extra).await?;
     debug!(%peer, method = %req.method, path = %req.path, code = d.code, "客户端管理界面请求已处理");
     Ok(())
 }
@@ -490,6 +579,9 @@ async fn route(
                 "/api/proxies/add",
                 "/api/proxies/remove",
                 "/api/stop",
+                "/debug/pprof",
+                "/debug/pprof/",
+                "/debug/pprof/profile",
             ];
             if KNOWN.contains(&path) {
                 (
@@ -844,7 +936,11 @@ mod tests {
     use super::*;
 
     fn hub_with(proxies: ProxyTable) -> Arc<Hub> {
-        let cfg = Arc::new(ClientConfig::default());
+        hub_with_cfg(proxies, ClientConfig::default())
+    }
+
+    fn hub_with_cfg(proxies: ProxyTable, cfg: ClientConfig) -> Arc<Hub> {
+        let cfg = Arc::new(cfg);
         let store = Arc::new(Store::from_config(&cfg).expect("默认配置不落盘"));
         let health = health::Monitor::start(&cfg);
         let (_tx, rx) = tokio::sync::watch::channel::<Option<Arc<ClientSession>>>(None);
@@ -945,7 +1041,7 @@ mod tests {
             http1::reason(d.code),
             d.ctype,
             d.body.len(),
-            d.body
+            String::from_utf8_lossy(&d.body)
         )
     }
     #[test]
@@ -1333,5 +1429,29 @@ mod tests {
             auth_failure(&hub, &req(&bad)).is_some(),
             "密码不对必须拒 —— 只比用户名等于把界面敞开"
         );
+    }
+
+    #[tokio::test]
+    async fn pprof_默认关闭时返回_404() {
+        let hub = hub_with(ProxyTable::default());
+        let resp =
+            decide_over_raw(hub, "GET /debug/pprof/profile HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        assert!(resp.contains("pprof disabled"), "{resp}");
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn pprof_windows_启用时明确返回_501() {
+        let mut cfg = ClientConfig::default();
+        cfg.web_server.pprof_enable = true;
+        let hub = hub_with_cfg(ProxyTable::default(), cfg);
+        let resp = decide_over_raw(
+            hub,
+            "GET /debug/pprof/profile?seconds=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
+        assert!(resp.contains("only supported on Unix"), "{resp}");
     }
 }

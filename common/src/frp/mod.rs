@@ -77,6 +77,7 @@ pub mod crypto;
 pub mod kcp;
 pub mod msg;
 pub mod mux;
+pub mod proxy_stream;
 pub mod quic;
 pub mod sni;
 pub mod stream;

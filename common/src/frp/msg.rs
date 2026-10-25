@@ -579,6 +579,12 @@ impl NewProxy {
             // ★ 官方 frpc 的 `MarshalToMsg`：`m.Annotations = c.Annotations`
             //   （基础代理配置对所有类型都带）—— 只透传，不解读。
             annotations: p.annotations.clone(),
+            // ★ 数据面开关必须上报：服务端靠它决定要不要解密/解压。
+            //
+            // 漏传的后果是最难查的那种：客户端加密了、服务端当明文
+            // 透传，用户看到“能连上但数据全乱”。实测就是这样发现的。
+            use_encryption: p.use_encryption,
+            use_compression: p.use_compression,
             ..Default::default()
         };
 

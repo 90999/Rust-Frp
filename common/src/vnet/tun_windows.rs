@@ -663,10 +663,20 @@ mod tests {
         assert!(prefix_to_mask("abc").is_none());
     }
 
+    /// 两个测试都会改进程级的 `NFRP_WINTUN_DLL`，cargo test 默认并行跑，
+    /// 不串行就会互相把对方的路径覆盖掉。这里只锁测试，不锁生产路径。
+    fn dll_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 没装 wintun.dll 时，错误信息必须**可操作**（含下载地址与放置位置），
     /// 而不是一句加载失败。
     #[test]
     fn 缺少_dll_时报错要可操作() {
+        let _l = dll_env_lock();
         // 用一个一定不存在的路径逼出失败分支
         std::env::set_var("NFRP_WINTUN_DLL", r"Z:\definitely\no\such\wintun.dll");
         let e = match WintunApi::load() {
@@ -681,6 +691,39 @@ mod tests {
         assert!(e.contains("wintun.dll"), "要点名缺什么：{e}");
         assert!(e.contains("wintun.net"), "要给下载地址：{e}");
         assert!(e.contains("NFRP_WINTUN_DLL"), "要给出覆盖方式：{e}");
+    }
+
+    /// 非管理员创建虚拟网卡时，必须直接给出“以管理员身份运行”，
+    /// 不能只抛一个裸的 `os error 5`。
+    ///
+    /// 仓库里带着测试用 `wintun.dll` 时真实走到 `WintunCreateAdapter`；
+    /// 没有 DLL 或当前恰好是管理员时也接受（分别跳过 / 建完即删），
+    /// 这样不会把 CI 环境差异变成失败。
+    #[test]
+    fn 非管理员创建网卡要给提权提示() {
+        let _l = dll_env_lock();
+        let dll = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/wintun/wintun/bin/amd64/wintun.dll");
+        if !dll.is_file() {
+            eprintln!("跳过：没有测试用 wintun.dll（{}）", dll.display());
+            return;
+        }
+        std::env::set_var("NFRP_WINTUN_DLL", &dll);
+        let name = format!("NFRP-TEST-DENIED-{}", std::process::id());
+        let res = Tun::create(&name, 1400);
+        std::env::remove_var("NFRP_WINTUN_DLL");
+
+        match res {
+            // 管理员环境：真的建出来了，回收即可。
+            Ok(tun) => drop(tun),
+            Err(e) => {
+                let s = e.to_string();
+                assert!(
+                    s.contains("管理员") && s.contains("拒绝访问"),
+                    "非管理员的错误要能指导用户提权，实际：{s}"
+                );
+            }
+        }
     }
 
     /// ★ 真机验证：真的创建一块 Wintun 网卡、配地址、再删掉。

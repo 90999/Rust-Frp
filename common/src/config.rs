@@ -311,6 +311,81 @@ pub fn port_allowed(allow: &[PortRange], port: u16) -> bool {
 // 服务端配置
 // ---------------------------------------------------------------------------
 
+/// 官方 frps 的 `[[httpPlugins]]` 一项。
+///
+/// 语义与官方 `pkg/plugin/server/http.go` 对齐：每个受支持的 op 都会向
+/// `addr + path?version=0.1.0&op=...` 发一个 JSON POST，插件可以拒绝
+/// （`reject`）或改写（`unchange = false`）请求内容。
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct HttpPluginConfig {
+    /// 插件名，只用于日志与排障。
+    #[serde(default)]
+    pub name: String,
+    /// 插件地址，如 `127.0.0.1:9000`；没写 scheme 时按 `http://` 处理。
+    #[serde(default)]
+    pub addr: String,
+    /// URL 路径，如 `/handler`。
+    #[serde(default)]
+    pub path: String,
+    /// 该插件要接收的 op 列表；空表示一个都不接（与官方一致）。
+    #[serde(default)]
+    pub ops: Vec<String>,
+    /// 是否校验插件 HTTPS 证书。
+    ///
+    /// 官方字段是 `tlsVerify`，**默认 false = 跳过校验**（历史行为）。
+    /// 生产环境应显式设为 true；这里保留官方默认以免破坏现有插件部署。
+    #[serde(default, rename = "tlsVerify", alias = "tls_verify")]
+    pub tls_verify: bool,
+}
+
+impl std::fmt::Debug for HttpPluginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpPluginConfig")
+            .field("name", &self.name)
+            .field("addr", &self.addr)
+            .field("path", &self.path)
+            .field("ops", &self.ops)
+            .field("tls_verify", &self.tls_verify)
+            .finish()
+    }
+}
+
+/// 官方 frps 的 `[sshTunnelGateway]`。
+///
+/// `bind_port > 0` 才启用；其余字段与官方同名。
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SshTunnelGatewayConfig {
+    #[serde(default, rename = "bindPort", alias = "bind_port")]
+    pub bind_port: u16,
+    #[serde(default, rename = "privateKeyFile", alias = "private_key_file")]
+    pub private_key_file: String,
+    #[serde(
+        default,
+        rename = "autoGenPrivateKeyPath",
+        alias = "auto_gen_private_key_path"
+    )]
+    pub auto_gen_private_key_path: String,
+    #[serde(default, rename = "authorizedKeysFile", alias = "authorized_keys_file")]
+    pub authorized_keys_file: String,
+}
+
+impl std::fmt::Debug for SshTunnelGatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTunnelGatewayConfig")
+            .field("bind_port", &self.bind_port)
+            .field("private_key_file", &self.private_key_file)
+            .field("auto_gen_private_key_path", &self.auto_gen_private_key_path)
+            .field("authorized_keys_file", &self.authorized_keys_file)
+            .finish()
+    }
+}
+
+impl SshTunnelGatewayConfig {
+    pub fn enabled(&self) -> bool {
+        self.bind_port > 0
+    }
+}
+
 /// 服务端配置，对应 `server.toml`。
 ///
 /// ★ v0.5.3：手工实现 `Debug`（见文件下方），`token` 与 `dashboard_pwd`
@@ -694,6 +769,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub dashboard_port: Option<u16>,
 
+    /// 官方 frps 的 `[webServer]` 段落。
+    ///
+    /// NFRp 历史上使用 `dashboard_port` / `dashboard_user` / `dashboard_pwd`。
+    /// 现在同时接受官方写法：`[webServer] port` 作为 dashboard 端口的备用值，
+    /// `user` / `password` 作为 dashboard 凭据的备用值，`[webServer.tls]`
+    /// 用于面板 HTTPS。两者都写时显式的 `dashboard_*` 优先。
+    #[serde(default, rename = "webServer")]
+    pub web_server: WebServerConfig,
+
     /// 是否在面板端口上导出 Prometheus 指标（官方 frps 的 `enablePrometheus`）。
     ///
     /// ★ v0.6.5：**默认关闭**，与官方一致。此前是无条件开放 `/metrics`。
@@ -732,6 +816,57 @@ pub struct ServerConfig {
         alias = "udp_packet_size"
     )]
     pub udp_packet_size: usize,
+
+    /// 面板静态资源目录（官方 frps 的 `webServer.assetsDir`）。
+    ///
+    /// ★ v0.6.6：配了它之后，面板的 `/` 与其它路径会**优先从这个目录读文件**，
+    /// 而不是用内嵌的那份 HTML。这样可以把面板换成自己的页面（换 logo、
+    /// 加公司信息之类），不用改二进制。
+    ///
+    /// 安全约束（实现里逐条落实）：
+    /// * 先 `canonicalize`，再检查结果仍在 `assets_dir` 之内 —— 挡 `../` 穿越；
+    /// * 只读普通文件，不列目录、不跟符号链接到目录外；
+    /// * 按扩展名给 MIME，认不出来的按 `application/octet-stream`。
+    ///
+    /// 留空 = 用内嵌面板（默认行为，与之前完全一致）。
+    #[serde(default, alias = "assetsDir", alias = "assets_dir")]
+    pub assets_dir: String,
+
+    /// 是否在面板端口上挂 `/debug/pprof/profile`（官方 `webServer.pprofEnable`）。
+    ///
+    /// ★ v0.6.6：默认关闭。与 `enablePrometheus` 同口径 —— 诊断端点不该在
+    /// "只想开个面板"的部署里默认暴露。
+    ///
+    /// Unix 上由 pprof-rs 采集并输出 Go pprof 兼容的 protobuf；Windows 没有
+    /// perf 事件，端点会明确返回 501 而不是假装成功。
+    #[serde(
+        default,
+        rename = "pprofEnable",
+        alias = "pprof_enable",
+        alias = "PprofEnable",
+        alias = "PPROFENABLE"
+    )]
+    pub pprof_enable: bool,
+
+    /// 官方 `natholeAnalysisDataReserveHours`：NAT 打洞分析记录的保留小时数。
+    ///
+    /// 官方默认 168（7 天）。NFRp 目前只实现 mode 0，因此这里的记录用于
+    /// 统计每一对 client/visitor 的反复配对情况，并按此值过期清理；它是
+    /// 真实的资源上限，不是只解析不生效的占位字段。
+    #[serde(
+        default = "default_nathole_analysis_reserve_hours",
+        rename = "natholeAnalysisDataReserveHours",
+        alias = "nathole_analysis_data_reserve_hours"
+    )]
+    pub nathole_analysis_data_reserve_hours: u64,
+
+    /// 官方 `[[httpPlugins]]`：登录 / 注册 / 心跳等事件的 HTTP 钩子。
+    #[serde(default, rename = "httpPlugins", alias = "http_plugins")]
+    pub http_plugins: Vec<HttpPluginConfig>,
+
+    /// 官方 `[sshTunnelGateway]`：SSH 隧道网关。
+    #[serde(default, rename = "sshTunnelGateway", alias = "ssh_tunnel_gateway")]
+    pub ssh_tunnel_gateway: SshTunnelGatewayConfig,
 
     /// 面板用户名（留空表示**不做鉴权**）。
     ///
@@ -890,6 +1025,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("dashboard_port", &self.dashboard_port)
             .field("dashboard_user", &self.dashboard_user)
             .field("dashboard_pwd", &redact(&self.dashboard_pwd))
+            .field("web_server", &self.web_server)
             .field("allow_insecure_dashboard", &self.allow_insecure_dashboard)
             .field("allow_insecure_no_auth", &self.allow_insecure_no_auth)
             .field("hot_reload", &self.hot_reload)
@@ -906,6 +1042,53 @@ impl ServerConfig {
     /// frp 模式实际监听的端口。
     pub fn frp_bind_port(&self) -> u16 {
         self.bind_port.unwrap_or(self.control_port)
+    }
+
+    /// 实际生效的面板端口。
+    ///
+    /// 显式的 `dashboard_port` 优先；否则使用官方写法
+    /// `[webServer] port`。两者都为 0/空时面板不启动。
+    pub fn effective_dashboard_port(&self) -> Option<u16> {
+        self.dashboard_port
+            .filter(|p| *p != 0)
+            .or_else(|| (self.web_server.port != 0).then_some(self.web_server.port))
+    }
+
+    /// 实际生效的面板 Basic Auth 凭据。
+    ///
+    /// 显式 `dashboard_user` / `dashboard_pwd` 优先；都为空时回退到
+    /// 官方 `[webServer] user` / `password`。
+    pub fn effective_dashboard_creds(&self) -> (String, String) {
+        if has_dashboard_creds(&self.dashboard_user, &self.dashboard_pwd) {
+            (self.dashboard_user.clone(), self.dashboard_pwd.clone())
+        } else if has_dashboard_creds(&self.web_server.user, &self.web_server.password) {
+            (
+                self.web_server.user.clone(),
+                self.web_server.password.clone(),
+            )
+        } else {
+            (self.dashboard_user.clone(), self.dashboard_pwd.clone())
+        }
+    }
+
+    /// 面板静态资源目录：官方 `[webServer] assetsDir` 可作为顶层
+    /// `assets_dir` 的备用值。
+    pub fn effective_assets_dir(&self) -> &str {
+        if self.assets_dir.trim().is_empty() {
+            &self.web_server.assets_dir
+        } else {
+            &self.assets_dir
+        }
+    }
+
+    /// 面板 pprof：顶层开关或官方 `[webServer] pprofEnable` 任一开启。
+    pub fn effective_pprof_enable(&self) -> bool {
+        self.pprof_enable || self.web_server.pprof_enable
+    }
+
+    /// 面板 HTTPS 配置（官方 `[webServer.tls]`）。
+    pub fn web_tls(&self) -> &WebTlsConfig {
+        &self.web_server.tls
     }
 
     /// 实际生效的认证配置。
@@ -1205,8 +1388,14 @@ impl Default for ServerConfig {
             detailed_errors_to_client: true,
             p2p_port: None,
             dashboard_port: None,
+            web_server: WebServerConfig::default(),
             enable_prometheus: false,
             udp_packet_size: default_udp_packet_size(),
+            assets_dir: String::new(),
+            pprof_enable: false,
+            nathole_analysis_data_reserve_hours: default_nathole_analysis_reserve_hours(),
+            http_plugins: Vec::new(),
+            ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
@@ -1394,8 +1583,19 @@ pub struct ProxyConfig {
     pub http_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub http_pwd: String,
-    /// 转发到内网服务时重写 Host 头。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// 数据面加密（官方 transport.useEncryption）。配了之后这条代理的业务
+    /// 数据会套一层 AES-128-CFB（密钥由 token 派生，与控制通道同一套 pbkdf2）。
+    /// 格式与官方逐字节对齐（16 字节明文 IV + CFB 流），所以两端必须一致。
+    #[serde(default, rename = "useEncryption", alias = "use_encryption")]
+    pub use_encryption: bool,
+
+    /// 数据面压缩（官方 transport.useCompression）。Snappy **framing** 格式，
+    /// 位于加密的外层（写：先压缩再加密；读：先解密再解压）。默认关闭。
+    #[serde(default, rename = "useCompression", alias = "use_compression")]
+    pub use_compression: bool,
+
+    /// 改写发给内网服务的 Host 头。
+    #[serde(default)]
     pub host_header_rewrite: String,
     /// 按 HTTP Basic Auth 的**用户名**路由（官方 `routeByHTTPUser`）。
     ///
@@ -1936,6 +2136,18 @@ pub struct ClientConfig {
     /// 与服务端之间的传输协议：`tcp`（默认）或 `quic`，需与服务端一致。
     #[serde(default = "default_transport_protocol")]
     pub transport_protocol: String,
+    /// 数据面加密（官方客户端级 `[transport].useEncryption`）。
+    ///
+    /// ★ 官方 `GetRealConn` 读的是 `pxy.baseCfg.Transport.UseEncryption`，
+    /// `baseCfg` 就是 `ClientCommonConfig` —— 所以这个开关在**客户端级**，
+    /// 作用于该客户端的**所有**代理。这一点用真实 e2e 验证过：
+    /// 官方 frpc 0.71 只有写在 `[transport]` 下才真的加密数据面。
+    #[serde(default, rename = "useEncryption", alias = "use_encryption")]
+    pub use_encryption: bool,
+
+    /// 数据面压缩（官方客户端级 `[transport].useCompression`）。同上。
+    #[serde(default, rename = "useCompression", alias = "use_compression")]
+    pub use_compression: bool,
 
     /// 连接服务端的超时（秒，对应 frp `dialServerTimeout`，官方默认 10）。
     ///
@@ -2063,6 +2275,58 @@ pub struct ClientConfig {
     #[serde(default, alias = "include", alias = "IncludeConfigFiles")]
     pub includes: Vec<String>,
 
+    /// xtcp 打洞前用来探测公网映射地址的 STUN 服务器（官方 frpc 的
+    /// `natHoleStunServer`）。
+    ///
+    /// ★ v0.6.6：官方先做 `nathole.Prepare([stun], ...)` 拿到自己的
+    /// `XOR-MAPPED-ADDRESS`，再把它填进 `NatHoleVisitor.mapped_addrs`
+    /// 交给服务端撮合。没有它只能靠"服务端看到的源地址"猜映射 —
+    /// 锥形 NAT 下够用，对称 NAT / 多出口时会给错地址，打洞必然失败。
+    ///
+    /// ```toml
+    /// natHoleStunServer = "stun.easyvoip.com:3478"
+    /// ```
+    ///
+    /// 多个用逗号分隔，逐个尝试。留空 = 不做 STUN 探测（行为与之前一致）。
+    #[serde(default, rename = "natHoleStunServer", alias = "nat_hole_stun_server")]
+    pub nat_hole_stun_server: String,
+
+    /// 解析服务端域名时用的 DNS 服务器（官方 frpc 的 `dnsServer`）。
+    ///
+    /// ★ v0.6.6：只影响**本进程**解析服务端地址时用哪个 DNS，
+    /// 不动系统设置（官方注释："If this value is empty, the system default
+    /// will be used"）。
+    ///
+    /// 典型场景：服务端域名只在内网 DNS 里有记录，而系统 resolver 指向公网。
+    ///
+    /// ```toml
+    /// dnsServer = "10.0.0.2"        # 端口默认 53
+    /// ```
+    ///
+    /// 必须是 **IP**（可带端口）。用主机名指 DNS 服务器需要先解析它 ——
+    /// 那是鸡生蛋问题，这里直接拒绝而不是默默失败。
+    #[serde(default, alias = "dnsServer", alias = "dns_server")]
+    pub dns_server: String,
+
+    /// 连服务端时走的出站代理（官方 frpc 的 `transport.proxyURL`）。
+    ///
+    /// ★ v0.6.6：支持 `http://` / `https://` / `socks5://` / `socks5h://`，
+    /// 可带 `user:pass@`（HTTP Basic 或 SOCKS5 用户名密码）。
+    ///
+    /// 作用于**客户端 → 服务端**方向（控制连接与每条工作连接）——
+    /// 出网受限、必须经公司代理才能出站的环境靠它。
+    ///
+    /// ```toml
+    /// proxyURL = "socks5://user:pass@10.0.0.1:1080"
+    /// ```
+    ///
+    /// 留空 = 直连（默认，行为与之前完全一致）。
+    ///
+    /// ⚠ KCP / QUIC 走 UDP，**不经过**这个代理（官方同样如此）——
+    /// HTTP CONNECT / SOCKS5 是 TCP 隧道，接不住 UDP 报文。
+    #[serde(default, alias = "proxyURL", alias = "proxy_url")]
+    pub proxy_url: String,
+
     /// UDP 转发的单报文缓冲上限（官方 frpc 的 `udpPacketSize`）。
     ///
     /// 与服务端同名字段同义、同默认（65507，官方默认 1500 但要保持现状
@@ -2164,6 +2428,11 @@ impl Default for ClientConfig {
             visitors: Vec::new(),
             includes: Vec::new(),
             udp_packet_size: default_udp_packet_size(),
+            proxy_url: String::new(),
+            dns_server: String::new(),
+            use_encryption: false,
+            use_compression: false,
+            nat_hole_stun_server: String::new(),
             auth: Default::default(),
             store: Default::default(),
             web_server: Default::default(),
@@ -2189,6 +2458,67 @@ pub struct StoreConfig {
     /// **官方 frp 的 store 是另一套结构**（Go 的 `configmgmt` 序列化），
     /// 两者不通用 —— 换实现时需要重新加一遍代理，这一点在 README 里写明了。
     pub path: String,
+}
+
+/// Web 管理界面 TLS 配置（`[webServer.tls]`）。
+///
+/// 官方 frp 在服务端面板（frps `webServer`）和客户端本地面板（frpc
+/// `webServer`）都接受同一组字段。NFrp 旧版只识别但明确报“未实现”；从
+/// v0.6.7 起真正加载证书并启动 HTTPS listener。
+///
+/// `trustedCaFile` / `serverName` 也一并接受，保证官方 TOML 能直接解析；
+/// 当前 Web 面板不做客户端证书认证，因此这两个字段不参与服务端监听。
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebTlsConfig {
+    /// PEM 证书链文件。
+    #[serde(rename = "certFile", alias = "cert_file")]
+    pub cert_file: String,
+
+    /// PEM 私钥文件（PKCS#8 / PKCS#1 / SEC1）。
+    #[serde(rename = "keyFile", alias = "key_file")]
+    pub key_file: String,
+
+    /// 可选 CA；仅为官方配置兼容保留。
+    #[serde(rename = "trustedCaFile", alias = "trusted_ca_file")]
+    pub trusted_ca_file: String,
+
+    /// 可选证书名；仅为官方配置兼容保留。
+    #[serde(rename = "serverName", alias = "server_name")]
+    pub server_name: String,
+}
+
+impl WebTlsConfig {
+    /// 是否配置了 HTTPS。只有 cert/key 都非空才算启用。
+    pub fn is_enabled(&self) -> bool {
+        !self.cert_file.trim().is_empty() || !self.key_file.trim().is_empty()
+    }
+
+    /// 校验 cert/key 必须成对出现。返回 `(cert, key)` 供加载器直接使用。
+    pub fn files(&self) -> Result<Option<(&str, &str)>> {
+        let cert = self.cert_file.trim();
+        let key = self.key_file.trim();
+        match (cert.is_empty(), key.is_empty()) {
+            (true, true) => Ok(None),
+            (false, false) => Ok(Some((cert, key))),
+            _ => Err(crate::error::Error::Protocol(
+                "webServer.tls.certFile 与 webServer.tls.keyFile 必须同时配置；\
+                 当前只配置了其中一个"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Debug for WebTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebTlsConfig")
+            .field("cert_file", &self.cert_file)
+            .field("key_file", &self.key_file)
+            .field("trusted_ca_file", &self.trusted_ca_file)
+            .field("server_name", &self.server_name)
+            .finish()
+    }
 }
 
 /// 客户端 Web 管理界面配置（`[webServer]`）。
@@ -2221,12 +2551,29 @@ pub struct WebServerConfig {
     /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
     /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会**直接解析失败**。
     /// 值不会被使用（NFrp 用内置页面），启动时会明确告警。
-    #[serde(default, alias = "assetsDir")]
+    #[serde(default, alias = "assetsDir", alias = "AssetsDir", alias = "ASSETSDIR")]
     pub assets_dir: String,
 
-    /// pprof 性能分析开关（官方 frpc 的 `webServer.pprofEnable`）。★ 同上：不生效。
-    #[serde(default, alias = "pprofEnable")]
+    /// pprof 性能分析开关（官方 frpc 的 `webServer.pprofEnable`）。
+    ///
+    /// 与官方路径一致：`/debug/pprof/profile?seconds=N`。实现是 Unix-only
+    /// （pprof-rs 依赖 perf 信号与 `ucontext_t`）；Windows 上端点存在但明确
+    /// 返回 501，不会静默成功或拖垮整个客户端构建。
+    #[serde(
+        default,
+        alias = "pprofEnable",
+        alias = "PprofEnable",
+        alias = "PPROFENABLE",
+        alias = "pprof_enable"
+    )]
     pub pprof_enable: bool,
+
+    /// 面板 HTTPS（官方 frps / frpc 的 `webServer.tls`）。
+    ///
+    /// 配置 `certFile` + `keyFile` 后，面板直接以 TLS 监听；HTTP 不再被
+    /// 接受。客户端本地 Web 和 frps dashboard 共用这一份配置。
+    #[serde(default)]
+    pub tls: WebTlsConfig,
 }
 
 fn default_webserver_addr() -> String {
@@ -2248,6 +2595,7 @@ impl std::fmt::Debug for WebServerConfig {
             .field("password", &pwd)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
             .field("assets_dir", &self.assets_dir)
+            .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
 }
@@ -2262,6 +2610,7 @@ impl Default for WebServerConfig {
             allow_insecure_remote: false,
             assets_dir: String::new(),
             pprof_enable: false,
+            tls: WebTlsConfig::default(),
         }
     }
 }
@@ -2591,6 +2940,11 @@ pub const MAX_UDP_PACKET_SIZE: usize = 65507;
 
 fn default_udp_packet_size() -> usize {
     MAX_UDP_PACKET_SIZE
+}
+
+/// 官方 frps 的默认值：168 小时（7 天）。
+fn default_nathole_analysis_reserve_hours() -> u64 {
+    168
 }
 
 /// 把配置里的 `udpPacketSize` 夹到有意义的范围。
@@ -3962,6 +4316,77 @@ bindPort = 2222
     /// 示例配置是**手写**的 TOML，一旦字段名与结构体漂移，
     /// 用户 `--gen-config` 出来的文件就根本加载不了 —— 而这类错误
     /// 只有真正去解析才会暴露，所以必须测。
+    /// 官方 `[webServer]` + `[webServer.tls]` 必须能直接解析，且 TLS
+    /// cert/key 必须成对；`dashboard_port` 显式值优先。
+    #[test]
+    fn web_server_tls_解析与优先级() {
+        let raw = r#"
+bind_port = 27000
+[webServer]
+addr = "127.0.0.1"
+port = 27010
+user = "admin"
+password = "pw"
+assetsDir = "/srv/assets"
+pprofEnable = true
+[webServer.tls]
+certFile = "/etc/nfrp/cert.pem"
+keyFile = "/etc/nfrp/key.pem"
+trustedCaFile = "/etc/nfrp/ca.pem"
+serverName = "dashboard.example.com"
+"#;
+        let cfg = parse_server_toml(raw).expect("官方 webServer 写法应能解析");
+        assert_eq!(cfg.effective_dashboard_port(), Some(27010));
+        assert_eq!(
+            cfg.effective_dashboard_creds(),
+            ("admin".to_string(), "pw".to_string())
+        );
+        assert_eq!(cfg.effective_assets_dir(), "/srv/assets");
+        assert!(cfg.effective_pprof_enable());
+        let (cert, key) = cfg.web_tls().files().unwrap().expect("cert/key 成对");
+        assert_eq!(cert, "/etc/nfrp/cert.pem");
+        assert_eq!(key, "/etc/nfrp/key.pem");
+
+        // 显式 dashboard_port 优先于 webServer.port
+        let cfg2 = parse_server_toml(
+            "bind_port = 27000\ndashboard_port = 27011\n[webServer]\nport = 27010\n",
+        )
+        .unwrap();
+        assert_eq!(cfg2.effective_dashboard_port(), Some(27011));
+
+        // 只配一半必须报错，不能静默退回 HTTP
+        let bad = r#"
+bind_port = 27000
+[webServer.tls]
+certFile = "/tmp/cert.pem"
+"#;
+        let cfg3 = parse_server_toml(bad).expect("语法本身合法");
+        assert!(cfg3.web_tls().files().is_err(), "缺 keyFile 必须拒绝");
+    }
+
+    #[test]
+    fn web_server_tls_客户端解析() {
+        let raw = r#"
+serverAddr = "127.0.0.1"
+serverPort = 27000
+[webServer]
+addr = "127.0.0.1"
+port = 7400
+user = "u"
+password = "p"
+[webServer.tls]
+certFile = "cert.pem"
+keyFile = "key.pem"
+"#;
+        let cfg = parse_client_toml(raw).expect("客户端 webServer.tls 应能解析");
+        assert_eq!(cfg.web_server.port, 7400);
+        assert!(cfg.web_server.tls.is_enabled());
+        assert_eq!(
+            cfg.web_server.tls.files().unwrap(),
+            Some(("cert.pem", "key.pem"))
+        );
+    }
+
     #[test]
     fn server_example_config_loads() {
         let cfg: ServerConfig =

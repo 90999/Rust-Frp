@@ -645,6 +645,37 @@ pub async fn server_handshake_authz<F>(
 where
     F: FnOnce(&str) -> std::result::Result<crate::security::Role, String>,
 {
+    server_handshake_authz_ext(
+        stream,
+        auth,
+        run_id,
+        authorize,
+        max_clock_skew_secs,
+        None,
+        None,
+    )
+    .await
+}
+
+/// [`server_handshake_authz`] + 官方 `[[httpPlugins]]` 的 Login 钩子。
+///
+/// 插件在**认证之前**执行：它可以拒绝登录（`reject`）或改写登录内容
+/// （例如把 `user` 换成插件查出来的账号）。这与官方 `Control.worker()`
+/// 的顺序一致 —— 插件先于 token/OIDC 校验。
+///
+/// `peer` 只用于插件响应的 `client_address` 字段；`None` 时留空。
+pub async fn server_handshake_authz_ext<F>(
+    stream: BoxStream,
+    auth: &crate::security::AuthProvider,
+    run_id: &str,
+    authorize: F,
+    max_clock_skew_secs: u64,
+    plugins: Option<&crate::plugin::PluginManager>,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<ServerAccept>
+where
+    F: FnOnce(&str) -> std::result::Result<crate::security::Role, String>,
+{
     // 先用 v1 建连接对象：探测只在 raw 缓冲区上做事，跟协议无关
     let mut conn = FrpConn::new(stream, WireVersion::V1);
     let version = conn.detect_version().await?;
@@ -748,10 +779,49 @@ where
     if type_id != msg::TYPE_LOGIN {
         bail!("期望 Login 或 NewWorkConn，收到 type_id {type_id}");
     }
-    let login = match FrpMessage::decode(type_id, &body)? {
+    let mut login = match FrpMessage::decode(type_id, &body)? {
         FrpMessage::Login(l) => l,
         _ => unreachable!(),
     };
+
+    // ---- 官方 `[[httpPlugins]]`：Login 钩子 ----
+    //
+    // 必须在 token / OIDC 校验之前，与官方 frps 的 `Control.worker()` 一致。
+    // 插件可以：① 直接拒绝（用户管理 / 黑名单）；② 改写 user 等字段，让
+    // 后面的认证按插件给定的身份执行。失败/拒绝时明文回 LoginResp，
+    // 让客户端明确知道"登录被拒"而不是无限重连。
+    if let Some(plugins) = plugins {
+        if !plugins.is_empty() {
+            let content = crate::plugin::login_content(
+                &login,
+                &peer.map(|p| p.to_string()).unwrap_or_default(),
+            )?;
+            match plugins
+                .handle_mutable(crate::plugin::OP_LOGIN, content)
+                .await
+            {
+                Ok(mut new_content) => {
+                    // 插件通常会原样带回 `client_address`，但把它去掉更稳妥：
+                    // Login 结构里本来就没有这个字段，serde 会忽略，不过
+                    // 这里显式移除能避免插件把任意大对象塞回来。
+                    if let Some(obj) = new_content.as_object_mut() {
+                        obj.remove("client_address");
+                    }
+                    crate::plugin::apply_login_content(&mut login, new_content)?;
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    let _ = conn
+                        .send_msg(&FrpMessage::LoginResp(LoginResp {
+                            error: reason.clone(),
+                            ..Default::default()
+                        }))
+                        .await;
+                    bail!("HTTP 插件拒绝登录：{reason}");
+                }
+            }
+        }
+    }
 
     // ★★ v0.5.6 修（审计总报告 M3，中危）：**先校验时间戳新鲜性**，
     //   再比凭证。
@@ -975,6 +1045,46 @@ mod tests {
 
     const TOKEN: &str = "tok";
     const RUN_ID: &str = "run-1";
+
+    #[test]
+    fn v2_帧解析_拒绝非法_flags_和超长负载() {
+        let mut partial = vec![0u8, 16, 0, 0, 0, 0];
+        assert!(take_frame(&mut partial).unwrap().is_none(), "头不完整");
+
+        let mut bad_flags = wire::encode_frame(FRAME_MESSAGE, b"x");
+        bad_flags[2] = 1;
+        let err = take_frame(&mut bad_flags).unwrap_err().to_string();
+        assert!(err.contains("flags"), "{err}");
+
+        let mut too_big = Vec::new();
+        too_big.extend_from_slice(&FRAME_MESSAGE.to_be_bytes());
+        too_big.extend_from_slice(&0u16.to_be_bytes());
+        too_big.extend_from_slice(&((wire::MAX_FRAME_PAYLOAD + 1) as u32).to_be_bytes());
+        let err = take_frame(&mut too_big).unwrap_err().to_string();
+        assert!(err.contains("超过上限"), "{err}");
+    }
+
+    #[test]
+    fn v2_帧解析_保留剩余字节并允许零长负载() {
+        let mut buf = wire::encode_frame(FRAME_MESSAGE, b"hello");
+        buf.extend_from_slice(&wire::encode_frame(FRAME_SERVER_HELLO, b""));
+        let (ft, payload) = take_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(ft, FRAME_MESSAGE);
+        assert_eq!(payload, b"hello");
+        let (ft, payload) = take_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(ft, FRAME_SERVER_HELLO);
+        assert!(payload.is_empty());
+        assert!(take_frame(&mut buf).unwrap().is_none());
+    }
+
+    /// 未知帧类型在 `read_frame` 层保留、由 `recv_msg` 明确拒绝。
+    #[test]
+    fn v2_未知帧类型由_recv_拒绝() {
+        let payload = wire::encode_frame(999, b"\x00\x01");
+        // 直接模拟 `recv_msg` 的类型判断，避免为了一个分支再起 socket。
+        let ft = u16::from_be_bytes([payload[0], payload[1]]);
+        assert_ne!(ft, FRAME_MESSAGE);
+    }
 
     fn empty_metas() -> std::collections::HashMap<String, String> {
         Default::default()

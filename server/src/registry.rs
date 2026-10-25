@@ -18,6 +18,7 @@ use crate::{
     vhost::VhostTable,
     visitor::VisitorTable,
 };
+use nfrp_common::plugin::PluginManager;
 use tracing::debug;
 
 /// 由配置折算出来的服务端资源上限（`0` 表示不限）。
@@ -97,6 +98,8 @@ pub struct Registry {
     /// 放 `AtomicU8` 而不是 `Mutex`：热路径上每次用户连接都要读它，
     /// 而它只在启动 / 热重载时写一次。用原子量避免在 `pick` 里多取一把锁。
     lb_policy: AtomicU8,
+    /// 官方 `[[httpPlugins]]`。热重载时整体换掉，读侧克隆 `Arc`。
+    plugins: Mutex<Arc<PluginManager>>,
 }
 
 impl Registry {
@@ -116,7 +119,21 @@ impl Registry {
             security: Mutex::new(Arc::new(SecurityContext::default())),
             // 默认轮询：与官方 frp 的 group 行为一致
             lb_policy: AtomicU8::new(LbPolicy::RoundRobin as u8),
+            plugins: Mutex::new(Arc::new(PluginManager::default())),
         }
+    }
+
+    /// 安装 / 替换 HTTP 插件集合（启动装载与配置热重载共用）。
+    pub fn set_plugins(&self, plugins: Arc<PluginManager>) {
+        *self.plugins.lock().unwrap_or_else(|e| e.into_inner()) = plugins;
+    }
+
+    /// 取当前 HTTP 插件集合。
+    pub fn plugins(&self) -> Arc<PluginManager> {
+        self.plugins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 取当前安全上下文（克隆 Arc，几乎零成本）。

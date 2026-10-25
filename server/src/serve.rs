@@ -247,6 +247,12 @@ pub fn preflight(cfg: &ServerConfig) -> Result<()> {
         &cfg.tls_key_file,
         &cfg.tls_trusted_ca_file,
     )?;
+    // 面板 HTTPS 也在启动/`--check` 阶段验一遍证书，不能等到 bind 后才发现。
+    if let Some((cert, key)) = cfg.web_tls().files()? {
+        let _ = frp::tls::server_config_from_pem_with_ca(cert, key, "")
+            .with_context(|| format!("加载面板 HTTPS 证书失败（{cert} / {key}）"))?;
+    }
+    crate::ssh_gateway::validate_config(cfg)?;
     Ok(())
 }
 
@@ -256,6 +262,16 @@ pub async fn serve_with(
     registry: Arc<Registry>,
     extras: ServeExtras,
 ) -> Result<()> {
+    // 官方 `natholeAnalysisDataReserveHours`（默认 168）是进程级策略，
+    // 在监听前安装，避免首批 xtcp 会话仍用默认值。
+    crate::nathole_official::configure_analysis_reserve(cfg.nathole_analysis_data_reserve_hours);
+    // 直接调用 `serve_with` 的测试 / 嵌入方可能没在 Registry 上装插件，
+    // 这里兜底一次；main 已装过则等价覆盖。
+    if !cfg.http_plugins.is_empty() {
+        registry.set_plugins(Arc::new(nfrp_common::plugin::PluginManager::from_config(
+            &cfg.http_plugins,
+        )?));
+    }
     let port = cfg.frp_bind_port();
     let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, port))
         .await
@@ -390,6 +406,13 @@ pub async fn serve_on_with(
         }
     }
 
+    // 官方 `[sshTunnelGateway]`：SSH 反向隧道入口。
+    if cfg.ssh_tunnel_gateway.enabled() {
+        let bind_addr = cfg.bind_addr.clone();
+        crate::ssh_gateway::run(cfg.clone(), registry.clone(), security.clone(), &bind_addr)
+            .await?;
+    }
+
     // xtcp 真 P2P：牵线用的 UDP 端口（不配置时 xtcp 自动退化成中继）
     if let Some(p2p_port) = cfg.p2p_port {
         let hub = crate::p2p::P2PHub::new();
@@ -412,13 +435,14 @@ pub async fn serve_on_with(
     //   原先同样只判 `dashboard_user.is_empty()`。必须用唯一真源，
     //   否则"用户名非空 + 密码为空"会初始化出 `Some(("admin", ""))`，
     //   而 `dashboard.rs` 会拿它去比 `"admin:"` —— 鉴权形同虚设。
-    let has_dash_creds =
-        nfrp_common::config::has_dashboard_creds(&cfg.dashboard_user, &cfg.dashboard_pwd);
-    let dashboard_auth: dashboard::DashboardAuth =
-        Arc::new(RwLock::new(has_dash_creds.then(|| {
-            (cfg.dashboard_user.clone(), cfg.dashboard_pwd.clone())
-        })));
-    if let Some(dport) = cfg.dashboard_port {
+    let (dash_user, dash_pwd) = cfg.effective_dashboard_creds();
+    let has_dash_creds = nfrp_common::config::has_dashboard_creds(&dash_user, &dash_pwd);
+    let dashboard_auth: dashboard::DashboardAuth = Arc::new(RwLock::new(if has_dash_creds {
+        Some((dash_user, dash_pwd))
+    } else {
+        None
+    }));
+    if let Some(dport) = cfg.effective_dashboard_port() {
         // 防御性兜底：`validate()` 已经在启动路径上拦过一次，但这里再挡一次 ——
         // `serve_with` 是所有启动方式的必经之地（包括将来新加的加载路径、
         // 以及嵌进别的宿主程序时直接调它的场景）。面板无鉴权 + 非回环 =
@@ -442,11 +466,22 @@ pub async fn serve_on_with(
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("监听 {addr} 失败（面板端口可能被占用）"))?;
-        tokio::spawn(dashboard::run(
+        // 官方 `[webServer.tls]`：cert/key 同时配置时整个面板只接受 HTTPS。
+        // 证书加载失败直接阻止启动，不能静默退回 HTTP。
+        let tls_acceptor = match cfg.web_tls().files()? {
+            Some((cert, key)) => {
+                let tls = frp::tls::server_config_from_pem_with_ca(cert, key, "")
+                    .with_context(|| format!("加载面板 HTTPS 证书失败（{cert} / {key}）"))?;
+                Some(tokio_rustls::TlsAcceptor::from(tls))
+            }
+            None => None,
+        };
+        tokio::spawn(dashboard::run_with_tls(
             listener,
             registry.clone(),
             dashboard_auth.clone(),
             cfg.clone(),
+            tls_acceptor,
         ));
     }
 
@@ -996,12 +1031,15 @@ async fn handle_frp_stream(
     // 高延迟链路 + OIDC 首次验签（JWKS 已在启动时预热）。超时即断开，
     // 对合法用户无任何可感知影响。
     // ★ v0.5.6（M3）：把登录时间戳窗口传进握手（0 = 关闭校验）。
-    let handshake = conn::server_handshake_authz(
+    let plugins = registry.plugins();
+    let handshake = conn::server_handshake_authz_ext(
         stream,
         &auth_snapshot,
         &run_id,
         authorize,
         cfg.max_clock_skew_secs,
+        Some(&plugins),
+        Some(peer),
     );
     let hs_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await;
     // ★ C9-3：认证阶段到此结束（成功/失败/超时都算），立刻释放未认证名额 ——
@@ -1255,6 +1293,42 @@ async fn handle_control(
                         //   路径（`admin.rs`）共用 —— 原先面板那条漏了 strip，
                         //   于是全名会被叠成 `alice.alice.web`（端口/域名泄漏）。
                         m.proxy_name = util::canonical_wire_name(&client.user, &m.proxy_name);
+                        // ---- 官方 `[[httpPlugins]]`：NewProxy ----
+                        //
+                        // 插件可以拒绝注册（返回 reject），也可以改写端口 /
+                        // 名字 / 类型。放在权限检查之前，让插件成为第一道闸；
+                        // 之后仍然要过 RBAC，插件不能借改写绕过角色限制。
+                        if !registry.plugins().is_empty() {
+                            let plugins = registry.plugins();
+                            let user = nfrp_common::plugin::user_info(&login, &run_id);
+                            let content = nfrp_common::plugin::content_with_user(&m, user)?;
+                            match plugins
+                                .handle_mutable(nfrp_common::plugin::OP_NEW_PROXY, content)
+                                .await
+                            {
+                                Ok(v) => {
+                                    m = serde_json::from_value(v)
+                                        .context("插件返回的 NewProxy 内容无法解析")?;
+                                    m.proxy_name =
+                                        util::canonical_wire_name(&client.user, &m.proxy_name);
+                                }
+                                Err(e) => {
+                                    registry.metrics().proxy_failures.inc();
+                                    let reason = e.to_string();
+                                    warn!(proxy = %m.proxy_name, "HTTP 插件拒绝代理注册：{reason}");
+                                    conn.send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
+                                        proxy_name: m.proxy_name.clone(),
+                                        error: cfg.error_to_client(
+                                            &format!("new proxy [{}] error", m.proxy_name),
+                                            &reason,
+                                        ),
+                                        ..Default::default()
+                                    }))
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
                         let name = m.proxy_name.clone();
                         let port = m.remote_port;
                         // (3) 授权：这个角色允许注册这种类型的代理 / 占这个端口吗？
@@ -1332,7 +1406,35 @@ async fn handle_control(
                         };
                         conn.send_msg(&FrpMessage::NewProxyResp(resp)).await?;
                     }
-                    FrpMessage::Ping(p) => {
+                    FrpMessage::Ping(mut p) => {
+                        // 官方 `[[httpPlugins]]`：Ping。插件可以拒绝心跳
+                        // （管理端强制下线）或改写心跳内容。
+                        if !registry.plugins().is_empty() {
+                            let plugins = registry.plugins();
+                            let user = nfrp_common::plugin::user_info(&login, &run_id);
+                            let content = nfrp_common::plugin::content_with_user(&p, user)?;
+                            match plugins
+                                .handle_mutable(nfrp_common::plugin::OP_PING, content)
+                                .await
+                            {
+                                Ok(v) => {
+                                    p = serde_json::from_value(v)
+                                        .context("插件返回的 Ping 内容无法解析")?;
+                                }
+                                Err(e) => {
+                                    warn!("HTTP 插件拒绝心跳，断开控制连接：{e:#}");
+                                    let _ = conn
+                                        .send_msg(&FrpMessage::Pong(Pong {
+                                            error: cfg.error_to_client(
+                                                "invalid ping",
+                                                &e.to_string(),
+                                            ),
+                                        }))
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
                         // OIDC + additionalScopes 含 HeartBeats 时，每个心跳上的
                         // token 都要重新验签、且 subject 与登录时一致。
                         // 少了这一步，"登录时验过一次"就等于之后永久信任。
@@ -1415,6 +1517,16 @@ async fn handle_control(
                             // （不改指标 —— 这正是 M8 的修法）。
                             debug!(proxy = %m.proxy_name, "CloseProxy 的名字不在本客户端的表里，未做任何清理");
                         }
+                        // 官方 `[[httpPlugins]]`：CloseProxy 是**通知型** op，
+                        // 插件失败/拒绝只记日志，不影响本地清理（官方同语义）。
+                        if !registry.plugins().is_empty() {
+                            let plugins = registry.plugins();
+                            let user = nfrp_common::plugin::user_info(&login, &run_id);
+                            let content = nfrp_common::plugin::content_with_user(&m, user)?;
+                            plugins
+                                .notify(nfrp_common::plugin::OP_CLOSE_PROXY, content)
+                                .await;
+                        }
                     }
                     FrpMessage::NatHoleVisitor(m) => {
                         crate::p2p::handle_nat_hole_visitor(&registry, &client, &m).await?;
@@ -1429,7 +1541,7 @@ async fn handle_control(
                         }
                     }
                     FrpMessage::NatHoleReport(m) => {
-                        debug!(sid = %m.sid, success = m.success, "收到 NatHoleReport");
+                        crate::nathole_official::handle_report(&m);
                     }
                     // 面板下发的管理命令的回执：按 id 交还给等待者
                     FrpMessage::ServerCmdResp(r) => {
@@ -1589,6 +1701,9 @@ async fn register_visitor_proxy(
         })
         .map_err(|e| anyhow!(e))?;
     client.add_proxy(m.proxy_name.clone(), None, slot);
+    // ★ v0.6.6：把数据面标志记下来，工作连接那一侧要用它决定是否解密/解压
+    client.set_proxy_flags(&m.proxy_name, m.use_encryption, m.use_compression);
+    client.set_proxy_type(&m.proxy_name, &m.proxy_type);
     // 与官方 frps 一致：visitor 类代理没有公网地址，remote_addr 留空
     Ok(String::new())
 }
@@ -1643,6 +1758,8 @@ async fn register_tcp(
     }
 
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
+    client.set_proxy_flags(&m.proxy_name, m.use_encryption, m.use_compression);
+    client.set_proxy_type(&m.proxy_name, &m.proxy_type);
     Ok(format!("{proxy_host}:{}", m.remote_port))
 }
 
@@ -1858,6 +1975,22 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     // 组内各成员的 name 可以完全不同（alice.web-a / bob.web-b），
                     // 拿创建监听器那个成员的名字下发，其他成员会找不到这条代理。
                     proxy: backend.proxy_name.clone(),
+                    proxy_type: client.proxy_type(&backend.proxy_name),
+                    client_user: client.user.clone(),
+                    client_run_id: client.run_id.clone(),
+                    // ★ v0.6.6：数据面标志随用户连接带下去
+                    use_encryption: {
+                        let (e, _) = client.proxy_flags(&backend.proxy_name);
+                        e
+                    },
+                    use_compression: {
+                        let (_, c) = client.proxy_flags(&backend.proxy_name);
+                        c
+                    },
+                    data_key: {
+                        let (e, _) = client.proxy_flags(&backend.proxy_name);
+                        e.then(|| nfrp_common::frp::v1::derive_key(sec.auth_cfg.token.as_bytes()))
+                    },
                     remote_port,
                     stream: Box::pin(stream),
                     peer,
@@ -1918,14 +2051,36 @@ pub fn admit_user(user: PendingUser, client: &Arc<ClientState>, registry: &Arc<R
 
 async fn handle_work(
     mut conn: FrpConn,
-    msg: NewWorkConn,
+    mut msg: NewWorkConn,
     sec: &crate::guard::SecurityContext,
     registry: Arc<Registry>,
     peer: SocketAddr,
 ) -> Result<()> {
-    let client = registry
+    let mut client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+
+    // 官方 `[[httpPlugins]]`：NewWorkConn。插件在凭证校验之前执行，
+    // 可以拒绝（例如池被盗用）或改写 run_id / privilege_key。
+    if !registry.plugins().is_empty() {
+        let plugins = registry.plugins();
+        let user = nfrp_common::plugin::user_info(
+            &Login {
+                user: client.user.clone(),
+                ..Default::default()
+            },
+            &client.run_id,
+        );
+        let content = nfrp_common::plugin::content_with_user(&msg, user)?;
+        let new_content = plugins
+            .handle_mutable(nfrp_common::plugin::OP_NEW_WORK_CONN, content)
+            .await
+            .map_err(|e| anyhow!("HTTP 插件拒绝工作连接：{e}"))?;
+        msg = serde_json::from_value(new_content).context("插件返回的 NewWorkConn 内容无法解析")?;
+        client = registry
+            .get(&msg.run_id)
+            .ok_or_else(|| anyhow!("插件改写后的 run_id={} 不存在", msg.run_id))?;
+    }
 
     // ★★ v0.5.5 修（第四轮 A-1，高危）：工作连接必须绑定到**发起它的那个客户端**。
     //
@@ -2408,6 +2563,13 @@ async fn handle_visitor(
     let (stream, leftover) = conn.into_stream();
     let user = PendingUser {
         proxy: proxy_name.clone(),
+        proxy_type: entry.proxy_type.clone(),
+        client_user: entry.client.user.clone(),
+        client_run_id: entry.client.run_id.clone(),
+        // visitor 走的是 visitor 自己那条通道，加密/压缩由它自己协商
+        use_encryption: false,
+        use_compression: false,
+        data_key: None,
         // visitor 没有公网端口概念
         remote_port: 0,
         stream: Box::pin(PrefixedStream::new(leftover, stream)),
@@ -2481,6 +2643,35 @@ impl Drop for ConnGuard<'_> {
 
 pub fn spawn_bridge(user: PendingUser, work: WorkItem, registry: Arc<Registry>) {
     tokio::spawn(async move {
+        // 官方 `[[httpPlugins]]`：NewUserConn。
+        //
+        // 放在所有用户连接路径的汇合点（tcp / vhost / visitor 最终都会走
+        // `spawn_bridge`），因此不会出现"只给 tcp 调、http 漏掉"这种
+        // 防线铺不满的问题。插件拒绝时直接关闭这条用户连接。
+        if !registry.plugins().is_empty() {
+            let plugins = registry.plugins();
+            let info = nfrp_common::plugin::user_info(
+                &Login {
+                    user: user.client_user.clone(),
+                    ..Default::default()
+                },
+                &user.client_run_id,
+            );
+            let content = serde_json::json!({
+                "user": info,
+                "proxy_name": user.proxy.clone(),
+                "proxy_type": user.proxy_type.clone(),
+                "remote_addr": user.peer.to_string(),
+            });
+            if let Err(e) = plugins
+                .handle_mutable(nfrp_common::plugin::OP_NEW_USER_CONN, content)
+                .await
+            {
+                registry.metrics().conns_rejected.inc();
+                warn!(proxy = %user.proxy, "HTTP 插件拒绝用户连接：{e:#}");
+                return;
+            }
+        }
         if let Err(e) = bridge(user, work, &registry).await {
             debug!("转发结束：{e:#}");
         }
@@ -2494,6 +2685,9 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         remote_port,
         stream: mut user_stream,
         peer,
+        use_encryption: user_enc,
+        use_compression: user_comp,
+        data_key: user_key,
         ..
     } = user;
     let mut work_conn = work.conn;
@@ -2515,15 +2709,50 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         .await
         .context("发送 StartWorkConn 失败")?;
 
-    let (mut work_stream, leftover) = work_conn.into_stream();
-    if !leftover.is_empty() {
+    let (work_stream, leftover) = work_conn.into_stream();
+
+    // ★★ leftover 是 frpc → frps 方向多读到的字节。明文时它就是响应的
+    // 开头，直接写给用户是对的；但**开了加密/压缩时它是密文前缀**，
+    // 直接写给用户会把响应破坏成乱码（实测：用户收到的
+    // HTTP 响应长度对不上 / 完全超时）。
+    //
+    // 所以这里只在"不包" 的情况下直接写；要包的话把 leftover
+    // 当作 work_stream 的前缀拼回去，交给 ProxyStream 去解。
+    // 标志已随 PendingUser 带下来，这里直接用
+    let will_wrap = user_enc || user_comp;
+    if !leftover.is_empty() && !will_wrap {
         use tokio::io::AsyncWriteExt;
         user_stream.write_all(&leftover).await?;
     }
+    let mut work_stream: nfrp_common::frp::stream::BoxStream = if will_wrap {
+        Box::pin(nfrp_common::frp::stream::PrefixedStream::new(
+            leftover,
+            work_stream,
+        ))
+    } else {
+        Box::pin(work_stream)
+    };
 
     // 无论成功、失败、还是上面某个 `?` 提前返回，`guard` 都会在作用域结束时
     // 归还计数 —— 这就是 RAII 修法的全部价值。
-    match util::relay_between(&mut user_stream, &mut work_stream).await {
+    // ★ v0.6.6：数据面解密 / 解压（官方 transport.useEncryption / useCompression）
+    //
+    // 与客户端对称：包在**工作连接**这一侧（work_stream = 到 frpc 的那条），
+    // 用户连接（user_stream）保持明文。
+    //
+    // 标志来自注册时记下的 NewProxy 字段。查不到就当没配（明文透传）——
+    // 绝不能“查不到就按密文解”，那会把正常流量解成垃圾。
+    let (enc, comp) = (user_enc, user_comp);
+    let relay_result = if enc || comp {
+        let key = user_key;
+        debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压");
+        let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
+        util::relay_between(&mut user_stream, &mut wrapped).await
+    } else {
+        util::relay_between(&mut user_stream, &mut work_stream).await
+    };
+
+    match relay_result {
         Ok((up, down)) => {
             debug!(proxy = %proxy, "转发结束：上行 {up}B / 下行 {down}B");
             guard.record_bytes(up, down);
@@ -2712,6 +2941,12 @@ pub fn ensure_protocol(cfg: &ServerConfig) -> Result<()> {
 pub(crate) fn test_pending(proxy: &str, slot: Option<ConnSlot>) -> PendingUser {
     PendingUser {
         proxy: proxy.to_string(),
+        proxy_type: "tcp".to_string(),
+        client_user: "test".to_string(),
+        client_run_id: "test-run".to_string(),
+        use_encryption: false,
+        use_compression: false,
+        data_key: None,
         remote_port: 0,
         stream: Box::pin(tokio::io::empty()),
         peer: SocketAddr::from(([127, 0, 0, 1], 8080)),

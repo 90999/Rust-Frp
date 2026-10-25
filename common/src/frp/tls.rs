@@ -20,7 +20,6 @@ use rustls::crypto::ring;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::stream::{BoxStream, PrefixedStream};
@@ -493,10 +492,10 @@ pub struct ClientTlsOptions<'a> {
 ///
 /// ★ v0.5.6（L16）：`verify = false` 走与官方一致的"不校验"（保互通），
 /// `true` 走真正校验（需要 `trustedCaFile` 配合自签场景）。
-pub async fn connect_client(
-    mut stream: TcpStream,
-    opts: &ClientTlsOptions<'_>,
-) -> Result<BoxStream> {
+pub async fn connect_client<S>(mut stream: S, opts: &ClientTlsOptions<'_>) -> Result<BoxStream>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     if !opts.enable {
         return Ok(Box::pin(stream));
     }

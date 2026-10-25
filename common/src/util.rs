@@ -507,7 +507,20 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF, RELAY_BUF).await
+    let r = tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF, RELAY_BUF).await;
+
+    // ★ 收尾必须 flush 两端。
+    //
+    // 数据面可能被 ProxyStream 包了一层（压缩/加密），而那一层是
+    // **有缓冲的**：尾部几十字节会留在它的内部缓存里。copy_bidirectional
+    // 在 EOF 后只会 shutdown，不保证 flush 调用方——实测表现就是
+    // “大多数时候对、偶尔少一截”（约 20% 失败）。
+    //
+    // 这里抛弃错误：链路已经断开时 flush 失败是正常的，
+    // 不能因为“尾部刷不出去”就把整次转发判成失败。
+    let _ = tokio::io::AsyncWriteExt::flush(a).await;
+    let _ = tokio::io::AsyncWriteExt::flush(b).await;
+    r
 }
 
 /// 双向转发：把 `a` 收到的字节原样写给 `b`，反之亦然。

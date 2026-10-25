@@ -3,8 +3,12 @@
 本文件是第十轮审计的完整记录，含两部分：
 
 - **第一部分** · v0.5.10 发布复扫报告（2026-10-17）—— v0.5.10 发布正文引用的那一份（内容未改）；
-- **第二部分** · 新维度深挖审计（2026-10-18 起，**进行中**）：Miri / ASan / TSan /
+- **第二部分** · 新维度深挖审计（2026-10-18 起）：Miri / ASan / TSan /
   cargo-vet + cargo-deny / PSF 状态机 / Phaedra 字段 fuzz / OIDC 核查。
+  **2026-10-25 状态**：已完成部分见本文件；官方 0.71 兼容、NatHole、SSH 网关、
+  pprof、HTTP 插件等收尾见 [SECURITY-FIXES-ROUND16.md](SECURITY-FIXES-ROUND16.md)。
+  仍未完成的 TSan / Linux TUN Miri / 真实 IdP e2e 等也在 ROUND16 末尾列明，
+  不要把它们误读成“已通过”。
 
 ---
 

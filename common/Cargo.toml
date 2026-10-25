@@ -35,6 +35,7 @@ sha2 = { workspace = true }
 
 anyhow = { workspace = true }
 bytes = { workspace = true }
+snap = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -44,3 +45,8 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# pprof-rs 依赖 perf 信号与 nix，只在 Unix（Linux/macOS）可用；
+# Windows 上 pprof_http 会返回明确的 501，而不是让整个 crate 编译失败。
+pprof = { workspace = true }

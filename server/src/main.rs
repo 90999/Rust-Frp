@@ -294,6 +294,18 @@ async fn main() -> Result<()> {
 
     nfrp_server::serve::ensure_protocol(&cfg)?;
 
+    // 插件地址/路径的合法性在启动前就检查，`--check` 也要能发现。
+    let plugin_manager = std::sync::Arc::new(nfrp_common::plugin::PluginManager::from_config(
+        &cfg.http_plugins,
+    )?);
+    if !plugin_manager.is_empty() {
+        tracing::info!(
+            "HTTP 插件已装载：{} 个插件，{} 个 op 订阅",
+            cfg.http_plugins.len(),
+            cfg.http_plugins.iter().map(|p| p.ops.len()).sum::<usize>()
+        );
+    }
+
     if cli.check {
         // ★★ v0.5.7 修（第六轮审计 F-1，中危）：**预检必须与启动同口径**。
         //
@@ -314,6 +326,7 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let registry = Arc::new(Registry::new(limits_from(&cfg)));
+    registry.set_plugins(plugin_manager);
     let extras = nfrp_server::ServeExtras {
         config_path: Some(path.clone()),
         log_handle,

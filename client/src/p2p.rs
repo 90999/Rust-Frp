@@ -289,6 +289,12 @@ pub struct P2PRoute {
     pub transport: Transport,
     /// 端口预测窗口；0 表示只用牵线下发的那一个地址（官方行为）。
     pub predict_window: u16,
+    /// 打洞前用来探公网映射地址的 STUN 服务器（官方 `natHoleStunServer`）。
+    ///
+    /// ★ v0.6.6：从 `ClientConfig` 在 [`setup`] 时拷贝过来 —— 这里不持 `&ClientConfig`
+    /// 是因为它要跨 task 共享（引用活不了那么久）。
+    /// 空字符串 = 不做 STUN 探测。
+    pub stun_servers: String,
 }
 
 /// 建一套打洞中枢；`None` 表示配置里没开 P2P（xtcp 将只走中继）。
@@ -310,6 +316,7 @@ pub async fn setup(
         Arc::new(P2PRoute {
             server_udp: addr,
             bus,
+            stun_servers: cfg.nat_hole_stun_server.clone(),
             transport: parse_transport(&cfg.xtcp_transport),
             predict_window: if cfg.xtcp_port_predict {
                 cfg.xtcp_predict_window.max(1)
@@ -389,6 +396,11 @@ pub async fn try_punch_as_visitor(
             Transport::Quic => "quic".to_string(),
             Transport::Kcp => "kcp".to_string(),
         },
+        // ★ v0.6.6：配了 `natHoleStunServer` 就先探一下自己的公网映射地址。
+        //
+        // 探不到不是致命错误（锥形 NAT 下靠"服务端看到的源地址"
+        // 也能打），所以失败只记一条 debug 日志、继续走原流程。
+        mapped_addrs: stun_mapped_addr(route).await,
         ..Default::default()
     };
     let _ = run_id;
@@ -974,6 +986,28 @@ impl AsyncWrite for P2PStream {
         match self.get_mut() {
             Self::Quic(s) => Pin::new(s).poll_shutdown(cx),
             Self::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// 用 `natHoleStunServer` 探测本机的公网映射地址。
+///
+/// 返回空 `Vec` 表示"没配"或"探测失败" —— 两种情况对上层等价：
+/// 服务端会退回用"它看到的源地址"做撮合。
+async fn stun_mapped_addr(route: &P2PRoute) -> Vec<String> {
+    let servers = route.stun_servers.trim();
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    match nfrp_common::stun::probe(servers).await {
+        Ok(addr) => {
+            tracing::debug!(%addr, "STUN 探测到公网映射地址");
+            vec![addr.to_string()]
+        }
+        Err(e) => {
+            // 不致命：锥形 NAT 下没有它也能打洞
+            tracing::debug!("STUN 探测失败（不影响继续尝试打洞）：{e:#}");
+            Vec::new()
         }
     }
 }

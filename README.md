@@ -122,7 +122,9 @@ nfrp-common = "0.6"
 第五轮（39 项）见 [SECURITY-FIXES-ROUND5.md](SECURITY-FIXES-ROUND5.md)；
 第六轮（8 项）见 [SECURITY-FIXES-ROUND6.md](SECURITY-FIXES-ROUND6.md)；
 第七轮（13 项）见 [SECURITY-FIXES-ROUND7.md](SECURITY-FIXES-ROUND7.md)；
-第八轮（5 项）见 [SECURITY-FIXES-ROUND8.md](SECURITY-FIXES-ROUND8.md)。
+第八轮（5 项）见 [SECURITY-FIXES-ROUND8.md](SECURITY-FIXES-ROUND8.md)；
+第十六轮（官方 0.71 兼容收尾 / NatHole / SSH 网关 / pprof / HTTP 插件）见
+[SECURITY-FIXES-ROUND16.md](SECURITY-FIXES-ROUND16.md)。
 
 ### 运维与调度
 
@@ -141,10 +143,20 @@ nfrp-common = "0.6"
 - 面板可直接增删代理、踢掉客户端，无需改配置重启
 - Dashboard API v2（`/api/v2/*`）：统一错误信封 + 分页 + 稳定排序；v1 接口行为不变
 - 客户端本地 Web UI / API（`[webServer] port = 7400`）：查看隧道 / 连接 / 流量，并可增删代理
+- CPU profile：`pprofEnable = true` 后，服务端面板与客户端本地 Web 都提供
+  `GET /debug/pprof/profile?seconds=N`（默认 10 秒、上限 60 秒）；Unix 返回
+  protobuf，Windows 明确 501（Rust `pprof` 依赖 perf signal / `ucontext_t`）
+- SSH 隧道网关（`sshTunnelGateway`）：服务端内嵌 SSH 服务器，OpenSSH 的
+  `ssh -R` 可直接注册 `tcp` / `http` / `https` / `tcpmux` / `stcp` 代理，
+  数据面复用普通工作连接；`authorizedKeysFile` 非空时只接受文件内公钥，
+  公钥注释就是 frp 用户名
+- HTTP 插件（`httpPlugins`）：服务端在 `Login` / `NewProxy` / `CloseProxy` /
+  `Ping` / `NewWorkConn` / `NewUserConn` 时回调外部 HTTP 服务，支持拒绝、
+  改写登录内容和代理名/metas；每次请求 10 秒超时
 
 ### 工程质量
 
-- 725 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- 867 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
 - CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
 - 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
 - 发布产物附 `SHA256SUMS` + Ed25519 分离签名
@@ -359,29 +371,33 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 ## 当前限制
 
 - **VirtualNet 的 TUN 设备**：Linux 用 `/dev/net/tun`（需 root 或 `CAP_NET_ADMIN`）；
-  **Windows 用 Wintun**（v0.6.6 起支持，需管理员权限 + 自行下载 `wintun.dll`，
-  数据面已真机验证：ping 由我们应答，内核→TUN→我们→TUN→内核 双向打通）；
+  **Windows 用 Wintun**（v0.6.6 起支持，需管理员权限 + 自行下载 `wintun.dll`；
+  仓库含 `#[ignore]` 的真机网卡和双向 ping 数据面测试，需管理员权限手动执行；
+  非管理员会话已验证缺 DLL / 拒绝访问的错误路径，但本轮没有重跑真机数据面）；
   macOS 未实现，配置了会明确报错而不是静默失败
-- 与官方 0.71 的配置字段对齐情况分三类：
+- 与官方 0.71 的配置字段对齐情况：
 
   **已实现**：TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，
   含服务端 mTLS 与客户端证书）、`auth.tokenSource`（文件 / 外部命令，客户端与服务端）、
   `includes`（客户端配置包含）、`quicBindPort`、`enablePrometheus`、
-  `udpPacketSize`（两端；默认 65507 而非官方的 1500 —— 见下）
+  `udpPacketSize`（两端；默认 65507 而非官方的 1500 —— 见下）、
+  客户端 `useEncryption` / `useCompression`（按官方 golib 的 AES-128-CFB + snappy
+  流实现，单测/内存双端通过；未做官方 frpc 组合 e2e）、
+  `proxyURL`（HTTP CONNECT / SOCKS5 出站代理）、
+  `dnsServer`（A/AAAA 查询走自定义 UDP DNS）、`natHoleStunServer`（RFC 5389
+  探测公网映射）、`pprofEnable`（Unix CPU profile，Windows 明确 501）、
+  `assetsDir`（面板静态资源目录）、`natholeAnalysisDataReserveHours`
+  （NatHole 分析记录保留期，0 = 不保留）、`httpPlugins`（服务端登录/代理/
+  工作连接回调）、`sshTunnelGateway`（OpenSSH `ssh -R` 隧道网关）。
 
-  **本工具不适用**（不是"没做"，是概念上没有对应）：
-  `pprofEnable` —— 那是 Go 运行时的 CPU / 堆采样；Rust 用 `perf` / `heaptrack`
-  在进程外抓，内嵌一个同名开关只会误导人。
-  `sshTunnelGateway` —— 官方 frps 内嵌了一个 SSH 服务器（`ssh -R` 直接开隧道），
-  要补它等于在本项目里再写一个 SSH 服务端，攻击面与工作量都远超"配置字段"。
+  **官方 NatHole / xtcp**：已实现官方控制器协议，并用官方 `frpc 0.71.0`
+  做过真实 e2e（provider/visitor 经 `NatHoleSid` 工作连接、`NatHoleClient`、
+  `NatHoleResp` 完成 UDP 打洞，访问成功）。当前覆盖 EasyNAT / 公网直连的
+  mode 0 场景；HardNAT、端口预测、多 STUN 地址与 TTL 探测等完整 NAT 分类
+  尚未实现，极端 NAT 组合下可能打洞失败后由客户端回退中继。
 
-  **仍未做**：客户端的 `useEncryption` / `useCompression`（数据面加密与压缩，
-  需要与 `fatedier/golib` 的 AES-128-CFB 与 snappy 流**字节级对齐**，
-  做错会静默破坏与官方 frpc 的互通）、`proxyURL`（出站 HTTP/SOCKS5 代理）、
-  `dnsServer`（自定义 DNS）、`natHoleStunServer`、`pprofEnable`、`assetsDir`；
-  服务端的 `assetsDir`、`webServer.tls.certFile` / `webServer.tls.keyFile`
-  （面板 HTTPS）、`natholeAnalysisDataReserveHours`、`httpPlugins`（服务端鉴权回调）。
-  配置里写了这些字段时，启动日志会逐条列出"配了但不会生效"。
+  **仍未做**：`webServer.tls.certFile` / `webServer.tls.keyFile`（面板 HTTPS）。
+  配置了这两个字段会在启动日志里明确报"未实现"，不会静默忽略。
 
   > `udpPacketSize` 的默认值**故意与官方不同**：官方默认 1500，NFRP 一直用
   > 65507（UDP 协议上限）。改成 1500 会**静默截断**现有用户的大 UDP 报文

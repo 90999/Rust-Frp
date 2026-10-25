@@ -428,7 +428,21 @@ async fn main() -> Result<()> {
             session_rx.clone(),
         );
         let serving = hub.clone();
-        tokio::spawn(web::run(listener, serving));
+        // 官方 `[webServer.tls]`：与 frps 面板同一套语义，配置 cert/key 后
+        // 本地面板只接受 HTTPS。
+        let tls_acceptor = match cfg.web_server.tls.files()? {
+            Some((cert, key)) => {
+                let tls = nfrp_common::frp::tls::server_config_from_pem_with_ca(cert, key, "")
+                    .with_context(|| format!("加载客户端面板 HTTPS 证书失败（{cert} / {key}）"))?;
+                Some(tokio_rustls::TlsAcceptor::from(tls))
+            }
+            None => None,
+        };
+        if tls_acceptor.is_some() {
+            tokio::spawn(web::run_with_tls(listener, serving, tls_acceptor));
+        } else {
+            tokio::spawn(web::run(listener, serving));
+        }
         Some(hub)
     } else {
         None
@@ -654,6 +668,8 @@ fn cmd_verify(a: &VerifyArgs) -> Result<()> {
 /// ★ 与服务端共用同一个真源 `nfrp_common::config::has_dashboard_creds()`，
 ///   保证两端口径永不漂移。
 fn check_web_server_is_safe(cfg: &ClientConfig) -> Result<()> {
+    // 先校验 TLS 文件成对，避免端口已经绑定后才在启动路径深处失败。
+    cfg.web_server.tls.files()?;
     let has_creds =
         nfrp_common::config::has_dashboard_creds(&cfg.web_server.user, &cfg.web_server.password);
     if !has_creds
@@ -904,19 +920,69 @@ fn parse_local_bind(raw: &str) -> Result<std::net::SocketAddr> {
 ///
 /// 套壳顺序与官方 frpc 一致：`TCP -> [TLS] -> [WebSocket]`，
 /// yamux 由 [`ServerLink`] 再套在外面。
+/// 把代理 URL 里的 `user:pass@` 抹掉，只留 `scheme://host:port`。
+///
+/// 代理密码写进日志是真实事故（日志会被收集、转发、贴到 issue 里），
+/// 所以**每一处**打代理地址的地方都必须过这里。
+fn redact_proxy(url: &str) -> String {
+    match url.rsplit_once('@') {
+        Some((_, rest)) => match url.split_once("://") {
+            Some((scheme, _)) => format!("{scheme}://{rest}"),
+            None => rest.to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
 async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     // KCP 是另一条路：裸 UDP 上的可靠传输，TLS / WebSocket 那几层跟它没关系
     if is_kcp(&cfg.transport_protocol) {
         return kcp_connect(cfg).await;
     }
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
-    let addr = util::resolve_addr(&server)
-        .await
-        .with_context(|| format!("解析服务端地址 {server} 失败"))?;
-    let stream = dial_server(cfg, addr)
-        .await
-        .with_context(|| format!("连接 {addr} 失败"))?;
-    stream.set_nodelay(true).ok();
+    // ★ v0.6.6：配了 `dnsServer` 就用它解析服务端域名；
+    // 没配就走系统 resolver（原路径，行为不变）。
+    let addr = if cfg.dns_server.trim().is_empty() {
+        util::resolve_addr(&server)
+            .await
+            .with_context(|| format!("解析服务端地址 {server} 失败"))?
+    } else {
+        nfrp_common::dns::resolve_addr_via(&cfg.dns_server, &server)
+            .await
+            .with_context(|| {
+                format!(
+                    "用自定义 DNS {} 解析服务端地址 {server} 失败",
+                    cfg.dns_server
+                )
+            })?
+    };
+    // ★ v0.6.6：`transport.proxyURL` —— 走出站代理时直接拿到一条已建好的隧道流；
+    // 不走代理时保持原样（TcpStream + nodelay）——零回归。
+    //
+    // 为什么代理路径跳过 `set_nodelay`：那个方法只在 `TcpStream` 上有，
+    // 而代理链路上拿到的是 `BoxStream`（可能还包了 TLS）。
+    // 代理链路上延迟主要来自代理本身，nodelay 作用有限。
+    let stream: BoxStream = if cfg.proxy_url.trim().is_empty() {
+        let s = dial_server(cfg, addr)
+            .await
+            .with_context(|| format!("连接 {addr} 失败"))?;
+        s.set_nodelay(true).ok();
+        Box::pin(s)
+    } else {
+        debug!(
+            proxy = %redact_proxy(&cfg.proxy_url),
+            %server,
+            "通过代理连接服务端"
+        );
+        nfrp_common::net_proxy::connect(&cfg.proxy_url, &cfg.server_addr, cfg.server_port, None)
+            .await
+            .with_context(|| {
+                format!(
+                    "经代理 {} 连接服务端 {server} 失败",
+                    redact_proxy(&cfg.proxy_url)
+                )
+            })?
+    };
 
     let name = if cfg.tls_server_name.is_empty() {
         &cfg.server_addr
@@ -1262,7 +1328,13 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     // 代理表由 `main` 建好传进来（与本地管理界面共用同一张），这里**不重建** ——
     // 重建会把界面上刚加进去的代理抹掉。
     for p in &cfg.proxies {
-        let msg = NewProxy::from_config(p, &cfg.user);
+        let mut msg = NewProxy::from_config(p, &cfg.user);
+        // ★ 官方语义：`[transport].useEncryption` 是**客户端级**开关，作用于所有代理。
+        // 代理级字段是 NFRP 的扩展（允许单条代理单独开），两者取或。
+        // 服务端就是按这个字段决定要不要解密/解压的，漏传会导致"客户端加密、
+        // 服务端明文透传"—— 用户看到的是能连上但数据全乱。
+        msg.use_encryption |= cfg.use_encryption;
+        msg.use_compression |= cfg.use_compression;
         conn.send_msg(&FrpMessage::NewProxy(msg)).await?;
     }
 
@@ -1600,7 +1672,7 @@ async fn work_conn_flow(
     let stream = link.connect().await?;
 
     let ts = util::now_unix_secs() as i64;
-    let (mut work, leftover, start) =
+    let (work, leftover, start) =
         conn::client_work_conn(stream, link.wire, &run_id, &link.cfg.token, ts).await?;
 
     // 服务端下发的名字是**线上全名**（带 `{user}.` 前缀），本地映射表按配置里的
@@ -1719,11 +1791,67 @@ async fn work_conn_flow(
         }
     }
 
-    if !leftover.is_empty() {
+    // ★★ 加密/压缩时 leftover 必须进 ProxyStream，不能直接写给内网服务！
+    //
+    // leftover 是读 StartWorkConn 时多读到的字节，它属于 **frps → frpc** 方向。
+    // 明文时它就是用户请求的开头，直接写给内网服务是对的；
+    // **但开了加密/压缩时它是密文/压缩流的前缀**，直接写会把内网服务
+    // 破坏成倒时间头（实测：本地 HTTP 服务报 "Exception occurred during
+    // processing of request"，然后不返回响应，客户端看到的就是超时）。
+    //
+    // 正确做法：把 leftover 当作 work 流的**前缀**，先拼回去，再包 ProxyStream。
+    let need_wrap_early = proxy.use_encryption
+        || link.cfg.use_encryption
+        || proxy.use_compression
+        || link.cfg.use_compression;
+    if !leftover.is_empty() && !need_wrap_early {
         local_stream.write_all(&leftover).await?;
     }
+    let work: nfrp_common::frp::stream::BoxStream = if need_wrap_early {
+        Box::pin(nfrp_common::frp::stream::PrefixedStream::new(
+            leftover, work,
+        ))
+    } else {
+        work
+    };
+    let mut work = work;
+
     // 带宽限流：配了就按令牌桶限速，没配就走原路径（行为完全不变）
     let limit = throttle::parse_bandwidth(&proxy.bandwidth_limit).unwrap_or(0);
+
+    // ★ v0.6.6：数据面加密 / 压缩（官方 transport.useEncryption / useCompression）
+    //
+    // 位置很关键：包在**工作连接**这一侧（`work` = 到 frps 的那条连接），
+    // 内网服务那一侧（`local_stream`）保持明文 —— 与官方 `GetRealConn` 的
+    // 包装方向一致。
+    //
+    // 不配时**一个字节都不多走**：`need_wrap` 为假直接走原路径，
+    // 行为与之前完全一致。
+    // ★ 官方语义：客户端级 `[transport]` 开关 + NFRP 的代理级开关，取或。
+    let eff_enc = proxy.use_encryption || link.cfg.use_encryption;
+    let eff_comp = proxy.use_compression || link.cfg.use_compression;
+    if eff_enc || eff_comp {
+        let key = eff_enc.then(|| nfrp_common::frp::v1::derive_key(link.cfg.token.as_bytes()));
+        debug!(
+            proxy = %start.proxy_name,
+            enc = eff_enc,
+            comp = eff_comp,
+            "数据面已启用加密/压缩"
+        );
+        let wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work, key, eff_comp);
+        // relay_throttled 按值接收并要求 'static，所以这里把 wrapped 交出去
+        let r = if limit > 0 {
+            throttle::relay_throttled(wrapped, local_stream, limit, limit).await
+        } else {
+            let mut w = wrapped;
+            util::relay_between(&mut w, &mut local_stream).await
+        };
+        if let Err(e) = r {
+            debug!(proxy = %start.proxy_name, "转发中断：{e}");
+        }
+        return Ok(());
+    }
+
     let r = if limit > 0 {
         debug!(proxy = %start.proxy_name, limit, "按 {} 字节/秒限速", limit);
         throttle::relay_throttled(work, local_stream, limit, limit).await
@@ -1875,6 +2003,8 @@ mod tests {
         ProxyConfig {
             proxy_protocol_version: "v2".into(),
             transport: Default::default(),
+            use_encryption: false,
+            use_compression: false,
             name: "web-a".into(),
             proxy_type: "tcp".into(),
             local_addr: "127.0.0.1:8080".into(),

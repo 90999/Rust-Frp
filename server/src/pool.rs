@@ -95,6 +95,21 @@ impl WorkItem {
 /// * visitor 连接（stcp / xtcp）：握手完成后它本身就是裸字节通道。
 pub struct PendingUser {
     pub proxy: String,
+    /// 代理类型与所属客户端身份，`NewUserConn` 插件需要。
+    pub proxy_type: String,
+    pub client_user: String,
+    pub client_run_id: String,
+    /// 数据面是否加密（`NewProxy.use_encryption`）。
+    ///
+    /// ★ v0.6.6：随用户连接一起带下来，因为真正做 relay 的
+    /// [`crate::serve::bridge`] 拿不到 `ClientState` / `SecurityContext`。
+    pub use_encryption: bool,
+    /// 数据面是否压缩（`NewProxy.use_compression`）。
+    pub use_compression: bool,
+    /// 已派生的数据面密钥（仅在 `use_encryption` 时是 `Some`）。
+    ///
+    /// 这里直接存**派生结果**而不是 token 本身：bridge 那一层不该接触明文 token。
+    pub data_key: Option<[u8; 16]>,
     pub remote_port: u16,
     pub stream: BoxStream,
     pub peer: SocketAddr,
@@ -153,6 +168,15 @@ struct ProxyEntry {
     slot: Permit,
     /// 占用的公网端口；`http` / `https` / `stcp` / `xtcp` 这类没有公网端口的为 `None`。
     port: Option<u16>,
+    /// 数据面是否加密（来自客户端 `NewProxy.use_encryption`）。
+    ///
+    /// ★ v0.6.6：服务端必须知道它，否则工作连接的另一端不知道要解密 ——
+    /// 客户端加密、服务端明文透传，用户会得到"能连上、数据全乱"。
+    use_encryption: bool,
+    /// 数据面是否压缩（来自 `NewProxy.use_compression`）。
+    use_compression: bool,
+    /// 代理类型（`tcp` / `http` / `stcp` ...）。给 `NewUserConn` 插件用。
+    proxy_type: String,
 }
 
 /// 一对已经配对成功的（用户连接，工作连接）。
@@ -168,7 +192,11 @@ pub enum Submit {
     /// 已入队等工作连接；调用方需要据此向客户端索要新连接。
     Queued,
     /// 待处理队列已满，必须立刻拒绝这条连接。
-    Full(PendingUser),
+    ///
+    /// `PendingUser` 带着 stream、地址、token 等一堆字段；不装箱会让整个
+    /// `Submit` 枚举按最大变体分配 264 字节，正常命中 `Paired` / `Queued`
+    /// 的路径也要扛这个体积。拒绝路径本来就是冷路径，装箱只多一次分配。
+    Full(Box<PendingUser>),
 }
 
 #[derive(Default)]
@@ -450,7 +478,58 @@ impl ClientState {
         self.proxies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(name, ProxyEntry { slot, port });
+            .insert(
+                name,
+                ProxyEntry {
+                    slot,
+                    port,
+                    // 由 `set_proxy_flags` 回填（注册时从 NewProxy 消息取）
+                    use_encryption: false,
+                    use_compression: false,
+                    proxy_type: String::new(),
+                },
+            );
+    }
+
+    /// 回填代理类型（`tcp` / `http` / `stcp` ...），供 `NewUserConn` 插件使用。
+    pub fn set_proxy_type(&self, name: &str, proxy_type: &str) {
+        let mut g = self.proxies.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.get_mut(name) {
+            e.proxy_type = proxy_type.to_string();
+        }
+    }
+
+    /// 查代理类型；不存在时返回空串。
+    pub fn proxy_type(&self, name: &str) -> String {
+        self.proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|e| e.proxy_type.clone())
+            .unwrap_or_default()
+    }
+
+    /// 回填某条代理的数据面标志（加密 / 压缩）。
+    ///
+    /// 从 `NewProxy` 消息里拿到的值，注册时调用一次。
+    /// 代理不存在时安静返回 —— 注册失败路径上不该再报错。
+    pub fn set_proxy_flags(&self, name: &str, enc: bool, comp: bool) {
+        let mut g = self.proxies.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.get_mut(name) {
+            e.use_encryption = enc;
+            e.use_compression = comp;
+        }
+    }
+
+    /// 查某条代理的数据面标志：`(加密, 压缩)`。
+    ///
+    /// 代理不存在时返回 `(false, false)` —— 与"没配"同义（明文透传），
+    /// 不会因为查不到就把数据当成密文去解。
+    pub fn proxy_flags(&self, name: &str) -> (bool, bool) {
+        let g = self.proxies.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(name)
+            .map(|e| (e.use_encryption, e.use_compression))
+            .unwrap_or((false, false))
     }
 
     /// 当前登记的代理数。
@@ -571,7 +650,7 @@ impl ClientState {
             return Submit::Paired(Box::new(PairedBox { user, work: w }));
         }
         let Some(permit) = self.backlog_limit.try_acquire() else {
-            return Submit::Full(user);
+            return Submit::Full(Box::new(user));
         };
         user.queue_permit = Some(permit);
         g.users.push_back(user);
@@ -633,7 +712,15 @@ impl ClientState {
             }
         };
         if paired.is_none() {
-            self.work_notify.notify_waiters();
+            // `notify_one` 而不是 `notify_waiters`：一条工作连接只该唤醒
+            // 一个 `acquire_work_conn` 等待者。更关键的是，Tokio 的
+            // `notify_waiters` **不保存许可**：如果工作连接在
+            // `acquire_work_conn_within` 刚发出 `RequestWork`、但还没
+            // `await notified()` 的窗口里到达，通知会直接丢掉，工作连接
+            // 却已躺在池里，等待者只能空等超时。官方 frpc 的 xtcp
+            // 工作连接正是这么快，真实 e2e 每次都命中这个窗口。
+            // `notify_one` 会把许可存下来，之后 `notified()` 立即返回。
+            self.work_notify.notify_one();
         }
         paired
     }
@@ -715,6 +802,12 @@ mod tests {
     fn user(name: &str, now: Instant) -> PendingUser {
         PendingUser {
             proxy: name.to_string(),
+            proxy_type: "tcp".to_string(),
+            client_user: "test".to_string(),
+            client_run_id: "test-run".to_string(),
+            use_encryption: false,
+            use_compression: false,
+            data_key: None,
             remote_port: 0,
             stream: Box::pin(tokio::io::empty()),
             peer: SocketAddr::from(([127, 0, 0, 1], 1234)),
