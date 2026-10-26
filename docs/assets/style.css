@@ -81,6 +81,12 @@ html {
   scroll-behavior: smooth;
   scroll-padding-top: calc(var(--header-h) + 20px);
   -webkit-text-size-adjust: 100%;
+
+  /* ★ 关键：始终为垂直滚动条预留位置。
+     没有它的话，主题切换引起的高度微小变化会让滚动条"闪现/消失"，
+     视口宽度随之变化（约 15px），而 .main 的宽度是 calc(100% - …)，
+     于是整块内容横向跳一下 —— 就是"切主题时往左瞬移"的成因。 */
+  scrollbar-gutter: stable;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -239,6 +245,8 @@ a:hover {
   left: 0;
   width: var(--sidebar-w);
   overflow-y: auto;
+  /* 导航滚动条出现/消失时不改变内部宽度（否则整列文字会横向闪一下） */
+  scrollbar-gutter: stable;
   overscroll-behavior: contain;
   padding: 22px 12px 40px 20px;
   border-right: 1px solid var(--border);
@@ -530,6 +538,7 @@ pre {
   font-size: 13px;
   line-height: 1.65;
   scrollbar-width: thin;
+  scrollbar-gutter: stable;
 }
 
 pre code {
@@ -587,6 +596,7 @@ pre:hover .copy-btn {
   margin: 0 0 20px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  scrollbar-gutter: stable;
 }
 
 table {
