@@ -45,6 +45,7 @@ use nfrp_common::{
     frp::{msg::Login, msg::NewProxy, BoxStream, FrpConn, WireVersion},
     plugin, util,
 };
+use russh::server::{PublicKeyOffer, VerifiedPublicKey};
 use russh::{
     keys::{ssh_key::LineEnding, Algorithm, PrivateKey, PublicKey},
     server::{Auth, Handler, Msg, Server, Session},
@@ -224,7 +225,13 @@ impl Handler for GatewayHandler {
         }
     }
 
-    async fn auth_publickey_offered(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        offer: PublicKeyOffer<'_>,
+    ) -> Result<Auth> {
+        // russh 0.65：offered 阶段拿到的是 PublicKeyOffer，公钥在 .public_key 上
+        let key = offer.public_key;
         if self.authorized.is_empty() || self.authorized.user_for(key).is_some() {
             Ok(Auth::Accept)
         } else {
@@ -232,7 +239,9 @@ impl Handler for GatewayHandler {
         }
     }
 
-    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        // russh 0.65：验证通过后给的是 VerifiedPublicKey，公钥在 .public_key 上
+        let key = key.public_key;
         if self.authorized.is_empty() {
             return Ok(Auth::Accept);
         }
@@ -247,14 +256,21 @@ impl Handler for GatewayHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if self.first_channel.is_some() {
             // 官方只处理第一条 session channel。
-            return Ok(false);
+            // russh 0.65 用「不 accept」表示拒绝（旧版是 return Ok(false)）。
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
+        // russh 0.65：接受 channel 要显式 reply.accept()
+        reply.accept().await;
         self.first_channel = Some(channel);
-        Ok(true)
+        Ok(())
     }
 
     async fn exec_request(
@@ -634,7 +650,11 @@ impl AuthorizedKeys {
                 format!("authorizedKeysFile 第 {} 行的公钥无法解析", lineno + 1)
             })?;
             let bytes = parsed.to_bytes().context("authorized key 编码失败")?;
-            keys.insert(bytes, parsed.comment().trim().to_string());
+            // russh 0.65：comment() 返回 ssh_key 的 Comment，用 as_str() 取原文
+            // russh 0.65：comment() 返回 ssh_key 的 Comment，as_str() 是 Result（非 UTF-8 会报错）。
+            // 注释就是 frp 用户名，解不出就当空处理，不让整个 keys 文件失效。
+            let comment = parsed.comment().as_str().unwrap_or("").trim().to_string();
+            keys.insert(bytes, comment);
         }
         Ok(Self { keys })
     }
@@ -888,7 +908,10 @@ fn load_or_generate_host_key(
         }
         warn!(path = %path.display(), "自动生成的 SSH 主机私钥无法解析，将重新生成");
     }
-    let key = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519)
+    // 用 OS 熵源：`PrivateKey::random` 要求 `rand_core::CryptoRng`，
+    // 而 `rand::thread_rng()`（ThreadRng）在新版 rand_core 下不再满足该 trait
+    // （russh 0.60 升级后暴露）。生成主机私钥本来也该走 OS 随机源。
+    let key = PrivateKey::random(&mut rand010::rng(), Algorithm::Ed25519)
         .context("生成 SSH 主机私钥失败")?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -954,8 +977,8 @@ mod tests {
 
     #[test]
     fn authorized_keys_注释就是_frp_用户() {
-        let key = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap();
-        let other = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand010::rng(), Algorithm::Ed25519).unwrap();
+        let other = PrivateKey::random(&mut rand010::rng(), Algorithm::Ed25519).unwrap();
         let line = format!(
             "command=\"/bin/false\",no-pty {} alice\n",
             key.public_key().to_openssh().unwrap()

@@ -25,6 +25,11 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 russh = { workspace = true }
+# 与 russh 0.60 内部使用的 rand_core 保持同一主版本，
+# 否则 PrivateKey::random 要求的 CryptoRng trait 对不上。
+# rand 0.10 提供 OsRng（O.10 的 rand_core 只有 trait），
+# 与 russh 0.60 内部的 rand_core 主版本一致。
+rand010 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
 rand = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
