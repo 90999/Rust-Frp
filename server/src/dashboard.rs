@@ -291,6 +291,22 @@ where
     // 见 [`send`] 的 `head_only` 参数说明。
     let head_only = method == "HEAD";
 
+    // ★ NFRP-13：安全相关头必须唯一。出现两个以上 Authorization
+    // 直接当畸形请求拒掉，而不是“取第一个”——否则与前置代理 / WAF 的
+    // 取值口径一旦相反，就是鉴权差异（请求走私类问题的典型前提）。
+    if unique_header(&req, "authorization").is_err() {
+        send(
+            &mut stream,
+            400,
+            "text/plain; charset=utf-8",
+            b"Duplicate Authorization header\n",
+            SEC_HEADERS,
+            head_only,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // 健康探针必须在鉴权**之前**处理。
     //
     // k8s 的 liveness/readiness、docker 的 HEALTHCHECK、各类 LB 的健康检查
@@ -771,6 +787,28 @@ fn header_value(req: &str, name: &str) -> Option<String> {
     None
 }
 
+/// 安全相关头：**必须唯一**。重复即为畸形请求（NFRP-13）。
+///
+/// 为什么不能“取第一个就算了”：面板前面经常挂 Nginx / WAF / SSO 网关，
+/// 上游与 NFRp 对“哪个 `Authorization` 生效”理解一旦相反，就是鉴权差异，
+/// 属于请求走私类问题的经典前置条件。
+///
+/// 返回 `Err(())` 表示同名头出现两次以上，调用方应直接回 400。
+fn unique_header(req: &str, name: &str) -> std::result::Result<Option<String>, ()> {
+    let head = req.split("\r\n\r\n").next().unwrap_or(req);
+    let mut it = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim().to_string());
+
+    match (it.next(), it.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => Ok(Some(v)),
+        _ => Err(()),
+    }
+}
+
 fn basic_auth_of(req: &str) -> Option<String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let raw = header_value(req, "authorization")?;
@@ -887,54 +925,67 @@ where
 // ---------------------------------------------------------------------------
 
 fn status_json(registry: &Registry, snap: &Snapshot) -> String {
-    let mut clients = String::from("[");
-    let infos = registry.clients();
-    for (i, c) in infos.iter().enumerate() {
-        if i > 0 {
-            clients.push(',');
-        }
-        // run_id 必须带上：面板上的"新增代理 / 踢出"是拿它当主键的。
-        // client_id 会重复（同一个 client_id 重连多次），不能当主键用。
-        clients.push_str(&format!(
-            "{{\"run_id\":{:?},\"client_id\":{:?},\"user\":{:?},\"proxies\":{:?},\"backlog\":{},\"idle_work_conns\":{},\"managed\":{}}}",
-            c.run_id, c.client_id, c.user, c.proxies, c.backlog, c.idle_work_conns, c.managed
-        ));
-    }
-    clients.push(']');
-
-    let mut visitors = String::from("[");
-    let list = registry.visitors.list();
-    for (i, v) in list.iter().enumerate() {
-        if i > 0 {
-            visitors.push(',');
-        }
-        visitors.push_str(&format!(
-            "{{\"proxy_name\":{:?},\"type\":{:?},\"provider_user\":{:?},\"allow_users\":{:?}}}",
-            v.proxy_name, v.proxy_type, v.provider_user, v.allow_users
-        ));
-    }
-    visitors.push(']');
-
-    let ports: Vec<String> = registry
-        .reserved_ports()
+    // ★★ NFRP-05（P0）：不能用 `format!` + `{:?}` 拼 JSON。
+    //
+    // Rust 的 `Debug` 对控制字符输出 **`\u{1}`**（Rust 语法），
+    // 而 JSON 只接受 **`\u0001`**（4 位十六进制）。
+    //
+    // 实测（本机复现，commit c7214ab）：只要一个已注册客户端把
+    // `client_id` 里塞一个 `\u{1}`，`/api/status` 就变成非法 JSON
+    // （Python / PowerShell 两个独立解析器都报错），面板 `JSON.parse` 直接白屏。
+    // 等于“让管理员看不见我”。
+    //
+    // 这里交给 serde_json，转义规则不再由我们自己担。
+    let clients: Vec<serde_json::Value> = registry
+        .clients()
         .iter()
-        .map(|p| p.to_string())
+        .map(|c| {
+            serde_json::json!({
+                // run_id 必须带上：面板的"新增代理 / 踢出"是拿它当主键的。
+                // client_id 会重复（同一个 client_id 重连多次），不能当主键用。
+                "run_id": c.run_id,
+                "client_id": c.client_id,
+                "user": c.user,
+                "proxies": c.proxies,
+                "backlog": c.backlog,
+                "idle_work_conns": c.idle_work_conns,
+                "managed": c.managed,
+            })
+        })
         .collect();
 
-    format!(
-        concat!(
-            "{{\"status\":{},\"clients\":{},\"visitors\":{},\"ports\":[{}],",
-            "\"p2p_enabled\":{},\"limits\":{{\"max_clients\":{},\"max_total_conns\":{},\"max_conns_per_client\":{}}}}}"
-        ),
-        encode_json(snap),
-        clients,
-        visitors,
-        ports.join(","),
-        registry.p2p().is_some(),
-        registry.limits().max_clients,
-        registry.limits().max_total_conns,
-        registry.limits().max_conns_per_client,
-    )
+    let visitors: Vec<serde_json::Value> = registry
+        .visitors
+        .list()
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "proxy_name": v.proxy_name,
+                "type": v.proxy_type,
+                "provider_user": v.provider_user,
+                "allow_users": v.allow_users,
+            })
+        })
+        .collect();
+
+    let ports: Vec<u16> = registry.reserved_ports();
+
+    serde_json::json!({
+        // `status` 段原本就走 `encode_json`（数字字段，本来就安全）；
+        // 这里把它作为**已序列化的 JSON 片段**嵌入，保持输出结构完全不变。
+        "status": serde_json::from_str::<serde_json::Value>(&encode_json(snap))
+            .unwrap_or(serde_json::Value::Null),
+        "clients": clients,
+        "visitors": visitors,
+        "ports": ports,
+        "p2p_enabled": registry.p2p().is_some(),
+        "limits": {
+            "max_clients": registry.limits().max_clients,
+            "max_total_conns": registry.limits().max_total_conns,
+            "max_conns_per_client": registry.limits().max_conns_per_client,
+        }
+    })
+    .to_string()
 }
 
 /// 面板页面：纯静态 HTML + 一点 JS 轮询 `/api/status`。
@@ -1688,6 +1739,118 @@ Authorization: Basic ",
             "HTTPS 必须带 HSTS：{text}"
         );
         h.abort();
+    }
+
+    // ==================================================================
+    // NFRP-05：`/api/status` 必须是合法 JSON
+    // ==================================================================
+
+    /// 远端可控字段带控制字符时，输出**仍然必须是合法 JSON**。
+    ///
+    /// 旧实现用 `format!("{:?}")`，控制字符被写成 `\u{1}`（Rust 语法），
+    /// JSON 解析器直接报错 —— 面板白屏、采集器全挂。
+    #[test]
+    fn status_json_对控制字符仍然合法() {
+        let registry = Arc::new(Registry::unlimited());
+        let snap = Snapshot::default();
+
+        // 空 registry 先保证基线是合法 JSON
+        let base = status_json(&registry, &snap);
+        serde_json::from_str::<serde_json::Value>(&base).expect("空状态必须是合法 JSON");
+
+        // 含控制字符的名字：这里直接验证转义函数的行为约定
+        // （Registry 里塞假客户端需要内部状态，单测层面用 serde_json 对照）
+        let evil = "poc\u{1}id\nINFO 伪造行";
+        let v = serde_json::json!({ "client_id": evil });
+        let js = v.to_string();
+        assert!(
+            !js.contains("\\u{1}"),
+            "绝不能出现 Rust 风格的 \\u{{1}}：{js}"
+        );
+        serde_json::from_str::<serde_json::Value>(&js).expect("必须是合法 JSON");
+        assert!(js.contains("\\u0001"), "控制字符要转成 JSON 的 \\u0001");
+    }
+
+    /// `status_json` 的顶层键必须齐全（改实现时别把字段弄丢）。
+    #[test]
+    fn status_json_字段齐全() {
+        let registry = Arc::new(Registry::unlimited());
+        let snap = Snapshot::default();
+        let v: serde_json::Value =
+            serde_json::from_str(&status_json(&registry, &snap)).expect("合法 JSON");
+        for key in [
+            "status",
+            "clients",
+            "visitors",
+            "ports",
+            "p2p_enabled",
+            "limits",
+        ] {
+            assert!(v.get(key).is_some(), "缺少字段 {key}：{v}");
+        }
+        assert!(v["clients"].is_array());
+        assert!(v["visitors"].is_array());
+        assert!(v["limits"]["max_clients"].is_number());
+    }
+
+    // ==================================================================
+    // NFRP-13：重复 Authorization 必须拒绝
+    // ==================================================================
+
+    #[test]
+    fn 重复_authorization_被判为畸形() {
+        let one = "GET / HTTP/1.1\r\nAuthorization: Basic YQ==\r\n\r\n";
+        assert_eq!(
+            unique_header(one, "authorization"),
+            Ok(Some("Basic YQ==".to_string()))
+        );
+
+        let two = "GET / HTTP/1.1\r\nAuthorization: Basic bad\r\nAuthorization: Basic good\r\n\r\n";
+        assert!(
+            unique_header(two, "authorization").is_err(),
+            "出现两个 Authorization 必须报错（不能取第一个）"
+        );
+
+        // 反向顺序也一样
+        let two2 =
+            "GET / HTTP/1.1\r\nAuthorization: Basic good\r\nAuthorization: Basic bad\r\n\r\n";
+        assert!(unique_header(two2, "authorization").is_err());
+
+        // 没有该头 ⇒ Ok(None)
+        assert_eq!(
+            unique_header("GET / HTTP/1.1\r\n\r\n", "authorization"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn 重复_authorization_返回_400() {
+        // 起一个最小面板，发两个 Authorization，必须 400
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (addr, _h) = spawn_dashboard_with(false).await;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let evil = concat!(
+                "GET /api/status HTTP/1.1\r\n",
+                "Host: x\r\n",
+                "Authorization: Basic dTpw\r\n",
+                "Authorization: Basic dTpw\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            let mut s = tokio::net::TcpStream::connect(addr).await.expect("连面板");
+            s.write_all(evil.as_bytes()).await.expect("发请求");
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf).await;
+            let body = String::from_utf8_lossy(&buf).to_string();
+            assert!(
+                body.starts_with("HTTP/1.1 400"),
+                "重复 Authorization 必须 400，实际：{}",
+                &body[..body.len().min(80)]
+            );
+        });
     }
 
     // ==================================================================

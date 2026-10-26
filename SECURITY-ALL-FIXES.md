@@ -3989,6 +3989,8 @@ mTLS 已做内存双端真实握手：合法客户端证书通过；不带证书
 证据：`tmp\mtls_handshake_test2.txt`。同一份 TLS 配置重复安装是幂等的；换另一组文件
 会明确报错（`configure_tls_is_idempotent_for_same_files`）。
 
+
+> 注：以下清单是**当轮**的状态记录。若与当前代码不符，以 `README.md` 与实测为准（例如 `webServer.tls.*` 已于 0.6.6 实现）。
 仍未实现：`webServer.tls.*`（面板 HTTPS）、Windows VirtualNet、官方 xtcp NatHole，
 以及 README 限制③列出的其余字段。
 
@@ -5681,7 +5683,12 @@ pprof 端点真实 200。
 
 ## 9. 仍未完成 / 不要误报
 
-- `webServer.tls.*` 面板 HTTPS：未实现，配置会明确报错。
+- ~~`webServer.tls.*` 面板 HTTPS：未实现，配置会明确报错。~~
+  **这条已过时（2026-10-26 更正）**：`webServer.tls.certFile` / `keyFile` 早已实现
+  —— rustls 包装面板与客户端 web 的监听器，只接受 HTTPS，并在响应上带
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains`。
+  实测：HTTPS 200 正常取页面，明文 HTTP 被拒。
+  上面保留原文是为了不改写历史记录，但**当前状态以本行为准**。
 - 官方 NatHole 完整 NAT 分类：只做 mode 0 / EasyNAT。
 - TSan、Linux TUN Miri、完整 PSF、Phaedra、真实 IdP OIDC e2e：环境/工具限制，
   不是“已通过”。

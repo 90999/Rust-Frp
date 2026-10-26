@@ -45,6 +45,34 @@ use crate::{pool::ClientState, registry::Registry};
 // 路由表
 // ---------------------------------------------------------------------------
 
+/// 请求目标里是否含 `.` / `..` 段（含 `%2e` 编码）。
+///
+/// # 为什么要拒绝它（NFRP-06）
+///
+/// `locations` 是**前缀匹配**，而很多后端（nginx / IIS / Apache）
+/// 会把路径做 dot-segment 归一化。于是
+/// `/public/../admin` 在 NFRp 这边命中 `/public`、到后端变成 `/admin`，
+/// “只暴露 /public”的设想直接被绕过。
+///
+/// 官方 frp 也是前缀匹配（`strings.HasPrefix`），所以这不是 NFRp 引入的问题；
+/// 但我们选择比上游更严：直接拒绝，而不是猜客户端意图。
+///
+/// 只解码一层且只处理 `%2e`（`.` 的唯一合法编码）：
+/// 多层编码如 `%252e` 到后端解码一次也只是 `%2e`，不会变成 `.`。
+fn has_dot_segment(path: &str) -> bool {
+    for seg in path.split(['/', '\\', '?', '#']) {
+        if seg.is_empty() {
+            continue;
+        }
+        // 小写化后把 %2e 归一成 '.'（%2E 也一样）
+        let decoded = seg.replace("%2e", ".").replace("%2E", ".");
+        if decoded == "." || decoded == ".." {
+            return true;
+        }
+    }
+    false
+}
+
 /// 虚拟主机的三种形态。
 ///
 /// 路由本身（域名匹配、最长前缀、`routeByHTTPUser`）三种完全共用 —— 都是官方
@@ -537,7 +565,7 @@ async fn handle_https(
     };
 
     let Some((route, _)) = table.lookup(&sni, "/", None, VhostKind::Https) else {
-        warn!(%peer, %sni, "没有匹配的 https 代理");
+        warn!(%peer, sni = %nfrp_common::util::LogSafe(&sni), "没有匹配的 https 代理");
         return Ok(());
     };
 
@@ -563,7 +591,7 @@ async fn handle_https(
     registry.metrics().https_conns.inc();
     let _guard = ConnGuard::new(&registry);
 
-    debug!(%peer, %sni, proxy = %route.proxy_name, "HTTPS 透传开始");
+    debug!(%peer, sni = %nfrp_common::util::LogSafe(&sni), proxy = %route.proxy_name, "HTTPS 透传开始");
     let (mut upstream, leftover) = work_conn.into_stream();
     if !leftover.is_empty() {
         // 极少见：StartWorkConn 之后客户端已经把响应写回来了
@@ -574,7 +602,7 @@ async fn handle_https(
     let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
     record_bytes(&registry, &r);
     if let Err(e) = r {
-        debug!(%peer, %sni, "HTTPS 透传中断：{e}");
+        debug!(%peer, sni = %nfrp_common::util::LogSafe(&sni), "HTTPS 透传中断：{e}");
     }
     Ok(())
 }
@@ -943,11 +971,24 @@ where
         let auth_user = basic_auth_user(&req);
         let visitor_keep_alive = wants_keep_alive(&req);
 
+        // ★ NFRP-06：带 dot-segment 的路径直接拒绝。
+        //
+        // `locations` 是前缀匹配，而后端会做归一化：
+        // `/public/../admin` 会命中 `/public` 但到后端变成 `/admin`。
+        // 不拒掉等于把 `locations` 当访问控制用的人一直在被绕过。
+        if has_dot_segment(&path) {
+            warn!(%peer, path = %path, "请求路径含 dot-segment，已拒绝");
+            io.stream
+                .write_all(&simple_response("400 Bad Request", "非法路径\n"))
+                .await?;
+            return Ok(());
+        }
+
         // ---- 路由 ----
         let Some((route, _loc)) =
             table.lookup(&host_header, &path, auth_user.as_deref(), VhostKind::Http)
         else {
-            debug!(%peer, host = %host_header, path = %path, "没有匹配的 http 代理");
+            debug!(%peer, host = %nfrp_common::util::LogSafe(&host_header), path = %path, "没有匹配的 http 代理");
             if method == "CONNECT" {
                 io.stream
                     .write_all(&simple_response(
@@ -1386,6 +1427,7 @@ where
 
 #[cfg(test)]
 mod tests {
+
     //! 虚拟主机的单元测试。
     //!
     //! 这个文件原本 794 行零测试 —— 而它恰好是**最容易出错**的部分：
@@ -1397,6 +1439,45 @@ mod tests {
     use crate::pool::dummy_client;
     use nfrp_common::http_relay::{find_subslice, MAX_HEAD};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    // ==================================================================
+    // NFRP-06：dot-segment 必须被拒
+    // ==================================================================
+
+    #[test]
+    fn dot_segment_能识别() {
+        for bad in [
+            "/public/../admin",
+            "/public/%2e%2e/admin",
+            "/public/%2E%2E/admin",
+            "/./x",
+            "/x/.",
+            "/a/..",
+        ] {
+            assert!(has_dot_segment(bad), "应当识别为可疑路径：{bad}");
+        }
+        for good in [
+            "/public/hello",
+            "/public/..hidden",
+            "/public/a..b",
+            "/public/v1.2.3/file",
+            "/",
+        ] {
+            assert!(!has_dot_segment(good), "不该误伤：{good}");
+        }
+    }
+
+    /// 前缀匹配确实会被 dot-segment 绕过 —— 锁住这个前提，
+    /// 防止将来有人把 `has_dot_segment` 的调用删掉。
+    #[test]
+    fn locations_前缀匹配会被_dot_segment_绕过() {
+        let locs = ["/public".to_string()];
+        let hit = locs
+            .iter()
+            .filter(|l| "/public/../admin".starts_with(l.as_str()))
+            .max_by_key(|l| l.len());
+        assert!(hit.is_some(), "前缀匹配确实会命中");
+        assert!(has_dot_segment("/public/../admin"));
+    }
 
     // -----------------------------------------------------------------------
     // 辅助构造

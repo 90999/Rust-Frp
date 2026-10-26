@@ -568,6 +568,32 @@ pub fn is_loopback_addr(addr: &str) -> bool {
     }
 }
 
+/// 把内容里的**控制字符**转成可见转义，专门用于日志字段。
+///
+/// # 为什么需要它（NFRP-07）
+///
+/// `client_id` / SNI / `Host` 这些值**全部由远端客户端提供**。
+/// 若直接 `%field` 打日志，一个带 `\n` 的值就能凭空多出一行
+/// **与真实格式完全一致**的日志；带 `\u001b[2J` 还能清屏、
+/// 甚至触发 OSC 52 剪贴板写入。这属于日志完整性问题。
+///
+/// 转义后的输出**不含真实换行与 ESC**，且仍可读。
+pub struct LogSafe<'a>(pub &'a str);
+
+impl std::fmt::Display for LogSafe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        for c in self.0.chars() {
+            if c.is_control() {
+                write!(f, "\\u{{{:x}}}", c as u32)?;
+            } else {
+                f.write_char(c)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 读取主机名。
 ///
 /// 只读环境变量（`COMPUTERNAME` / `HOSTNAME`），不使用任何平台专属 API。
@@ -670,6 +696,18 @@ pub fn tcp_keepalive_idle(stream: &tokio::net::TcpStream) -> std::io::Result<std
 
 #[cfg(test)]
 mod tests {
+    /// NFRP-07：日志字段里的控制字符必须被转义，不能产生真实换行/ESC。
+    #[test]
+    fn log_safe_转义控制字符() {
+        let s = format!("{}", crate::util::LogSafe("a\nb\u{1b}[2Jc"));
+        assert!(!s.contains('\n'), "不能留真实换行：{s:?}");
+        assert!(!s.contains('\u{1b}'), "不能留真实 ESC：{s:?}");
+        assert!(s.contains("\\u{a}"), "换行要转成可见形式：{s}");
+        assert!(s.contains("\\u{1b}"), "ESC 要转成可见形式：{s}");
+        // 正常字符原样保留
+        assert_eq!(format!("{}", crate::util::LogSafe("client-1")), "client-1");
+    }
+
     use super::*;
 
     /// run_id 必须每次都不同：同秒内连续生成 1000 个也要互不相同

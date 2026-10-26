@@ -1171,7 +1171,7 @@ async fn handle_control(
         login.client_id.clone()
     };
     info!(
-        %client_id, %run_id, os = %login.os, arch = %login.arch,
+        client_id = %nfrp_common::util::LogSafe(&client_id), %run_id, os = %login.os, arch = %login.arch,
         wire = %wire_version, "客户端登录成功"
     );
 
@@ -1239,7 +1239,7 @@ async fn handle_control(
         None => {
             registry.metrics().clients_rejected.inc();
             warn!(
-                %client_id,
+                client_id = %nfrp_common::util::LogSafe(&client_id),
                 "客户端数量已达上限 {}，拒绝本次登录", limits.max_clients
             );
             let _ = conn
@@ -1594,11 +1594,11 @@ async fn handle_control(
                 // 否则这条控制连接会一直活到心跳超时，
                 // 期间还能继续建立工作连接 —— "踢了但没完全踢"。
                 if client.is_stopped() {
-                    warn!(%client_id, "客户端已被面板踢出，断开控制连接");
+                    warn!(client_id = %nfrp_common::util::LogSafe(&client_id), "客户端已被面板踢出，断开控制连接");
                     break;
                 }
                 if last_seen.elapsed() > Duration::from_secs(cfg.heartbeat_timeout) {
-                    warn!(%client_id, "心跳超时 {}s，断开控制连接", cfg.heartbeat_timeout);
+                    warn!(client_id = %nfrp_common::util::LogSafe(&client_id), "心跳超时 {}s，断开控制连接", cfg.heartbeat_timeout);
                     break;
                 }
             }
