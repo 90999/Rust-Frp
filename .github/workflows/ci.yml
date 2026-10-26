@@ -90,7 +90,16 @@ jobs:
           tool: cross
 
       - name: build --release
-        run: cross build --release --workspace --target ${{ matrix.target }}
+        # 用 `edge` 镜像：默认的 `main` 镜像是老基础镜像，它的 glibc 跑不动
+        # 新版 libc crate 编出来的 build script —— 实测报
+        # `weak version GLIBC_2.29 not found` + `symbol gettid` relocation error，
+        # 而报错发生在 build script 阶段，跟本项目代码无关。
+        # 只换容器镜像，不改任何编译参数。
+        env:
+          CROSS_CONTAINER_OPTS: --platform linux/amd64
+        run: |
+          docker pull ghcr.io/cross-rs/${{ matrix.target }}:edge || true
+          cross build --release --workspace --target ${{ matrix.target }}
         timeout-minutes: 30
 
   # ---------------------------------------------------------------

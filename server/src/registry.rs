@@ -566,7 +566,13 @@ pub struct LoadGuard(Arc<Load>);
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
-        // 减到 0 就停： saturating 防止异常路径上多减一次把计数打到 usize::MAX
+        // 减到 0 就停：saturating 防止异常路径上多减一次把计数打到 usize::MAX
+        //
+        // 跨版本兼容：`fetch_update` 在更新的 rustc 里被标记为 deprecated
+        // （建议改用 `try_update`），但本地工具链仍是 1.98.1，那里没有
+        // `try_update`。CI 用的是最新 stable，两边都得能编译 —— 这里的行为
+        // 就是"饱和减一"，用 allow 比写两套 cfg 更清楚。
+        #[allow(deprecated)]
         self.0
             .inflight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
