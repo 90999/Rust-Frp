@@ -469,7 +469,19 @@
   }
 
   /* ---------- Theme ---------- */
+  let themeTimer = 0;
+
   function applyTheme(th) {
+    /* 先挂上过渡类，让配色平滑换过去（避免亮区突然消失被看成"画面跳了一下"） */
+    if (!REDUCED) {
+      const root = document.documentElement;
+      root.classList.add('theme-switching');
+      clearTimeout(themeTimer);
+      themeTimer = setTimeout(function () {
+        root.classList.remove('theme-switching');
+      }, 300);
+    }
+
     document.documentElement.setAttribute('data-theme', th);
     const moon = $('.ico-moon');
     const sun = $('.ico-sun');

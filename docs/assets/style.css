@@ -114,6 +114,39 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* ---------- Theme transition ----------
+   切主题时临时挂上，让颜色平滑过去。
+   只过渡颜色类属性：布局/位移属性一律不参与，避免出现任何"跳一下"。
+   由 app.js 在切换后约 300ms 摘掉。 */
+html.theme-switching,
+html.theme-switching body,
+html.theme-switching body::before,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition:
+    background-color 260ms var(--ease),
+    background-image 260ms var(--ease),
+    color 260ms var(--ease),
+    border-color 260ms var(--ease),
+    outline-color 260ms var(--ease),
+    fill 260ms var(--ease),
+    stroke 260ms var(--ease),
+    box-shadow 260ms var(--ease) !important;
+}
+
+/* 尊重"减少动态效果"：直接切，不做过渡 */
+@media (prefers-reduced-motion: reduce) {
+  html.theme-switching,
+  html.theme-switching body,
+  html.theme-switching body::before,
+  html.theme-switching *,
+  html.theme-switching *::before,
+  html.theme-switching *::after {
+    transition: none !important;
+  }
+}
+
 /* Page backdrop: very faint radial glow, themed */
 body::before {
   content: "";
@@ -603,6 +636,17 @@ table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13.5px;
+
+  /* ★ 固定列宽：默认的 auto 布局按内容分配列宽，切主题时字体渲染的细微
+     差异会让列宽重算（实测 TH/TD 的 left 从 645.7 跳到 420.5），
+     整列内容横向瞬移 —— 这就是"切主题时往左闪一下"的真正来源。 */
+  table-layout: fixed;
+}
+
+/* fixed 布局下长串（URL / 代码）会撑破单元格，这里允许折行 */
+th,
+td {
+  overflow-wrap: anywhere;
 }
 
 th {
