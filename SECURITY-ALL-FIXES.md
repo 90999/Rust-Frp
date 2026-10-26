@@ -5696,3 +5696,139 @@ pprof 端点真实 200。
 - SSH 的 tcpmux/stcp 完整数据面、官方 frpc 的加密+压缩组合、真实外部代理、
   真实 DNS 服务器未做 e2e。
 - Windows Wintun 真实数据面需要管理员权限。
+
+---
+
+# 2026-10-26 · 第十七轮（本地复现报告驱动的 5 项修复）
+
+本轮不是安全审计，而是**外部复现报告的闭环**。报告来自
+《NFRp 本地复现与待修清单-2026-10-26》：在 commit `c7214ab`（0.6.6）上
+**实弹复现**了 4 条问题（其中 3 条仓库从未记录、1 条记录过但没修），另指出
+2 条工程项。全部处理完毕。
+
+| 编号 | 问题 | 严重度 | 状态 |
+|---|---|---|---|
+| NFRP-05 | `/api/status` 手工拼 JSON，控制字符产生非法 JSON | 高（管理面可用性） | 已修 |
+| NFRP-13 | 重复 `Authorization` 取第一个（first-wins） | 中（鉴权差异前置条件） | 已修 |
+| NFRP-07 | `client_id` 换行注入，可伪造日志行 | 中（日志完整性） | 已修 |
+| NFRP-06 | `locations` 前缀匹配被 dot-segment 绕过 | 中（当 ACL 用时无边界） | 已修 |
+| NFRP-09 | 文档称"面板 TLS 未实现"，与代码不符 | 低（文档滞后） | 已修 |
+| 依赖漏洞 | `cargo audit` 报 4 条 RUSTSEC 公告 | 中 | 已清零 |
+
+## NFRP-05　`/api/status` 返回非法 JSON
+
+**根因**：`status_json()` 用 `format!("{{... {:?} ...}}")` 拼 JSON。Rust 的
+`Debug` 对控制字符输出 `\u{1}`（Rust 语法），JSON 只接受 `\u0001`。
+
+**影响**：`client_id` / 代理名 / `user` **全部由远端客户端提供**。任意一个已
+注册客户端（共享 frps 场景）塞一个 `\u0001` 就能让 `/api/status` 变成非法
+JSON —— 面板 `JSON.parse` 白屏、外部采集器与告警全挂。等效于"让管理员看不见我"。
+
+> 注意：**不是** JSON 结构注入 —— 引号会被正确转义，无法伪造字段。
+
+**修复**：整段改用 `serde_json::json!`，转义交给库。
+
+**验收**：真实 frps + 恶意 `client_id`，`/api/status` 被 Python 与 PowerShell
+两个独立解析器成功解析，且响应里出现 `\u0001`。
+
+**回归测试**：`status_json_对控制字符仍然合法`、`status_json_字段齐全`。
+
+## NFRP-13　重复 `Authorization` 头取第一个
+
+**根因**：`header_value()` 命中第一个同名头就 `return`。
+
+**风险**：单独看不构成绕过（仍需密码）。风险在部署形态：面板前置
+Nginx / WAF / SSO 网关时，上游与 NFRp 对"哪个 `Authorization` 生效"的理解
+一旦相反，就是鉴权差异 —— 请求走私类问题的经典前置条件。
+
+**修复**：新增 `unique_header()`，同名安全头出现两次及以上一律 400。
+
+**验收**：两个 `Authorization`（任意顺序）→ **都是 400**（修复前是 401 / 200 随顺序翻转）。
+
+**回归测试**：`重复_authorization_被判为畸形`、`重复_authorization_返回_400`。
+
+## NFRP-07　`client_id` 换行注入日志
+
+**根因**：`info!(%client_id, ...)` 走 `Display`，原样写入，不转义控制字符。
+
+**影响**：带 `\n` 的值能凭空多出一行**与真实格式完全一致**的日志（实测已复现），
+`grep` / SIEM / 人工排查都区分不出来；带 `\u001b[2J` 还能清屏，甚至触发
+OSC 52 剪贴板写入。
+
+**修复**：新增 `common::util::LogSafe`，把控制字符转成可见的 `\u{X}`。
+已覆盖 `client_id`（4 处）、SNI（3 处）、`Host`（1 处）。
+`audit.rs` 那条路本来就过 `serde_json`，无需改。
+
+**验收**：日志里**不再出现**伪造行，控制字符显示为 `\u{1}` / `\u{a}`。
+
+**回归测试**：`log_safe_转义控制字符`。
+
+## NFRP-06　`locations` 前缀匹配被 dot-segment 绕过
+
+**根因**：`match_location()` 用 `path.starts_with(loc)`，而 `path` 是请求行原文，
+未做百分号解码、未做 dot-segment 归一化，命中后又原样转发。
+
+**复现**：后端会做归一化（nginx / IIS / Apache 默认行为），于是
+`/public/../admin` 在 NFRp 这边命中 `/public`、到后端变成 `/admin`。
+
+**诚实定性**：上游 `fatedier/frp` 的 `pkg/util/vhost/router.go` 同样是
+`strings.HasPrefix` —— 所以**这不是 NFRp 引入的**，是"对齐上游"的结果。
+但很多用户把 `locations` 当路径级 ACL 用（"只暴露 /public"），实际它不是安全边界。
+
+**修复**：选最保守的方案 —— 请求目标含 dot-segment（`.` / `..`，含 `%2e` /
+`%2E` 编码）一律 400，不做"规范化后转发"（不猜客户端意图）。
+
+**验收**：`/public/../admin` 与 `/public/%2e%2e/admin` 都是 400；
+`/public/hello` 正常 200。**不再泄露 `ADMIN-SECRET`**。
+
+**回归测试**：`dot_segment_能识别`、`locations_前缀匹配会被_dot_segment_绕过`。
+
+## NFRP-09　文档更正
+
+`SECURITY-ALL-FIXES.md` 里"`webServer.tls.*` 面板 HTTPS 未实现"的表述已过时
+（该功能早已实现并有实测），已在原处加**更正说明**并保留原文（不改写历史），
+另外在若干历史清单前加了"以当前代码/实测为准"的时效提示。
+
+## 依赖漏洞（`cargo audit` 清零）
+
+CI 的 `rustsec/audit-check` 报出 4 条公告，全部来自 SSH 网关的 `russh` 依赖链：
+
+| 公告 | crate | 处理 |
+|---|---|---|
+| RUSTSEC-2026-0154 | russh 0.54.5（无界 32 位分配） | 升级（需 ≥0.60.3） |
+| RUSTSEC-2026-0153 | russh-cryptovec 0.52.0 | 同上 |
+| RUSTSEC-2023-0071 | rsa 0.9.10（Marvin Attack，**上游无修复**） | 见下 |
+| RUSTSEC-2026-0387 | crypto-bigint 0.5.5（常量时间问题） | 见下 |
+
+**关键发现**：升到 `russh 0.60` 后 `rsa` 仍是**硬依赖**
+（`internal-russh-forked-ssh-key` 无条件依赖），关 feature 也去不掉；
+而 `russh 0.65` 把 rsa 改成了 **feature**（`rsa = ["ssh-key/rsa"]`）——
+不开它，`rsa` 与 `crypto-bigint` 就彻底不进依赖树。
+
+**处置**：升到 `russh 0.65` 且**不开 `rsa` feature**，并适配 4 处 API 变化：
+`auth_publickey_offered(PublicKeyOffer)`、`auth_publickey(VerifiedPublicKey)`、
+`channel_open_session(ChannelOpenHandle) -> Result<()>`、`Comment::as_str()`。
+
+**代价（已写入 Cargo.toml 注释）**：SSH 网关不再支持 **RSA 客户端证书认证**，
+ed25519 / ECDSA 照常。鉴于 ed25519 是现代默认、且 RSA 那条路带着一个
+**上游明确声明无法修复**的侧信道漏洞，这个取舍是明确的。
+
+**结果**：`cargo audit` **0 漏洞**（330 个依赖）。
+
+## 质量门（本轮结束）
+
+- **887 项测试通过 / 0 失败**
+- clippy（`-D warnings`）0 告警；fmt 干净
+- `cargo audit` **0 漏洞**
+- 真实服务验收：**4/4 通过**（PoC1 合法 JSON + `\u0001`、PoC2 双 400、
+  PoC3 双 400 且无泄露、PoC4 无伪造日志行）
+
+## 附：CI 的两处修复
+
+1. `clippy` 在 CI（最新 stable）上因 `AtomicU64::fetch_update` 被标记 deprecated
+   而失败 —— 本地 1.98.1 还没有 `try_update`，两边都要能编，故加
+   `#[allow(deprecated)]` 并注释说明。
+2. `cross build aarch64-unknown-linux-musl` 失败于
+   `weak version GLIBC_2.29 not found` + `symbol gettid` relocation ——
+   是 cross 默认镜像的基础 glibc 太旧（报错发生在 build script 阶段，
+   与本项目代码无关），已把 CI 的 cross 切到 `edge` 镜像。
