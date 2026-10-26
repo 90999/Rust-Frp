@@ -82,10 +82,17 @@ html {
   scroll-padding-top: calc(var(--header-h) + 20px);
   -webkit-text-size-adjust: 100%;
 
-  /* ★ 关键：始终为垂直滚动条预留位置。
-     没有它的话，主题切换引起的高度微小变化会让滚动条"闪现/消失"，
-     视口宽度随之变化（约 15px），而 .main 的宽度是 calc(100% - …)，
-     于是整块内容横向跳一下 —— 就是"切主题时往左瞬移"的成因。 */
+  /* ★★ 这两个属性必须**成对**出现，缺一不可：
+
+     `scrollbar-gutter` 只对「元素自己的滚动条」生效。而 `html` 默认
+     `overflow-y: visible`，此时代滚动条归**视口**所有，gutter 声明会被忽略
+     —— 实测：有滚动条时 clientWidth=1425，无滚动条时 1440，差 15px。
+
+     显式写 `overflow-y: auto` 把滚动条交给 html 自己，gutter 才起作用，
+     宽度才恒定。这正是"切主题时内容往左瞬移"的根源：
+     主题切换引起高度微变 → 跨过有无滚动条的临界 → 视口宽 15px 跳变
+     → 居中的 `.content`（margin: 0 auto）跟着横向挪。 */
+  overflow-y: auto;
   scrollbar-gutter: stable;
 }
 
