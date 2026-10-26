@@ -126,9 +126,9 @@
       if (val && val !== key) el.textContent = val;
     });
     const lbl = $('#langLabel');
-    // Show "current -> target" so the button explains itself.
-    // 当前 -> 目标，点了会变成哪个语言一目了然
-    if (lbl) lbl.textContent = lang === 'zh' ? '中文 \u2192 EN' : 'EN \u2192 中文';
+    // 只显示**目标**语言：按钮表达"点它会切到哪"，这是语言切换器的通行做法。
+    // （原来显示"中文 → EN"，在 34px 的图标按钮组里放不下，会撑宽按钮、破坏对齐。）
+    if (lbl) lbl.textContent = lang === 'zh' ? 'EN' : '中';
     const btn = $('#langBtn');
     if (btn) {
       btn.setAttribute(
@@ -167,6 +167,9 @@
 
     clearTimeout(switchTimer);
 
+    /* 先清空，避免旧位置的 pager 残影在新页面上闪一下 */
+    clearPager();
+
     target.classList.remove('page-exit', 'page-enter');
 
     const reveal = function () {
@@ -179,6 +182,10 @@
         }, 420);
       }
       animateContent(target, false);
+      /* ★ pager 必须等新页面真的显示出来再建。
+         放在 activate() 末尾会导致"旧页面还在、pager 却已换成新内容"，
+         于是条子先停在上面、随后才被新内容挤下去 —— 就是那个闪烁。 */
+      buildPager(route);
     };
 
     if (old && !REDUCED) {
@@ -200,9 +207,16 @@
       reveal();
     }
 
-    buildPager(route);
     decorateCodeBlocks(target);
     closeDrawer();
+  }
+
+  /* 清空 pager（切换期间用），并保持占位高度避免页面高度抖动 */
+  function clearPager() {
+    const slot = $('#pagerSlot');
+    if (!slot) return;
+    slot.classList.remove('pager-in');
+    slot.innerHTML = '';
   }
 
   /* Stagger the headings / blocks inside a freshly shown page */
@@ -284,6 +298,13 @@
     }
 
     slot.appendChild(nav);
+
+    /* 淡入：让条子跟着页面一起出现，而不是硬插进去 */
+    if (!REDUCED) {
+      slot.classList.remove('pager-in');
+      void slot.offsetWidth;
+      slot.classList.add('pager-in');
+    }
   }
 
   /* ---------- Copy buttons ---------- */
@@ -345,6 +366,7 @@
 
   /* ---------- Scroll reveal ---------- */
   let io = null;
+  let revealFailsafe = 0;
   function initReveal() {
     if (!('IntersectionObserver' in window)) return;
     io = new IntersectionObserver(
@@ -366,7 +388,7 @@
     });
     if (!items.length) return;
 
-    if (!io) {
+    if (!io || REDUCED) {
       items.forEach(function (el) { el.classList.add('in'); });
       return;
     }
@@ -374,6 +396,17 @@
       el.style.transitionDelay = Math.min(i * 50, 300) + 'ms';
       io.observe(el);
     });
+
+    /* 兜底：IntersectionObserver 在无头渲染 / 后台标签页 / 极端慢设备上可能
+       迟迟不回调，而 .reveal 是 opacity:0 —— 结果是**正文整段看不见**，
+       比"没有动画"严重得多。1.2s 后把还没揭示的直接显示；
+       正常页面此时 IO 早已处理完，等于空操作。 */
+    clearTimeout(revealFailsafe);
+    revealFailsafe = setTimeout(function () {
+      $$('.reveal', host).forEach(function (el) {
+        if (!el.classList.contains('in')) el.classList.add('in');
+      });
+    }, 1200);
   }
 
   /* ---------- Count-up numbers ---------- */
@@ -486,6 +519,10 @@
     const btn = $('#langBtn');
     if (btn) {
       btn.addEventListener('click', function () {
+        // 切换动画：标签上翻淡出 → 下翻淡入（CSS 里的 lang-swap）
+        btn.classList.remove('switching');
+        void btn.offsetWidth;
+        btn.classList.add('switching');
         setLang(lang === 'zh' ? 'en' : 'zh', true);
       });
     }

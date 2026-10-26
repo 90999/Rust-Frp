@@ -896,6 +896,29 @@ td code {
 }
 
 /* ---------- Prev/next pager ---------- */
+
+/* 占位：只在真的有内容时预留高度，避免页面底部被顶一下 */
+.pager-slot:not(:empty) {
+  min-height: 96px;
+}
+
+/* 淡入：配合 app.js 的 `pager-in`。
+   用 animation 而不是 transition —— 这里要的是"出现一次"，不是可逆状态。 */
+.pager-slot.pager-in > .pager {
+  animation: pager-in 340ms var(--ease) both;
+}
+
+@keyframes pager-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .pager {
   display: flex;
   gap: 12px;
@@ -1051,45 +1074,44 @@ td code {
 
 /* ---------- Language button ---------- */
 .lang-btn {
-  /* 常驻粉底 + 粉边，在深色头部里一眼可见 */
+  /* 与 .icon-btn 同一套视觉：34px 高、8px 圆角、透明底、次要前景色。
+     唯一的差别是宽度自适应（图标 + 语言代码），而图标按钮是正方形。 */
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  justify-content: center;
+  gap: 6px;
   height: 34px;
-  padding: 0 13px 0 11px;
-  margin-right: 6px;
-  border: 1px solid var(--accent);
-  border-radius: 100px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  min-width: 34px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-muted);
   font-family: inherit;
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: 0.01em;
+  font-size: 12.5px;
+  font-weight: 620;
+  letter-spacing: 0.02em;
   line-height: 1;
   cursor: pointer;
-  position: relative;
+  overflow: hidden;
   transition:
-    background 200ms var(--ease),
-    color 200ms var(--ease),
-    border-color 200ms var(--ease),
-    box-shadow 200ms var(--ease),
+    background var(--dur) var(--ease),
+    color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
     transform 120ms var(--ease);
 }
 
 .lang-btn svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
-  transition: transform 600ms var(--ease);
+  transition: transform 620ms var(--ease);
 }
 
-/* 悬停：填充成实心粉，对比强烈，光标明确表示"能点" */
+/* 与 .icon-btn:hover 完全对齐：同底色、同文字色 */
 .lang-btn:hover {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #1a0b12;
-  box-shadow: 0 4px 16px -4px var(--accent-glow);
+  background: var(--bg-elev);
+  color: var(--fg);
 }
 
 .lang-btn:hover svg {
@@ -1097,7 +1119,37 @@ td code {
 }
 
 .lang-btn:active {
-  transform: scale(0.96);
+  transform: scale(0.94);
+}
+
+/* 键盘可达性：与图标按钮一致 */
+.lang-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 切换语言时，标签做一次轻量的翻出/翻入 */
+.lang-btn.switching #langLabel {
+  animation: lang-swap 420ms var(--ease) both;
+}
+
+@keyframes lang-swap {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  45% {
+    opacity: 0;
+    transform: translateY(-9px) scale(0.86);
+  }
+  46% {
+    opacity: 0;
+    transform: translateY(9px) scale(0.86);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 /* 键盘可达性 */
