@@ -415,5 +415,6 @@ Copyright 2026 nfrp contributors
 ---
 
 <p align="center">
-  Made by Nu0vo1212
+  Made by <a href="AUTHOR.md">Nu0vo1212</a> ·
+  <a href="https://nu0vo.xyz">nu0vo.xyz</a>
 </p>
