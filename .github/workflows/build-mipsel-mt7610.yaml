@@ -1,9 +1,9 @@
-name: build-mipsel-mt7610
+name: build-mipsel-mt7610-cross
 
-# 编译 MIPSEL（小端 mips32r2，MT7610 路由器常用）
-# MT7610 属于 mipsel, mips32r2，很多 OpenWrt 固件是 musl/glibc；
-# 这里选用 mipsel-unknown-linux-musl 更适合路由器静态单文件，避免 glibc 版本兼容坑
-# GitHub runner 自带 qemu-user-static 可以跑 mipsel 验证
+# Cross 版本编译 MIPSEL（mips32r2，MT7610）
+# 重要：mipsel-unknown-linux-musl stable 无预编译 std，host 不要 rustup target add
+# cross 在容器内部提供 std + 工具链
+# MT7610：MIPS32R2、小端、无FPU，软浮点 musl
 
 on:
   workflow_dispatch:
@@ -16,35 +16,30 @@ permissions:
 
 jobs:
   mipsel:
-    name: linux-mipsel-mt7610
+    name: linux-mipsel-mt7610-cross
     runs-on: ubuntu-22.04
     steps:
       - name: 取源码
         uses: actions/checkout@v4
 
-      - name: 装交叉工具链 & qemu
+      - name: 安装 Rust + cross
         run: |
-          sudo apt-get update
-          # mipsel-linux-gnu-gcc 交叉编译器 + qemu-user-static 模拟 mipsel
-          sudo apt-get install -y --no-install-recommends \
-            gcc-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user-static
-          mipsel-linux-gnu-gcc --version | head -1
-          qemu-mipsel-static --version | head -1
+          rustup toolchain install stable
+          # ✅ 删除 rustup target add mipsel-unknown-linux-musl，这一行是报错来源
+          cargo install cross --version 0.2.5
 
-      - name: 装 Rust target
-        run: |
-          rustup target add mipsel-unknown-linux-musl
-          rustc --version
-          cargo --version
-
-      - name: 编译（静态链接，适配 MT7610 mips32r2）
+      - name: 编译（cross 容器构建，静态 musl + mips32r2）
         env:
-          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: mipsel-linux-gnu-gcc
-          # MT7610 是 mips32r2；+crt-static 全静态 musl，单文件直接丢路由器跑
           RUSTFLAGS: "-C target-feature=+mips32r2,+crt-static"
         run: |
-          cargo build --release --target mipsel-unknown-linux-musl \
+          cross build --release --target mipsel-unknown-linux-musl \
             -p nfrp-server -p nfrp-client
+
+      - name: 安装 qemu-user-static 用于产物校验
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          qemu-mipsel-static --version | head -1
 
       - name: 校验产物
         run: |
@@ -52,15 +47,12 @@ jobs:
           D=target/mipsel-unknown-linux-musl/release
           file "$D/nfrp-server" "$D/nfrp-client"
 
-          # 架构校验：MIPS, little-endian, mips32
           file "$D/nfrp-server" | grep -q 'MIPS, little-endian' \
             || { echo "架构不对，不是 mipsel"; exit 1; }
 
-          # 静态链接校验
           file "$D/nfrp-server" | grep -Eq 'static-pie linked|statically linked' \
             || { echo "不是静态链接"; exit 1; }
 
-          # qemu-mipsel-static 模拟执行验证版本输出
           V=$(qemu-mipsel-static "$D/nfrp-server" -V)
           echo "server -V -> $V"
           echo "$V" | grep -q '^nfrp-server 0\.6\.' \
@@ -74,12 +66,12 @@ jobs:
           qemu-mipsel-static "$D/nfrp-client" -V | grep -q '^nfrp-client 0\.6\.' \
             || { echo "client -V 输出不对"; exit 1; }
 
-          echo "✅ mipsel-mt7610 产物已在 qemu 下真实执行验证"
+          echo "✅ cross 构建 mipsel-mt7610 产物，qemu 验证通过"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: nfrp-linux-mipsel-mt7610
+          name: nfrp-linux-mipsel-mt7610-cross
           path: |
             target/mipsel-unknown-linux-musl/release/nfrp-server
             target/mipsel-unknown-linux-musl/release/nfrp-client
